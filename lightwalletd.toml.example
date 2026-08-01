@@ -1,0 +1,36 @@
+# darkfi-lightwalletd configuration
+#
+# Copy this to ~/.config/darkfi/lightwalletd.toml (or pass --config <path>).
+# `network` must be set explicitly to "testnet" or "mainnet".
+# Bad TOML / invalid network / mismatched chain_name → process exits (no silent defaults).
+
+# ---------------------------------------------------------------------------
+# Testnet (default example)
+# ---------------------------------------------------------------------------
+darkfid_endpoint = "tcp://127.0.0.1:18345"
+grpc_listen = "127.0.0.1:9067"
+# Default cache root is scoped automatically to …/lightwalletd_cache/testnet
+# (or …/mainnet). `~` is expanded to $HOME.
+cache_path = "~/.local/share/darkfi/lightwalletd_cache"
+poll_interval = 10
+chain_name = "darkfi-testnet"
+network = "testnet"
+
+# UnifOMR rate limit (requests / peer IP / minute). 0 disables.
+# omr_rate_limit_per_min = 30
+
+# SECURITY: cleartext is ONLY allowed on 127.0.0.1 / ::1 / localhost.
+# For public binds you MUST set TLS:
+# grpc_listen = "0.0.0.0:9067"
+# tls_cert_path = "~/.config/darkfi/lightwalletd.crt"
+# tls_key_path = "~/.config/darkfi/lightwalletd.key"
+
+# ---------------------------------------------------------------------------
+# Mainnet example (replace the block above):
+# ---------------------------------------------------------------------------
+# darkfid_endpoint = "tcp://127.0.0.1:8345"
+# grpc_listen = "127.0.0.1:9067"
+# cache_path = "~/.local/share/darkfi/lightwalletd_cache"
+# poll_interval = 10
+# chain_name = "darkfi-mainnet"
+# network = "mainnet"

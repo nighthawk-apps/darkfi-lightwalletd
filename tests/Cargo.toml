@@ -1,0 +1,11 @@
+[package]
+name = "lightwallet-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Only pull in the modules we can test standalone
+log = "0.4"
+
+# These are needed for the lightwallet_client tests
+tokio = { version = "1", features = ["full"] }

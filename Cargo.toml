@@ -1,0 +1,98 @@
+[package]
+name = "darkfi-lightwalletd"
+version = "0.1.0"
+homepage = "https://nighthawkapps.com"
+description = "DarkFi lightwallet server — compact block serving for shielded wallet sync (UnifOMR)"
+authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
+repository = "https://github.com/nighthawk-apps/darkfi-lightwalletd"
+license = "AGPL-3.0-or-later"
+edition = "2021"
+
+# =============================================================================
+# Nighthawk Apps — standalone lightwalletd
+# =============================================================================
+# Copyright (C) 2026 Nighthawk Apps. Builds against a sibling ../darkfi checkout
+# (see scripts/fetch-darkfi.sh / scripts/build.sh). Does not modify upstream
+# darkfi crates; UnifOMR + compact-block serving live entirely in this repo.
+# =============================================================================
+
+[[bin]]
+name = "darkfi-lightwalletd"
+path = "src/main.rs"
+
+[[bin]]
+name = "e2e_unifomr_matrix"
+path = "src/bin/e2e_unifomr_matrix.rs"
+required-features = ["fhe-omr"]
+
+[features]
+# UnifOMR (FHE) is enabled by default. To build without FHE (lighter binary):
+#   cargo build --no-default-features
+default = ["fhe-omr"]
+# Enable UnifOMR (GetUnifOmrDigest + FetchPirBatch).
+fhe-omr = ["dep:fhe", "dep:fhe-traits"]
+# Enable live testnet 0.3 integration tests (requires running darkfid + lightwalletd).
+#   cargo test --features testnet-e2e
+testnet-e2e = []
+
+[dependencies]
+# DarkFi core
+darkfi = { path = "../darkfi", features = ["async-daemonize", "bs58", "blockchain", "rpc", "util"] }
+darkfi_money_contract = { path = "../darkfi/src/contract/money", features = ["client", "no-entrypoint"] }
+darkfi-sdk = { path = "../darkfi/src/sdk" }
+darkfi-serial = { path = "../darkfi/src/serial", features = ["async"] }
+
+# gRPC (tls feature for optional ServerTlsConfig)
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+
+# Async runtime
+async-trait = "0.1.89"
+smol = "2.0.2"
+futures = "0.3.32"
+
+# Blockchain store / cache
+sled = "0.34"
+
+# Serialization / Encoding
+bs58 = "0.5.1"
+tinyjson = "2.5.1"
+url = "2.5.8"
+
+# Logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
+tracing-appender = "0.2.5"
+
+# Crypto
+blake3 = "1.8.5"
+
+# Config
+serde = { version = "1.0.228", features = ["derive"] }
+structopt = "0.3.26"
+structopt-toml = "0.5.1"
+toml = "0.9.8"
+
+# Misc
+thiserror = "2.0.18"
+hex = "0.4.3"
+tokio = { version = "1", features = ["full"] }
+fhe = { version = "0.1.1", optional = true }
+fhe-traits = { version = "0.1.1", optional = true }
+rand = "0.9.4"
+tokio-stream = "0.1.18"
+bincode = "1.3"
+
+[dev-dependencies]
+tempfile = "3"
+darkfi-contract-test-harness = { path = "../darkfi/src/contract/test-harness" }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+# Removed workspace lints
+
+[patch.crates-io]
+halo2_proofs = {git="https://github.com/parazyd/halo2", branch="v050"}
+halo2_gadgets = {git="https://github.com/parazyd/halo2", branch="v050"}
+url = {git="https://github.com/darkrenaissance/rust-url", branch="v258"}
