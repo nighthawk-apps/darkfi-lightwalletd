@@ -343,11 +343,15 @@ impl Cache {
     }
 
     /// Lookup UnifOMR clue public key by payment pubkey.
+    ///
+    /// Values are stored as `key_version (u64 LE) || clue_pk` — strip the
+    /// full 8-byte prefix (not 4; that leftover from the u32-era version
+    /// corrupted every registered key on read).
     pub fn get_clue_public_key(&self, payment_pubkey: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         Ok(self
             .omr_clue_pubkeys
             .get(payment_pubkey.as_slice())?
-            .and_then(|v| (v.len() > 4).then(|| v[4..].to_vec())))
+            .and_then(|v| (v.len() > 8).then(|| v[8..].to_vec())))
     }
 
     /// Stable server pepper for clue-directory decoys (hides registration bit).
@@ -1217,6 +1221,33 @@ mod tests {
         for (i, block) in range.iter().enumerate() {
             assert_eq!(block.height, (i + 1) as u32, "blocks should be in ascending order");
         }
+    }
+
+    #[test]
+    fn test_clue_public_key_roundtrip_strips_u64_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+
+        let payment_pk = [0x11u8; 32];
+        // Realistic UnifOMR wire length (n=1024 → 4 + 16*1024); pattern must
+        // not accidentally equal a 4-byte-strip mis-read of version||key.
+        let clue_pk: Vec<u8> = (0..16_388u32).map(|i| (i % 251) as u8).collect();
+        let key_version = 1_785_630_000u64; // LE: low 4 nonzero, high 4 zero
+
+        cache
+            .store_clue_public_key(&payment_pk, &clue_pk, key_version)
+            .unwrap();
+        let got = cache.get_clue_public_key(&payment_pk).unwrap().unwrap();
+        assert_eq!(got, clue_pk, "must strip full u64 key_version prefix");
+
+        // Same version + same key is idempotent.
+        cache
+            .store_clue_public_key(&payment_pk, &clue_pk, key_version)
+            .unwrap();
+        assert_eq!(
+            cache.get_clue_public_key(&payment_pk).unwrap().unwrap(),
+            clue_pk
+        );
     }
 }
 

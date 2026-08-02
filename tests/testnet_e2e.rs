@@ -141,7 +141,7 @@ async fn testnet_clue_pk_register_and_fetch() {
 
     let key_version = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
+        .map(|d| d.as_secs())
         .unwrap_or(1);
     let ownership_proof = darkfi_lightwalletd::clue_ownership::sign_clue_pk_ownership(
         &pay_kp.secret,
