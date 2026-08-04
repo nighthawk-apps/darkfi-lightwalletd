@@ -43,15 +43,18 @@ const MAX_BLOCKS_PER_REQUEST: u32 = 10_000;
 const MAX_SPARSE_HEIGHTS: usize = 512;
 /// Max serialized detection key size before parse (S24 / DoS).
 /// UnifOMR GenDetKey is ~38MB at n=1024 (BFV CTs). Allow headroom.
-const MAX_DETECTION_KEY_BYTES: usize = 48 * 1024 * 1024;
+// Param2 (D=4096, moduli 40×3, n=1024) det-keys measure ~120 MiB on the wire.
+const MAX_DETECTION_KEY_BYTES: usize = 160 * 1024 * 1024;
 /// Cap on sum of all detection_keys lengths in one request.
-const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 160 * 1024 * 1024;
 /// Concurrent FHE worker slots (GetUnifOmrDigest / FetchPirBatch).
 const DEFAULT_FHE_PERMITS: usize = 2;
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 const MAX_PIR_STRIPES: usize = 8;
 /// Max opaque recipient OMR metadata on SendTransaction.
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
+/// Default max raw tx bytes (overridden by Config.max_tx_bytes).
+const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
 
 /// How long a SendTransaction peer binding remains valid for RegisterOmrClue (S12).
 const SEND_PEER_BIND_TTL: Duration = Duration::from_secs(86_400);
@@ -74,6 +77,10 @@ pub struct LightWalletService {
     omr_rate_limiter: Arc<PeerRateLimiter>,
     /// Per-peer RegisterOmrClue rate limiter (S12) — tighter than digest.
     clue_rate_limiter: Arc<PeerRateLimiter>,
+    /// Per-peer GetBlockRange / SendTransaction rate limiter.
+    rpc_rate_limiter: Arc<PeerRateLimiter>,
+    /// Max raw transaction bytes after envelope strip.
+    max_tx_bytes: usize,
     /// Recent SendTransaction peers keyed by tx hash (S12 peer bind).
     #[allow(clippy::type_complexity)]
     recent_send_peers: Arc<Mutex<HashMap<[u8; 32], (IpAddr, Instant)>>>,
@@ -91,16 +98,27 @@ impl LightWalletService {
         network_byte: u8,
         tip_notify: tokio::sync::watch::Receiver<u32>,
     ) -> Self {
-        Self::with_rate_limit(cache, rpc_client, chain_name, network_byte, 30, tip_notify)
+        Self::with_limits(
+            cache,
+            rpc_client,
+            chain_name,
+            network_byte,
+            30,
+            120,
+            DEFAULT_MAX_TX_BYTES,
+            tip_notify,
+        )
     }
 
-    /// Create a service with a custom per-minute UnifOMR rate limit.
-    pub fn with_rate_limit(
+    /// Create a service with custom rate limits and tx size cap.
+    pub fn with_limits(
         cache: Arc<Cache>,
         rpc_client: Arc<DarkfidRpcClient>,
         chain_name: String,
         network_byte: u8,
         omr_rate_limit_per_min: u32,
+        rpc_rate_limit_per_min: u32,
+        max_tx_bytes: usize,
         tip_notify: tokio::sync::watch::Receiver<u32>,
     ) -> Self {
         Self {
@@ -114,11 +132,18 @@ impl LightWalletService {
                 Duration::from_secs(60),
             )),
             clue_rate_limiter: Arc::new(PeerRateLimiter::new(32, Duration::from_secs(60))),
+            rpc_rate_limiter: Arc::new(PeerRateLimiter::new(
+                rpc_rate_limit_per_min,
+                Duration::from_secs(60),
+            )),
+            max_tx_bytes,
             recent_send_peers: Arc::new(Mutex::new(HashMap::new())),
             tip_notify,
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
         }
     }
+
+
 
     fn peer_ip<T>(request: &Request<T>) -> IpAddr {
         request
@@ -181,6 +206,17 @@ impl LightWalletService {
         }
     }
 
+    #[allow(clippy::result_large_err)]
+    fn check_rpc_rate_limit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if self.rpc_rate_limiter.check(Self::peer_ip(request)) {
+            Ok(())
+        } else {
+            Err(Status::resource_exhausted(
+                "RPC rate limit exceeded; retry later",
+            ))
+        }
+    }
+
     /// Validate a sender-supplied UnifOMR clue (requires `fhe-omr`).
     fn validate_omr_clue(omr_clue: &[u8]) -> Result<(), String> {
         #[cfg(feature = "fhe-omr")]
@@ -205,6 +241,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let start = range.start_height;
         let end = range.end_height;
@@ -422,6 +459,12 @@ impl DarkFiLightWallet for LightWalletService {
         request: Request<proto::TxHash>,
     ) -> Result<Response<proto::RawTransaction>, Status> {
         let hash = request.into_inner().hash;
+        if hash.len() != 32 {
+            return Err(Status::invalid_argument(format!(
+                "transaction hash must be 32 bytes, got {}",
+                hash.len()
+            )));
+        }
         let hash_hex = hex::encode(&hash);
 
         match self.rpc_client.get_tx(&hash_hex).await {
@@ -446,17 +489,28 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::RawTransaction>,
     ) -> Result<Response<proto::SendResponse>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let peer = Self::peer_ip(&request);
         let req = request.into_inner();
         let mut tx_data = req.data;
         let mut omr_clue = req.omr_clue;
 
-        if let Some(env) = crate::omr_envelope::parse_envelope(&tx_data) {
-            let raw_tx = env.raw_tx.to_vec();
+        if tx_data.starts_with(crate::omr_envelope::OMR_ENVELOPE_TAG) {
+            let env = crate::omr_envelope::parse_envelope(&tx_data).ok_or_else(|| {
+                Status::invalid_argument("malformed OMR envelope on SendTransaction")
+            })?;
             if omr_clue.is_empty() && !env.fhe_clue.is_empty() {
                 omr_clue = env.fhe_clue.to_vec();
             }
-            tx_data = raw_tx;
+            tx_data = env.raw_tx.to_vec();
+        }
+
+        if tx_data.len() > self.max_tx_bytes {
+            return Err(Status::invalid_argument(format!(
+                "transaction size {} exceeds limit {}",
+                tx_data.len(),
+                self.max_tx_bytes
+            )));
         }
 
         // Pre-compute tx hash so we can index the OMR clue before the block lands.
@@ -885,7 +939,7 @@ impl DarkFiLightWallet for LightWalletService {
 
     async fn get_unif_omr_digest(
         &self,
-        request: Request<proto::OmrDigestRequest>,
+        request: Request<tonic::Streaming<proto::DetectionKeyChunk>>,
     ) -> Result<Response<proto::OmrDigestResponse>, Status> {
         #[cfg(not(feature = "fhe-omr"))]
         {
@@ -896,42 +950,73 @@ impl DarkFiLightWallet for LightWalletService {
         }
         #[cfg(feature = "fhe-omr")]
         {
+            use tokio_stream::StreamExt;
             let peer = Self::peer_ip(&request);
-            let req = request.into_inner();
-            let start = req.start_height;
-            let end = req.end_height;
+            let mut stream = request.into_inner();
+            
+            let mut start = 0;
+            let mut end = 0;
+            let mut num_keys = 0;
+            let mut header_received = false;
+            
+            let mut current_key = Vec::new();
+            let mut keys = Vec::new();
 
-            let mut keys: Vec<Vec<u8>> = req.detection_keys;
-            if keys.is_empty() && !req.detection_key.is_empty() {
-                keys.push(req.detection_key);
-            }
-            if keys.is_empty() {
-                return Err(Status::invalid_argument(
-                    "detection_key or detection_keys required",
-                ));
-            }
-            if keys.len() > 16 {
-                return Err(Status::invalid_argument(
-                    "Too many UnifOMR detection_keys (max 16)",
-                ));
-            }
-            for (i, k) in keys.iter().enumerate() {
-                if k.len() > MAX_DETECTION_KEY_BYTES {
+            while let Some(chunk_res) = stream.next().await {
+                let chunk = chunk_res?;
+                
+                if !header_received {
+                    start = chunk.start_height;
+                    end = chunk.end_height;
+                    num_keys = chunk.num_keys;
+                    header_received = true;
+                    
+                    if num_keys == 0 {
+                        return Err(Status::invalid_argument("num_keys must be > 0"));
+                    }
+                    if num_keys > 16 {
+                        return Err(Status::invalid_argument("Too many UnifOMR detection_keys (max 16)"));
+                    }
+                }
+                
+                current_key.extend_from_slice(&chunk.data);
+                
+                if current_key.len() > MAX_DETECTION_KEY_BYTES {
                     return Err(Status::invalid_argument(format!(
-                        "UnifOMR detection key[{i}] too large: {} bytes",
-                        k.len()
+                        "UnifOMR detection key[{}] too large: {} bytes",
+                        keys.len(), current_key.len()
+                    )));
+                }
+                
+                if chunk.key_done {
+                    keys.push(std::mem::take(&mut current_key));
+                }
+                
+                let total_key_bytes: usize = keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
+                if total_key_bytes > MAX_DETECTION_KEYS_TOTAL_BYTES {
+                    return Err(Status::invalid_argument(format!(
+                        "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
+                         (max {MAX_DETECTION_KEYS_TOTAL_BYTES})"
                     )));
                 }
             }
-            let total_key_bytes: usize = keys.iter().map(|k| k.len()).sum();
-            if total_key_bytes > MAX_DETECTION_KEYS_TOTAL_BYTES {
+
+            if !header_received {
+                return Err(Status::invalid_argument("Empty stream"));
+            }
+            if !current_key.is_empty() {
+                return Err(Status::invalid_argument("Stream ended before key_done = true for the last key"));
+            }
+            if keys.len() != num_keys as usize {
                 return Err(Status::invalid_argument(format!(
-                    "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
-                     (max {MAX_DETECTION_KEYS_TOTAL_BYTES})"
+                    "Expected {} keys, but received {}", num_keys, keys.len()
                 )));
             }
+            if keys.iter().any(|k| k.is_empty()) {
+                return Err(Status::invalid_argument("empty detection key not allowed"));
+            }
+
             // Reject oversized multi-key payloads even when individual keys pass
-            // (e.g. many near-max keys whose product of count×size is excessive).
             if let Some(max_len) = keys.iter().map(|k| k.len()).max() {
                 if keys
                     .len()
@@ -1136,7 +1221,7 @@ impl DarkFiLightWallet for LightWalletService {
             })?;
         }
         self.cache
-            .store_clue_public_key(&pk, &req.clue_public_key, req.key_version)
+            .store_clue_public_key(&pk, &req.clue_public_key, req.key_version, &req.ownership_proof)
             .map_err(|e| Status::invalid_argument(format!("Failed to store clue pk: {e}")))?;
         Ok(Response::new(proto::Empty {}))
     }
@@ -1155,28 +1240,49 @@ impl DarkFiLightWallet for LightWalletService {
         pk.copy_from_slice(&req.payment_pubkey);
 
         #[cfg(feature = "fhe-omr")]
-        let clue_public_key = {
+        let (clue_public_key, ownership_proof, key_version) = {
             let registered = self
                 .cache
-                .get_clue_public_key(&pk)
+                .get_clue_public_key_entry(&pk)
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
             match registered {
-                Some(real) => real,
+                Some((ver, proof, real)) => {
+                    let padded = crate::clue_ownership::pad_ownership_proof(&proof)
+                        .map_err(Status::internal)?;
+                    (real, padded, ver)
+                }
                 None => {
                     let pepper = self
                         .cache
                         .get_or_create_clue_dir_pepper()
                         .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
-                    crate::unifomr::decoy_clue_public_key(&pk, &pepper)
+                    let decoy = crate::unifomr::decoy_clue_public_key(&pk, &pepper);
+                    (
+                        decoy,
+                        crate::clue_ownership::decoy_ownership_proof(),
+                        0u64,
+                    )
                 }
             }
         };
         #[cfg(not(feature = "fhe-omr"))]
-        let clue_public_key = {
-            self.cache
-                .get_clue_public_key(&pk)
+        let (clue_public_key, ownership_proof, key_version) = {
+            match self
+                .cache
+                .get_clue_public_key_entry(&pk)
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?
-                .unwrap_or_default()
+            {
+                Some((ver, proof, real)) => {
+                    let padded = crate::clue_ownership::pad_ownership_proof(&proof)
+                        .unwrap_or_else(|_| crate::clue_ownership::decoy_ownership_proof());
+                    (real, padded, ver)
+                }
+                None => (
+                    Vec::new(),
+                    crate::clue_ownership::decoy_ownership_proof(),
+                    0u64,
+                ),
+            }
         };
 
         // Pad past worst-case decoy RLWE keygen (n=1024) so cache-hit vs decoy
@@ -1192,6 +1298,8 @@ impl DarkFiLightWallet for LightWalletService {
         Ok(Response::new(proto::CluePublicKey {
             found: true,
             clue_public_key,
+            ownership_proof,
+            key_version,
         }))
     }
 }

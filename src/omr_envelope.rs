@@ -3,6 +3,8 @@
 //! Tag `O2` + u16 memo length + u32 clue length (UnifOMR clues can be multi-KB).
 
 pub const OMR_ENVELOPE_TAG: &[u8; 2] = b"O2";
+pub const MAX_OMR_MEMO_BYTES: usize = 4096;
+pub const MAX_FHE_CLUE_BYTES: usize = 65_536;
 
 pub struct OmrEnvelope<'a> {
     pub omr_memo: &'a [u8],
@@ -22,12 +24,15 @@ pub fn parse_envelope(data: &[u8]) -> Option<OmrEnvelope<'_>> {
 
 fn parse_o2(data: &[u8]) -> Option<OmrEnvelope<'_>> {
     let memo_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+    if memo_len > MAX_OMR_MEMO_BYTES {
+        return None;
+    }
     let memo_end = 4 + memo_len;
     if data.len() < memo_end + 4 {
         return None;
     }
     let clue_len = u32::from_le_bytes(data[memo_end..memo_end + 4].try_into().ok()?) as usize;
-    if clue_len > 65_536 {
+    if clue_len > MAX_FHE_CLUE_BYTES {
         return None;
     }
     let clue_start = memo_end + 4;
@@ -42,8 +47,12 @@ fn parse_o2(data: &[u8]) -> Option<OmrEnvelope<'_>> {
     })
 }
 
-pub fn strip_envelope(data: &[u8]) -> &[u8] {
-    parse_envelope(data).map(|e| e.raw_tx).unwrap_or(data)
+/// Strip envelope if present. Malformed O2 → None (caller must fail closed).
+pub fn strip_envelope(data: &[u8]) -> Option<&[u8]> {
+    if data.len() >= 2 && data[0] == b'O' && data[1] == b'2' {
+        return parse_envelope(data).map(|e| e.raw_tx);
+    }
+    Some(data)
 }
 
 #[cfg(test)]
@@ -73,6 +82,11 @@ mod tests {
         ];
         data.extend_from_slice(b"tx");
         assert!(parse_envelope(&data).is_none());
-        assert_eq!(strip_envelope(&data), data.as_slice());
+        assert_eq!(strip_envelope(&data).unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn malformed_o2_strip_none() {
+        assert!(strip_envelope(b"O2\x01\x00").is_none());
     }
 }

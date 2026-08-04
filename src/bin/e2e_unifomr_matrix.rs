@@ -12,12 +12,12 @@
 
 use darkfi_lightwalletd::proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 use darkfi_lightwalletd::proto::{
-    CluePublicKeyRegistration, Empty, OmrDigestRequest, PaymentPubkey,
+    CluePublicKeyRegistration, Empty, DetectionKeyChunk, PaymentPubkey,
 };
 use darkfi_lightwalletd::unifomr::{
     build_omr_clue_from_pk, clue_keypair_from_wallet, clue_public_key_wire_len,
-    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership, UnifOmrClient,
-    SCHEME_UNIFOMR,
+    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership,
+    verify_clue_pk_ownership, UnifOmrClient, SCHEME_UNIFOMR,
 };
 use darkfi::util::pcg::Pcg32;
 use darkfi_sdk::crypto::Keypair;
@@ -35,7 +35,7 @@ fn fail(name: &str, detail: &str) {
 
 async fn connect(url: &str) -> Result<Client, String> {
     // UnifOMR detection keys are ~38MB (n=1024 BFV CTs); raise tonic defaults (4MB).
-    const MAX_MSG: usize = 64 * 1024 * 1024;
+    const MAX_MSG: usize = 160 * 1024 * 1024;
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
         .map_err(|e| format!("endpoint: {e}"))?
         .tcp_nodelay(true);
@@ -72,7 +72,10 @@ async fn register(
     Ok(())
 }
 
-async fn lookup(client: &mut Client, pay: &[u8; 32]) -> Result<(bool, Vec<u8>), String> {
+async fn lookup(
+    client: &mut Client,
+    pay: &[u8; 32],
+) -> Result<(bool, Vec<u8>, Vec<u8>, u64), String> {
     let resp = client
         .get_clue_public_key(PaymentPubkey {
             payment_pubkey: pay.to_vec(),
@@ -80,10 +83,24 @@ async fn lookup(client: &mut Client, pay: &[u8; 32]) -> Result<(bool, Vec<u8>), 
         .await
         .map_err(|e| format!("GetCluePublicKey: {e}"))?
         .into_inner();
-    Ok((resp.found, resp.clue_public_key))
+    Ok((
+        resp.found,
+        resp.clue_public_key,
+        resp.ownership_proof,
+        resp.key_version,
+    ))
 }
 
-fn expect_registered_clue(found: bool, clue_pk: &[u8], expected: &[u8], label: &str) {
+fn expect_registered_clue(
+    found: bool,
+    clue_pk: &[u8],
+    ownership_proof: &[u8],
+    key_version: u64,
+    expected: &[u8],
+    payment_pk: &[u8; 32],
+    network: u8,
+    label: &str,
+) {
     if !found {
         fail(label, "expected found=true (privacy: always true)");
         return;
@@ -93,6 +110,16 @@ fn expect_registered_clue(found: bool, clue_pk: &[u8], expected: &[u8], label: &
             label,
             "registered lookup must return exact registered clue pk",
         );
+        return;
+    }
+    if let Err(e) = verify_clue_pk_ownership(
+        network,
+        key_version,
+        payment_pk,
+        clue_pk,
+        ownership_proof,
+    ) {
+        fail(label, &format!("ownership proof verify failed: {e}"));
         return;
     }
     match deserialize_public_key(clue_pk) {
@@ -115,7 +142,16 @@ fn expect_registered_clue(found: bool, clue_pk: &[u8], expected: &[u8], label: &
     }
 }
 
-fn expect_decoy_no_leak(found: bool, clue_pk: &[u8], not_equal_to: &[u8], label: &str) {
+fn expect_decoy_no_leak(
+    found: bool,
+    clue_pk: &[u8],
+    ownership_proof: &[u8],
+    key_version: u64,
+    payment_pk: &[u8; 32],
+    network: u8,
+    not_equal_to: &[u8],
+    label: &str,
+) {
     if !found {
         fail(
             label,
@@ -136,6 +172,19 @@ fn expect_decoy_no_leak(found: bool, clue_pk: &[u8], not_equal_to: &[u8], label:
     }
     if clue_pk == not_equal_to {
         fail(label, "decoy unexpectedly equals a real clue pk");
+        return;
+    }
+    // Decoy ownership must NOT verify under the queried payment key.
+    if verify_clue_pk_ownership(
+        network,
+        key_version,
+        payment_pk,
+        clue_pk,
+        ownership_proof,
+    )
+    .is_ok()
+    {
+        fail(label, "decoy ownership proof unexpectedly verified");
         return;
     }
     match deserialize_public_key(clue_pk) {
@@ -211,17 +260,31 @@ async fn main() {
         fail("both:register_receiver", &e);
     } else {
         match lookup(&mut client, &bob_pay).await {
-            Ok((found, pk)) => {
-                expect_registered_clue(found, &pk, &bob_clue_bytes, "both: GetClue→registered")
-            }
+            Ok((found, pk, proof, ver)) => expect_registered_clue(
+                found,
+                &pk,
+                &proof,
+                ver,
+                &bob_clue_bytes,
+                &bob_pay,
+                network,
+                "both: GetClue→registered",
+            ),
             Err(e) => fail("both:lookup", &e),
         }
     }
 
     match lookup(&mut client, &bob_pay).await {
-        Ok((found, pk)) => {
-            expect_registered_clue(found, &pk, &bob_clue_bytes, "recv_only: GetClue→registered")
-        }
+        Ok((found, pk, proof, ver)) => expect_registered_clue(
+            found,
+            &pk,
+            &proof,
+            ver,
+            &bob_clue_bytes,
+            &bob_pay,
+            network,
+            "recv_only: GetClue→registered",
+        ),
         Err(e) => fail("recv_only:lookup", &e),
     }
 
@@ -237,9 +300,13 @@ async fn main() {
         fail("send_only:register_sender", &e);
     } else {
         match lookup(&mut client, &neither_pay).await {
-            Ok((found, pk)) => expect_decoy_no_leak(
+            Ok((found, pk, proof, ver)) => expect_decoy_no_leak(
                 found,
                 &pk,
+                &proof,
+                ver,
+                &neither_pay,
+                network,
                 &alice_clue_bytes,
                 "send_only: decoy (no registration leak)",
             ),
@@ -249,9 +316,13 @@ async fn main() {
 
     let other = Keypair::random(&mut Pcg32::new(0x61505)).public.to_bytes();
     match lookup(&mut client, &other).await {
-        Ok((found, pk)) => expect_decoy_no_leak(
+        Ok((found, pk, proof, ver)) => expect_decoy_no_leak(
             found,
             &pk,
+            &proof,
+            ver,
+            &other,
+            network,
             &bob_clue_bytes,
             "neither: decoy (no registration leak)",
         ),
@@ -271,13 +342,43 @@ async fn main() {
                     .unwrap_or(0);
                 let end = tip.max(1);
                 let start = end.saturating_sub(3).min(end);
-                match client
-                    .get_unif_omr_digest(OmrDigestRequest {
-                        detection_key: det_key,
-                        detection_keys: vec![],
+                let stream = async_stream::stream! {
+                    yield DetectionKeyChunk {
                         start_height: start,
                         end_height: end,
-                    })
+                        num_keys: 1,
+                        data: vec![],
+                        key_done: false,
+                    };
+                    
+                    let chunk_size = 1024 * 1024;
+                    let mut offset = 0;
+                    while offset < det_key.len() {
+                        let end_offset = std::cmp::min(offset + chunk_size, det_key.len());
+                        let chunk_data = det_key[offset..end_offset].to_vec();
+                        offset = end_offset;
+                        let is_last = offset == det_key.len();
+
+                        yield DetectionKeyChunk {
+                            start_height: 0,
+                            end_height: 0,
+                            num_keys: 0,
+                            data: chunk_data,
+                            key_done: is_last,
+                        };
+                    }
+                    if det_key.is_empty() {
+                         yield DetectionKeyChunk {
+                            start_height: 0,
+                            end_height: 0,
+                            num_keys: 0,
+                            data: vec![],
+                            key_done: true,
+                        };
+                    }
+                };
+                match client
+                    .get_unif_omr_digest(tonic::Request::new(stream))
                     .await
                 {
                     Ok(resp) => {

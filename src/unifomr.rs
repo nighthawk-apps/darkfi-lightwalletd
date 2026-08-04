@@ -55,8 +55,9 @@ pub const MAX_CLUE_LAYERS: usize = 64;
 
 // Re-export ownership helpers so callers can use `unifomr::sign_clue_pk_ownership`.
 pub use crate::clue_ownership::{
-    clue_pk_ownership_message, sign_clue_pk_ownership, verify_clue_pk_ownership,
-    CLUE_PK_OWNERSHIP_DOMAIN,
+    clue_pk_ownership_message, decoy_ownership_proof, pad_ownership_proof,
+    sign_clue_pk_ownership, unpad_ownership_proof, verify_clue_pk_ownership,
+    CLUE_PK_OWNERSHIP_DOMAIN, OWNERSHIP_PROOF_WIRE_LEN,
 };
 
 const MIN_RESPONSE_TIME: Duration = Duration::from_millis(100);

@@ -296,17 +296,19 @@ impl Cache {
         Ok(self.omr_clue_hints.contains_key(tx_hash.as_slice())?)
     }
 
-    /// Store UnifOMR clue public key for a payment pubkey (32 bytes).
+    /// Store UnifOMR clue public key + ownership proof for a payment pubkey.
+    ///
+    /// Wire value (v3): `b"v3" || key_version u64 LE || proof_len u32 LE
+    /// || ownership_proof || clue_pk`.
     ///
     /// Monotonic anti-replay: an existing registration is only replaced when
-    /// `key_version` is strictly greater (signed key rotation). Replaying an
-    /// old registration (lower/equal version) cannot overwrite a newer one;
-    /// re-registering the identical key at the same version is idempotent.
+    /// `key_version` is strictly greater (signed key rotation).
     pub fn store_clue_public_key(
         &self,
         payment_pubkey: &[u8; 32],
         clue_pk: &[u8],
         key_version: u64,
+        ownership_proof: &[u8],
     ) -> Result<()> {
         // n=1024 → 4 + 16*1024 = 16388 bytes; leave headroom for future params.
         if clue_pk.is_empty() || clue_pk.len() > 65_536 {
@@ -314,44 +316,78 @@ impl Cache {
                 "invalid clue public key size".into(),
             ));
         }
+        if ownership_proof.is_empty() || ownership_proof.len() > 65_536 {
+            return Err(LightWalletError::CacheError(
+                "invalid ownership proof size".into(),
+            ));
+        }
         if let Some(existing) = self.omr_clue_pubkeys.get(payment_pubkey.as_slice())? {
-            if existing.len() >= 8 {
-                let stored_version =
-                    u64::from_le_bytes(existing[..8].try_into().expect("8-byte prefix"));
+            if let Some((stored_version, stored_proof, stored_clue)) =
+                Self::parse_clue_pubkey_value(&existing)
+            {
                 if key_version < stored_version {
                     return Err(LightWalletError::CacheError(format!(
                         "stale clue registration: key_version {key_version} < registered {stored_version}"
                     )));
                 }
                 if key_version == stored_version {
-                    if &existing[8..] == clue_pk {
+                    if stored_clue == clue_pk && stored_proof == ownership_proof {
                         return Ok(());
                     }
                     return Err(LightWalletError::CacheError(
                         "clue public key already registered at this key_version".into(),
                     ));
                 }
-                // key_version > stored_version: signed rotation, fall through.
             }
         }
-        let mut value = Vec::with_capacity(8 + clue_pk.len());
+        let mut value = Vec::with_capacity(2 + 8 + 4 + ownership_proof.len() + clue_pk.len());
+        value.extend_from_slice(b"v3");
         value.extend_from_slice(&key_version.to_le_bytes());
+        value.extend_from_slice(&(ownership_proof.len() as u32).to_le_bytes());
+        value.extend_from_slice(ownership_proof);
         value.extend_from_slice(clue_pk);
         self.omr_clue_pubkeys
             .insert(payment_pubkey.as_slice(), value)?;
         Ok(())
     }
 
-    /// Lookup UnifOMR clue public key by payment pubkey.
+    /// Parse stored clue-directory value → `(key_version, ownership_proof, clue_pk)`.
     ///
-    /// Values are stored as `key_version (u64 LE) || clue_pk` — strip the
-    /// full 8-byte prefix (not 4; that leftover from the u32-era version
-    /// corrupted every registered key on read).
+    /// Format: `b"v3" || key_version u64 LE || proof_len u32 LE || proof || clue_pk`.
+    fn parse_clue_pubkey_value(v: &[u8]) -> Option<(u64, Vec<u8>, Vec<u8>)> {
+        if v.len() < 2 + 8 + 4 || &v[..2] != b"v3" {
+            return None;
+        }
+        let key_version = u64::from_le_bytes(v[2..10].try_into().ok()?);
+        let proof_len = u32::from_le_bytes(v[10..14].try_into().ok()?) as usize;
+        if 14 + proof_len > v.len() {
+            return None;
+        }
+        let proof = v[14..14 + proof_len].to_vec();
+        let clue = v[14 + proof_len..].to_vec();
+        if clue.is_empty() || proof.is_empty() {
+            return None;
+        }
+        Some((key_version, proof, clue))
+    }
+
+    /// Lookup UnifOMR clue public key by payment pubkey.
     pub fn get_clue_public_key(&self, payment_pubkey: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         Ok(self
             .omr_clue_pubkeys
             .get(payment_pubkey.as_slice())?
-            .and_then(|v| (v.len() > 8).then(|| v[8..].to_vec())))
+            .and_then(|v| Self::parse_clue_pubkey_value(&v).map(|(_, _, clue)| clue)))
+    }
+
+    /// Lookup clue PK + ownership proof + key_version.
+    pub fn get_clue_public_key_entry(
+        &self,
+        payment_pubkey: &[u8; 32],
+    ) -> Result<Option<(u64, Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .omr_clue_pubkeys
+            .get(payment_pubkey.as_slice())?
+            .and_then(|v| Self::parse_clue_pubkey_value(&v)))
     }
 
     /// Stable server pepper for clue-directory decoys (hides registration bit).
@@ -1233,16 +1269,25 @@ mod tests {
         // not accidentally equal a 4-byte-strip mis-read of version||key.
         let clue_pk: Vec<u8> = (0..16_388u32).map(|i| (i % 251) as u8).collect();
         let key_version = 1_785_630_000u64; // LE: low 4 nonzero, high 4 zero
+        let proof = vec![0xABu8; 64];
 
         cache
-            .store_clue_public_key(&payment_pk, &clue_pk, key_version)
+            .store_clue_public_key(&payment_pk, &clue_pk, key_version, &proof)
             .unwrap();
         let got = cache.get_clue_public_key(&payment_pk).unwrap().unwrap();
-        assert_eq!(got, clue_pk, "must strip full u64 key_version prefix");
+        assert_eq!(got, clue_pk, "must return clue_pk without framing");
+
+        let (ver, got_proof, got_clue) = cache
+            .get_clue_public_key_entry(&payment_pk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ver, key_version);
+        assert_eq!(got_proof, proof);
+        assert_eq!(got_clue, clue_pk);
 
         // Same version + same key is idempotent.
         cache
-            .store_clue_public_key(&payment_pk, &clue_pk, key_version)
+            .store_clue_public_key(&payment_pk, &clue_pk, key_version, &proof)
             .unwrap();
         assert_eq!(
             cache.get_clue_public_key(&payment_pk).unwrap().unwrap(),

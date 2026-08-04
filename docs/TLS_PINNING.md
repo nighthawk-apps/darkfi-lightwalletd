@@ -3,6 +3,14 @@
 Remote `https://` / `tcp+tls://` lightwalletd endpoints **require** a TLS pin.
 Without it, Nighthawk clients **fail closed** at bootstrap / connect.
 
+PinnedVerifier also checks leaf **notBefore/notAfter** and **hostname (SAN/CN)**
+after the SHA-256 pin matches.
+
+## Release builds
+
+Android release Gradle tasks fail unless `LIGHTWALLET_TLS_PIN_SHA256` is a real
+64-hex pin (not empty / placeholder).
+
 ## What to pin
 
 SHA-256 of the server's **leaf certificate DER** (not SPKI, not the public key).

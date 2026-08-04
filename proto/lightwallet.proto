@@ -40,7 +40,10 @@ service DarkFiLightWallet {
   rpc GetTransaction(TxHash) returns (RawTransaction);
   
   // Phase 1: UnifOMR Detection (Linear Partial Decryption)
-  rpc GetUnifOmrDigest(OmrDigestRequest) returns (OmrDigestResponse);
+  // Client streams the detection key(s) in ~1 MiB chunks, avoiding the need
+  // for a 160 MiB single-message gRPC limit.
+  // The first message MUST be a DetectionKeyChunk with header fields set.
+  rpc GetUnifOmrDigest(stream DetectionKeyChunk) returns (OmrDigestResponse);
   
   // Phase 2: Batch PIR Fetch (Non-Linear Payload Retrieval)
   rpc FetchPirBatch(BatchPirRequest) returns (BatchPirResponse);
@@ -252,20 +255,6 @@ message LightInfo {
 
 // === OMR Messages ===
 
-message OmrDigestRequest {
-  // Client's UnifOMR detection key.
-  // Legacy single-key field; still honored when `detection_keys` is empty.
-  bytes detection_key = 1;
-  // Start height, inclusive
-  uint32 start_height = 2;
-  // End height, inclusive
-  uint32 end_height = 3;
-  // Multiple detection keys (same wallet, different address tags).
-  // When non-empty, the server evaluates each key and returns a framed multi-digest.
-  // Prefer this over N parallel GetUnifOmrDigest RPCs.
-  repeated bytes detection_keys = 4;
-}
-
 message OmrDigestResponse {
   // FHE encrypted digest containing the matching block heights.
   // For multi-key requests: length-prefixed frames, one digest per key
@@ -274,6 +263,29 @@ message OmrDigestResponse {
   bytes encrypted_digest = 1;
   // Whether the digest covers the full requested range
   bool complete = 2;
+}
+
+// === Streaming detection key messages (StreamDetectionKey RPC) ===
+
+// Client-streaming message for StreamDetectionKey.
+// The first chunk MUST carry the header fields (start/end height, key count).
+// Subsequent chunks carry raw detection key bytes.  Multiple keys are sent
+// sequentially: finish key 0's bytes, then key 1's bytes, etc.  Each key
+// boundary is indicated by `key_done = true` on the last chunk of that key.
+message DetectionKeyChunk {
+  // Only set on the first chunk (header).  Ignored on subsequent chunks.
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+  // Expected number of detection keys that will follow (cap 16).
+  uint32 num_keys = 3;
+
+  // Raw detection key bytes (partial or complete).
+  // Recommended chunk size: 1 MiB (1_048_576 bytes).
+  bytes data = 4;
+  // Set to true on the last chunk of each individual key.  The server
+  // uses this to delimit multi-key uploads (key_done count must equal
+  // num_keys before processing begins).
+  bool key_done = 5;
 }
 
 message OmrCapabilities {
@@ -311,6 +323,13 @@ message CluePublicKeyRegistration {
 message CluePublicKey {
   bytes clue_public_key = 1;
   bool found = 2;
+  // Schnorr ownership proof (same encoding as RegisterCluePublicKey).
+  // Always present at a fixed padded wire length: real registrations carry a
+  // verifiable proof; decoys carry random bytes of equal size so registration
+  // status is not leaked by response length. Clients MUST verify before use.
+  bytes ownership_proof = 3;
+  // key_version from registration (0 for decoys).
+  uint64 key_version = 4;
 }
 
 message BatchPirRequest {

@@ -46,22 +46,47 @@ pub struct Config {
     pub chain_name: String,
 
     /// Network mode: `"mainnet"` or `"testnet"`.
-    /// Controls UnifOMR detection-key network-byte validation and default
-    /// compact-block cache subdirectory.
     #[serde(default = "default_network")]
     pub network: String,
 
-    /// Max GetUnifOmrDigest / FetchPirBatch requests per peer IP per minute (S6).
-    /// Set to 0 to disable rate limiting (not recommended for public listen).
+    /// Max GetUnifOmrDigest / FetchPirBatch requests per peer IP per minute.
+    /// Set to 0 to disable (not recommended for public listen).
     #[serde(default = "default_omr_rate_limit_per_min")]
     pub omr_rate_limit_per_min: u32,
 
-    /// Optional path to PEM TLS certificate for gRPC (S6).
-    /// When set together with `tls_key_path`, the server serves HTTPS.
+    /// Max GetBlockRange / SendTransaction requests per peer IP per minute.
+    #[serde(default = "default_rpc_rate_limit_per_min")]
+    pub rpc_rate_limit_per_min: u32,
+
+    /// Max concurrent accepted TCP connections (0 = unlimited).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+
+    /// Max concurrent RPCs per HTTP/2 connection.
+    #[serde(default = "default_max_streams_per_conn")]
+    pub max_streams_per_conn: u32,
+
+    /// Max raw transaction bytes accepted by SendTransaction (after envelope strip).
+    #[serde(default = "default_max_tx_bytes")]
+    pub max_tx_bytes: usize,
+
+    /// gRPC request timeout in seconds (0 = no timeout).
+    #[serde(default = "default_request_timeout_s")]
+    pub request_timeout_s: u64,
+
+    /// darkfid JSON-RPC connect/read timeout in seconds.
+    #[serde(default = "default_darkfid_rpc_timeout_s")]
+    pub darkfid_rpc_timeout_s: u64,
+
+    /// Pin darkfid DNS at startup (resolve once, never re-resolve).
+    #[serde(default = "default_pin_darkfid_dns")]
+    pub pin_darkfid_dns: bool,
+
+    /// Optional path to PEM TLS certificate for gRPC.
     #[serde(default)]
     pub tls_cert_path: Option<String>,
 
-    /// Optional path to PEM TLS private key for gRPC (S6).
+    /// Optional path to PEM TLS private key for gRPC.
     #[serde(default)]
     pub tls_key_path: Option<String>,
 }
@@ -72,8 +97,7 @@ fn default_darkfid_endpoint() -> String {
 
 fn default_grpc_listen() -> String {
     // SECURITY: Default to localhost. Operators MUST explicitly set 0.0.0.0
-    // to expose the gRPC server to the network — and MUST also set TLS
-    // (tls_cert_path + tls_key_path). Cleartext off-loopback is refused at startup (S6).
+    // to expose the gRPC server — and MUST also set TLS.
     "127.0.0.1:9067".to_string()
 }
 
@@ -104,6 +128,34 @@ fn default_network() -> String {
 
 fn default_omr_rate_limit_per_min() -> u32 {
     30
+}
+
+fn default_rpc_rate_limit_per_min() -> u32 {
+    120
+}
+
+fn default_max_connections() -> u32 {
+    512
+}
+
+fn default_max_streams_per_conn() -> u32 {
+    256
+}
+
+fn default_max_tx_bytes() -> usize {
+    2_000_000
+}
+
+fn default_request_timeout_s() -> u64 {
+    300
+}
+
+fn default_darkfid_rpc_timeout_s() -> u64 {
+    15
+}
+
+fn default_pin_darkfid_dns() -> bool {
+    true
 }
 
 /// Expand a leading `~/` to the user home directory.
@@ -153,6 +205,13 @@ impl Default for Config {
             chain_name: default_chain_name(),
             network: default_network(),
             omr_rate_limit_per_min: default_omr_rate_limit_per_min(),
+            rpc_rate_limit_per_min: default_rpc_rate_limit_per_min(),
+            max_connections: default_max_connections(),
+            max_streams_per_conn: default_max_streams_per_conn(),
+            max_tx_bytes: default_max_tx_bytes(),
+            request_timeout_s: default_request_timeout_s(),
+            darkfid_rpc_timeout_s: default_darkfid_rpc_timeout_s(),
+            pin_darkfid_dns: default_pin_darkfid_dns(),
             tls_cert_path: None,
             tls_key_path: None,
         }
@@ -176,7 +235,6 @@ impl Config {
         match net.as_str() {
             "mainnet" | "testnet" => self.network = net,
             "localnet" => {
-                // Treat localnet like testnet for OMR wire bytes / cache scoping.
                 self.network = "testnet".to_string();
             }
             other => {
@@ -190,7 +248,6 @@ impl Config {
         let chain = self.chain_name.trim().to_ascii_lowercase();
         let expected = expected_chain_name(&self.network);
         if chain.is_empty() || chain == default_chain_name() {
-            // Auto-align default chain_name when operator only set `network`.
             self.chain_name = expected.to_string();
         } else {
             self.chain_name = self.chain_name.trim().to_string();
@@ -225,12 +282,16 @@ impl Config {
         if self.grpc_listen.trim().is_empty() {
             return Err("grpc_listen must not be empty".into());
         }
+        if self.max_tx_bytes == 0 {
+            return Err("max_tx_bytes must be >= 1".into());
+        }
+        if self.max_streams_per_conn == 0 {
+            return Err("max_streams_per_conn must be >= 1".into());
+        }
 
-        // Expand ~ in cache + TLS paths.
         let raw_cache = self.cache_path.clone();
         let mut cache = expand_tilde(&raw_cache);
 
-        // Scope the *default* cache root by network so testnet/mainnet never share sled DBs.
         let is_default_cache = raw_cache.trim() == default_cache_path()
             || cache.file_name().and_then(|s| s.to_str()) == Some("lightwalletd_cache");
         if is_default_cache {
@@ -286,6 +347,7 @@ mod tests {
         .unwrap();
         assert!(cfg.cache_path.ends_with("lightwalletd_cache/testnet"));
         assert_eq!(cfg.omr_network_byte(), 0x01);
+        assert_eq!(cfg.max_tx_bytes, 2_000_000);
     }
 
     #[test]
@@ -293,7 +355,7 @@ mod tests {
         std::env::set_var("HOME", "/tmp/lwd-home-test");
         let cfg = Config {
             network: "mainnet".into(),
-            chain_name: "darkfi-testnet".into(), // default → rewritten
+            chain_name: "darkfi-testnet".into(),
             cache_path: "~/.local/share/darkfi/lightwalletd_cache".into(),
             ..Config::default()
         }

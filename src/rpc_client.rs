@@ -17,19 +17,14 @@
  */
 
 //! JSON-RPC client for communicating with a `darkfid` full node.
-//!
-//! This module wraps the darkfid JSON-RPC API, providing typed methods for:
-//! - Fetching blocks by height
-//! - Fetching transactions by hash
-//! - Getting chain tip information
-//! - Subscribing to new blocks
-//! - Submitting transactions
-//! - Querying contract state
+
+use std::net::SocketAddr;
+use std::time::Duration;
 
 use darkfi::{blockchain::block_store::BlockInfo, util::encoding::base64};
 use darkfi_serial::deserialize_async;
 use tinyjson::JsonValue;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::error::{LightWalletError, Result};
@@ -38,17 +33,69 @@ use crate::error::{LightWalletError, Result};
 pub struct DarkfidRpcClient {
     /// The URL of the darkfid JSON-RPC endpoint
     endpoint: Url,
+    /// Resolved host:port (DNS pinned at construction when enabled).
+    connect_addr: String,
+    /// Connect + read timeout.
+    timeout: Duration,
 }
 
 impl DarkfidRpcClient {
-    /// Create a new RPC client pointing at the given darkfid endpoint.
-    pub fn new(endpoint: Url) -> Self {
-        Self { endpoint }
+    /// Create a new RPC client. Optionally pin DNS at construction.
+    pub async fn new(
+        endpoint: Url,
+        timeout: Duration,
+        pin_dns: bool,
+    ) -> Result<Self> {
+        let host = endpoint.host_str().unwrap_or("127.0.0.1").to_string();
+        let port = endpoint.port().unwrap_or(18345);
+        let connect_addr = if pin_dns {
+            match tokio::net::lookup_host((host.as_str(), port)).await {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        let pinned = addr.to_string();
+                        info!(
+                            target: "lightwalletd::rpc_client",
+                            "darkfid DNS pinned: {host}:{port} → {pinned}"
+                        );
+                        pinned
+                    } else {
+                        warn!(
+                            target: "lightwalletd::rpc_client",
+                            "DNS pin: no addresses for {host}; falling back to hostname"
+                        );
+                        format!("{host}:{port}")
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        target: "lightwalletd::rpc_client",
+                        "DNS pin failed for {host}: {e}; falling back to hostname"
+                    );
+                    format!("{host}:{port}")
+                }
+            }
+        } else {
+            format!("{host}:{port}")
+        };
+        Ok(Self {
+            endpoint,
+            connect_addr,
+            timeout,
+        })
+    }
+
+    /// Convenience for tests (loopback, 15s timeout, no pin).
+    pub fn new_simple(endpoint: Url) -> Self {
+        let host = endpoint.host_str().unwrap_or("127.0.0.1");
+        let port = endpoint.port().unwrap_or(18345);
+        Self {
+            connect_addr: format!("{host}:{port}"),
+            endpoint,
+            timeout: Duration::from_secs(15),
+        }
     }
 
     /// Fetch a block at the given height from darkfid.
-    ///
-    /// Maps to: `blockchain.get_block(height) -> base64(BlockInfo)`
     pub async fn get_block(&self, height: u32) -> Result<BlockInfo> {
         debug!(target: "lightwalletd::rpc_client", "Fetching block at height {height}");
 
@@ -75,8 +122,6 @@ impl DarkfidRpcClient {
     }
 
     /// Get the last confirmed block height and header hash.
-    ///
-    /// Maps to: `blockchain.last_confirmed_block() -> [height, hash_string]`
     pub async fn get_last_confirmed_block(&self) -> Result<(u32, String)> {
         debug!(target: "lightwalletd::rpc_client", "Fetching last confirmed block");
 
@@ -112,8 +157,6 @@ impl DarkfidRpcClient {
     }
 
     /// Get the current block target time in seconds.
-    ///
-    /// Maps to: `blockchain.block_target() -> seconds`
     pub async fn get_block_target(&self) -> Result<u32> {
         debug!(target: "lightwalletd::rpc_client", "Fetching block target");
 
@@ -128,8 +171,6 @@ impl DarkfidRpcClient {
     }
 
     /// Get the current network difficulty.
-    ///
-    /// Maps to: `blockchain.get_difficulty() -> difficulty_string_or_number`
     pub async fn get_difficulty(&self) -> Result<String> {
         debug!(target: "lightwalletd::rpc_client", "Fetching difficulty");
 
@@ -146,8 +187,6 @@ impl DarkfidRpcClient {
     }
 
     /// Submit a signed transaction to the network.
-    ///
-    /// Maps to: `tx.broadcast(base64_tx) -> tx_hash`
     pub async fn broadcast_tx(&self, tx_bytes: &[u8]) -> Result<String> {
         info!(target: "lightwalletd::rpc_client", "Broadcasting transaction");
 
@@ -166,8 +205,6 @@ impl DarkfidRpcClient {
     }
 
     /// Fetch a transaction by its hash.
-    ///
-    /// Maps to: `blockchain.get_tx(hash_hex) -> base64(Transaction)`
     pub async fn get_tx(&self, tx_hash: &str) -> Result<Vec<u8>> {
         debug!(target: "lightwalletd::rpc_client", "Fetching transaction {tx_hash}");
 
@@ -188,8 +225,6 @@ impl DarkfidRpcClient {
     }
 
     /// Lookup zkas bincodes for a given contract ID.
-    ///
-    /// Maps to: `blockchain.lookup_zkas(contract_id) -> [[ns, bincode], ...]`
     pub async fn lookup_zkas(&self, contract_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
         debug!(target: "lightwalletd::rpc_client", "Looking up zkas for contract {contract_id}");
 
@@ -235,15 +270,24 @@ impl DarkfidRpcClient {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
 
-        let host = self.endpoint.host_str().unwrap_or("127.0.0.1");
-        let port = self.endpoint.port().unwrap_or(18345);
+        let connect_fut = TcpStream::connect(&self.connect_addr);
+        let mut stream = tokio::time::timeout(self.timeout, connect_fut)
+            .await
+            .map_err(|_| {
+                LightWalletError::ConnectionError(format!(
+                    "Timeout connecting to darkfid at {}",
+                    self.connect_addr
+                ))
+            })?
+            .map_err(|e| {
+                LightWalletError::ConnectionError(format!(
+                    "Failed to connect to {} ({}): {}",
+                    self.endpoint, self.connect_addr, e
+                ))
+            })?;
 
-        let mut stream = TcpStream::connect((host, port)).await.map_err(|e| {
-            LightWalletError::ConnectionError(format!(
-                "Failed to connect to {}: {}",
-                self.endpoint, e
-            ))
-        })?;
+        // Prefer nodelay for request/response RPC.
+        let _ = stream.set_nodelay(true);
 
         let req = JsonRequest::new(method, params);
 
@@ -251,18 +295,29 @@ impl DarkfidRpcClient {
             LightWalletError::SerializationError(format!("Failed to stringify request: {}", e))
         })?;
 
-        stream.write_all(req_str.as_bytes()).await.map_err(|e| {
+        tokio::time::timeout(self.timeout, async {
+            stream.write_all(req_str.as_bytes()).await?;
+            stream.write_all(b"\n").await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            LightWalletError::ConnectionError("Timeout writing darkfid RPC request".into())
+        })?
+        .map_err(|e| {
             LightWalletError::ConnectionError(format!("Failed to write request: {}", e))
-        })?;
-        stream.write_all(b"\n").await.map_err(|e| {
-            LightWalletError::ConnectionError(format!("Failed to write newline: {}", e))
         })?;
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        reader.read_line(&mut line).await.map_err(|e| {
-            LightWalletError::ConnectionError(format!("Failed to read response: {}", e))
-        })?;
+        tokio::time::timeout(self.timeout, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                LightWalletError::ConnectionError("Timeout reading darkfid RPC response".into())
+            })?
+            .map_err(|e| {
+                LightWalletError::ConnectionError(format!("Failed to read response: {}", e))
+            })?;
 
         if line.is_empty() {
             return Err(LightWalletError::ConnectionError(
@@ -278,20 +333,22 @@ impl DarkfidRpcClient {
             .get::<std::collections::HashMap<String, JsonValue>>()
             .ok_or_else(|| {
                 LightWalletError::SerializationError(
-                    "Response is not a valid JSON object".to_string(),
+                    "Expected JSON object response".to_string(),
                 )
             })?;
-        if let Some(error) = result.get("error") {
-            return Err(LightWalletError::RpcError(format!(
-                "RPC error: {:?}",
-                error
-            )));
+
+        if let Some(err) = result.get("error") {
+            return Err(LightWalletError::RpcError(format!("{err:?}")));
         }
 
-        let res = result
+        result
             .get("result")
-            .ok_or_else(|| LightWalletError::RpcError("No result field in response".to_string()))?;
-
-        Ok(res.clone())
+            .cloned()
+            .ok_or_else(|| LightWalletError::RpcError("Missing result field".to_string()))
     }
+}
+
+#[allow(dead_code)]
+fn _socket_addr_hint(addr: &str) -> Option<SocketAddr> {
+    addr.parse().ok()
 }

@@ -17,7 +17,19 @@ chain_name = "darkfi-testnet"
 network = "testnet"
 
 # UnifOMR rate limit (requests / peer IP / minute). 0 disables.
-# omr_rate_limit_per_min = 30
+omr_rate_limit_per_min = 30
+# GetBlockRange / SendTransaction rate limit (requests / peer IP / minute).
+rpc_rate_limit_per_min = 120
+
+# Connection / DoS limits
+max_connections = 512
+max_streams_per_conn = 256
+max_tx_bytes = 2000000
+# Param2 UnifOMR detection keys are ~120 MiB.  Upload + server-side FHE
+# detection + Tor latency can exceed 60s.  Must match nginx/HAProxy timeouts.
+request_timeout_s = 300
+darkfid_rpc_timeout_s = 15
+pin_darkfid_dns = true
 
 # SECURITY: cleartext is ONLY allowed on 127.0.0.1 / ::1 / localhost.
 # For public binds you MUST set TLS:
@@ -34,3 +46,5 @@ network = "testnet"
 # poll_interval = 10
 # chain_name = "darkfi-mainnet"
 # network = "mainnet"
+# tls_cert_path = "~/.config/darkfi/lightwalletd.crt"
+# tls_key_path = "~/.config/darkfi/lightwalletd.key"

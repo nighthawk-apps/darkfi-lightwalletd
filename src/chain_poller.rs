@@ -300,7 +300,7 @@ mod tests {
         };
         let (tip_tx, _) = tokio::sync::watch::channel(0u32);
         let poller = ChainPoller {
-            rpc_client: Arc::new(DarkfidRpcClient::new(
+            rpc_client: Arc::new(DarkfidRpcClient::new_simple(
                 url::Url::parse("tcp://127.0.0.1:8340").unwrap(),
             )),
             cache: Arc::new(Cache::new("/tmp/test_poller_cache").unwrap()),

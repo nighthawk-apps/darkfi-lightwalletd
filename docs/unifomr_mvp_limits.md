@@ -4,6 +4,8 @@
 discrete Gaussian σ=0.5 errors, digest modulus-switch, all ℓ=2 plaintext bits
 evaluated, `r′ = 149`.
 
+**Transport profile:** `GetUnifOmrDigest` is streaming (chunked) to avoid gRPC single-message limits on 120 MiB keys.
+
 **Archived MVP profile:** see [`unifomr_mvp_archive.md`](./unifomr_mvp_archive.md) (fork reference; constants are not kept in source).
 
 ## Measured detection rates (this stack, 2026-07-22)
@@ -84,7 +86,11 @@ These are independent of Table-1 parameters:
 | BFV moduli sizes | `[40, 40, 40]` (digest served at last level) |
 | `R_PRIME` (`r′`) | **149** (paper value, active) |
 
-Detection keys are larger than MVP (~2× BFV degree); gRPC decode/encode limits are **64 MB** (matching `MAX_DETECTION_KEYS_TOTAL_BYTES`; per-key cap 48 MB). Detection-key count remains capped at **16**, but a single Param2 det-key is ~38 MB, so clients chunk `GetUnifOmrDigest` requests to stay under the 64 MB total budget.
+Detection keys are large under Param2 (`D=4096`, moduli `[40,40,40]`, `n=1024`):
+a single det-key measures **~120 MiB** on the wire. The `GetUnifOmrDigest` RPC uses
+client-side streaming to split this into ~1 MiB chunks. The server's total size limit
+(`MAX_DETECTION_KEYS_TOTAL_BYTES`) is **160 MiB**. Multi-key `detection_keys` batches
+must stay within that budget (practical cap is one full Param2 key per request).
 
 ## Cross-client parity (required)
 
