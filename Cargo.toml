@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tracing-appender = "0.2.5"
 
 # Crypto
-blake3 = "1.8.5"
+blake3 = "1.8.6"
 
 # Config
 serde = { version = "1.0.228", features = ["derive"] }

@@ -42,10 +42,15 @@ report() {
 
 echo -e "${CYAN}UnifOMR registration matrix → ${LWD_URL}${NC}"
 
-if ! lsof -nP -iTCP:9067 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "lightwalletd not listening on :9067 — start it first"
-  exit 1
-fi
+# Local default requires :9067; remote HTTPS (e.g. Studio ngrok) skips that check.
+case "$LWD_URL" in
+  http://127.0.0.1:9067|http://localhost:9067|http://[::1]:9067)
+    if ! lsof -nP -iTCP:9067 -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "lightwalletd not listening on :9067 — start it first"
+      exit 1
+    fi
+    ;;
+esac
 
 cd "$LWD_DIR"
 cargo build -q --release --bin e2e_unifomr_matrix --features fhe-omr
