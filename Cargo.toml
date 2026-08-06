@@ -43,7 +43,8 @@ darkfi-sdk = { path = "../darkfi/src/sdk" }
 darkfi-serial = { path = "../darkfi/src/serial", features = ["async"] }
 
 # gRPC (tls feature for optional ServerTlsConfig)
-tonic = { version = "0.12", features = ["tls"] }
+# tls-roots: system CA trust for remote HTTPS LWD (Studio ngrok / public TLS).
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 
 # Async runtime

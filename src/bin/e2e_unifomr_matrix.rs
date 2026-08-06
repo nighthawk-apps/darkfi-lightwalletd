@@ -36,13 +36,39 @@ fn fail(name: &str, detail: &str) {
 async fn connect(url: &str) -> Result<Client, String> {
     // UnifOMR detection keys are ~38MB (n=1024 BFV CTs); raise tonic defaults (4MB).
     const MAX_MSG: usize = 160 * 1024 * 1024;
-    let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
+    let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
         .map_err(|e| format!("endpoint: {e}"))?
         .tcp_nodelay(true);
+    // tonic does not auto-enable TLS from an https:// URL on Endpoint::connect;
+    // install system roots for remote Studio/ngrok (and any public LWD).
+    if url.starts_with("https://") {
+        let host = url
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        let tls = tonic::transport::ClientTlsConfig::new()
+            .domain_name(host)
+            .with_enabled_roots();
+        endpoint = endpoint
+            .tls_config(tls)
+            .map_err(|e| format!("tls_config: {e}"))?;
+    }
     let channel = endpoint
         .connect()
         .await
-        .map_err(|e| format!("connect {url}: {e}"))?;
+        .map_err(|e| {
+            let mut msg = format!("connect {url}: {e}");
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                msg.push_str(&format!(" | caused by: {s}"));
+                src = s.source();
+            }
+            msg
+        })?;
     Ok(DarkFiLightWalletClient::new(channel)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG))
