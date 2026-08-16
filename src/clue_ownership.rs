@@ -12,6 +12,12 @@
 /// Domain-separated message prefix for clue-PK ownership proofs (v2).
 pub const CLUE_PK_OWNERSHIP_DOMAIN: &[u8] = b"DarkFi-UnifOMR-CluePK-v2";
 
+/// Domain-separated message prefix for lightwalletd directory attestations.
+///
+/// `GetCluePublicKey` returns this (not a payment-key Schnorr) so real and
+/// decoy entries both verify. Registration still uses [`CLUE_PK_OWNERSHIP_DOMAIN`].
+pub const DIRECTORY_ATTEST_DOMAIN: &[u8] = b"DarkFi-UnifOMR-DirAttest-v1";
+
 /// Fixed wire length for `CluePublicKey.ownership_proof` responses.
 /// Layout: `u16 LE proof_len || proof || random/zero pad`.
 /// Keeps decoy and real responses the same size (registration-bit privacy).
@@ -106,11 +112,113 @@ pub fn verify_clue_pk_ownership(
     };
     let pk = PublicKey::from_bytes(*payment_pubkey)
         .map_err(|e| format!("invalid payment pubkey: {e}"))?;
-    let sig: darkfi_sdk::crypto::schnorr::Signature = deserialize(proof_bytes)
-        .map_err(|e| format!("invalid ownership proof encoding: {e}"))?;
+    let sig: darkfi_sdk::crypto::schnorr::Signature =
+        deserialize(proof_bytes).map_err(|e| format!("invalid ownership proof encoding: {e}"))?;
     let msg = clue_pk_ownership_message(network, key_version, payment_pubkey, clue_public_key);
     if !pk.verify(&msg, &sig) {
         return Err("clue public key ownership proof verification failed".into());
     }
     Ok(())
+}
+
+/// Build the signed message for a directory attestation.
+///
+/// `domain || network || key_version (u64 LE) || payment_pubkey || clue_public_key`
+pub fn directory_attest_message(
+    network: u8,
+    key_version: u64,
+    payment_pubkey: &[u8],
+    clue_public_key: &[u8],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(
+        DIRECTORY_ATTEST_DOMAIN.len() + 9 + payment_pubkey.len() + clue_public_key.len(),
+    );
+    msg.extend_from_slice(DIRECTORY_ATTEST_DOMAIN);
+    msg.push(network);
+    msg.extend_from_slice(&key_version.to_le_bytes());
+    msg.extend_from_slice(payment_pubkey);
+    msg.extend_from_slice(clue_public_key);
+    msg
+}
+
+/// Sign a `GetCluePublicKey` directory attestation with the server SecretKey.
+pub fn sign_directory_attestation(
+    server_sk: &darkfi_sdk::crypto::SecretKey,
+    network: u8,
+    key_version: u64,
+    payment_pubkey: &[u8; 32],
+    clue_public_key: &[u8],
+) -> Vec<u8> {
+    use darkfi_sdk::crypto::schnorr::SchnorrSecret;
+    use darkfi_serial::serialize;
+    let msg = directory_attest_message(network, key_version, payment_pubkey, clue_public_key);
+    let sig = server_sk.sign(&msg);
+    serialize(&sig)
+}
+
+/// Verify a directory attestation against the lightwalletd attest public key.
+pub fn verify_directory_attestation(
+    server_pk: &[u8],
+    network: u8,
+    key_version: u64,
+    payment_pubkey: &[u8; 32],
+    clue_public_key: &[u8],
+    attestation: &[u8],
+) -> Result<(), String> {
+    use darkfi_sdk::crypto::schnorr::SchnorrPublic;
+    use darkfi_sdk::crypto::PublicKey;
+    use darkfi_serial::deserialize;
+    if server_pk.len() != 32 {
+        return Err("directory attest pubkey must be 32 bytes".into());
+    }
+    let mut pk_bytes = [0u8; 32];
+    pk_bytes.copy_from_slice(server_pk);
+    let proof_bytes = if attestation.len() == OWNERSHIP_PROOF_WIRE_LEN {
+        unpad_ownership_proof(attestation)?
+    } else {
+        attestation
+    };
+    let pk = PublicKey::from_bytes(pk_bytes)
+        .map_err(|e| format!("invalid directory attest pubkey: {e}"))?;
+    let sig: darkfi_sdk::crypto::schnorr::Signature = deserialize(proof_bytes)
+        .map_err(|e| format!("invalid directory attestation encoding: {e}"))?;
+    let msg = directory_attest_message(network, key_version, payment_pubkey, clue_public_key);
+    if !pk.verify(&msg, &sig) {
+        return Err("directory attestation verification failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkfi::util::pcg::Pcg32;
+    use darkfi_sdk::crypto::{Keypair, PublicKey, SecretKey};
+
+    #[test]
+    fn directory_attest_verifies_for_real_and_decoy_payloads() {
+        let server = Keypair::random(&mut Pcg32::new(0xA77E57));
+        let server_pk = PublicKey::from_secret(server.secret).to_bytes();
+        let pay = [0x11u8; 32];
+        let clue = vec![0x22u8; 32];
+        let raw = sign_directory_attestation(&server.secret, 0x01, 1_700_000_001, &pay, &clue);
+        let wire = pad_ownership_proof(&raw).unwrap();
+        verify_directory_attestation(&server_pk, 0x01, 1_700_000_001, &pay, &clue, &wire)
+            .expect("attest must verify under the server key");
+        assert!(
+            verify_clue_pk_ownership(0x01, 1_700_000_001, &pay, &clue, &wire).is_err(),
+            "directory attest must not verify as a payment-key Schnorr"
+        );
+    }
+
+    #[test]
+    fn directory_attest_rejects_wrong_server_key() {
+        let server = Keypair::random(&mut Pcg32::new(0x51C));
+        let other = SecretKey::random(&mut Pcg32::new(0x07C));
+        let other_pk = PublicKey::from_secret(other).to_bytes();
+        let pay = [0x33u8; 32];
+        let clue = vec![0x44u8; 16];
+        let raw = sign_directory_attestation(&server.secret, 0x01, 9, &pay, &clue);
+        assert!(verify_directory_attestation(&other_pk, 0x01, 9, &pay, &clue, &raw).is_err());
+    }
 }

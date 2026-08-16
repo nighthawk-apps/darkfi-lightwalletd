@@ -51,6 +51,10 @@ const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 160 * 1024 * 1024;
 const DEFAULT_FHE_PERMITS: usize = 2;
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 const MAX_PIR_STRIPES: usize = 8;
+/// Max bytes per SealPIR query ciphertext (rejects multi-MB garbage).
+const MAX_PIR_QUERY_CT_BYTES: usize = 4 * 1024 * 1024;
+/// Max protobuf-encoded compact-block bytes materialized for one PIR window.
+const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 /// Max opaque recipient OMR metadata on SendTransaction.
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
@@ -143,8 +147,6 @@ impl LightWalletService {
         }
     }
 
-
-
     fn peer_ip<T>(request: &Request<T>) -> IpAddr {
         request
             .remote_addr()
@@ -159,9 +161,7 @@ impl LightWalletService {
             // M2: hard-cap to prevent unbounded growth under sustained traffic.
             if map.len() >= MAX_SEND_PEER_ENTRIES {
                 // Evict oldest entries to make room.
-                let mut entries: Vec<_> = map.iter()
-                    .map(|(k, (_, t))| (*k, *t))
-                    .collect();
+                let mut entries: Vec<_> = map.iter().map(|(k, (_, t))| (*k, *t)).collect();
                 entries.sort_by_key(|(_, t)| *t);
                 let evict_count = map.len().saturating_sub(MAX_SEND_PEER_ENTRIES) + 1;
                 for (k, _) in entries.into_iter().take(evict_count) {
@@ -292,6 +292,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockHeight>,
     ) -> Result<Response<proto::CompactBlock>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let height = request.into_inner().height;
 
         match self.cache.get_compact_block(height) {
@@ -458,6 +459,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::TxHash>,
     ) -> Result<Response<proto::RawTransaction>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let hash = request.into_inner().hash;
         if hash.len() != 32 {
             return Err(Status::invalid_argument(format!(
@@ -643,6 +645,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetNoteCommitmentsStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
 
         // SECURITY: Enforce max range
@@ -692,6 +695,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetNullifiersStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
 
         // SECURITY: Enforce max range
@@ -791,6 +795,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::ContractId>,
     ) -> Result<Response<proto::ZkasResponse>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let contract_id = request.into_inner().id;
 
         match self.rpc_client.lookup_zkas(&contract_id).await {
@@ -844,6 +849,11 @@ impl DarkFiLightWallet for LightWalletService {
             omr_supported: cfg!(feature = "fhe-omr"),
             best_block_hash: hash.to_vec(),
             backend_version: format!("lightwalletd {}", env!("CARGO_PKG_VERSION")),
+            directory_attest_pubkey: self
+                .cache
+                .directory_attest_public_key()
+                .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+                .to_vec(),
         }))
     }
 
@@ -953,46 +963,52 @@ impl DarkFiLightWallet for LightWalletService {
             use tokio_stream::StreamExt;
             let peer = Self::peer_ip(&request);
             let mut stream = request.into_inner();
-            
+
             let mut start = 0;
             let mut end = 0;
             let mut num_keys = 0;
             let mut header_received = false;
-            
+
             let mut current_key = Vec::new();
             let mut keys = Vec::new();
 
             while let Some(chunk_res) = stream.next().await {
                 let chunk = chunk_res?;
-                
+
                 if !header_received {
                     start = chunk.start_height;
                     end = chunk.end_height;
                     num_keys = chunk.num_keys;
                     header_received = true;
-                    
+
                     if num_keys == 0 {
                         return Err(Status::invalid_argument("num_keys must be > 0"));
                     }
                     if num_keys > 16 {
-                        return Err(Status::invalid_argument("Too many UnifOMR detection_keys (max 16)"));
+                        return Err(Status::invalid_argument(
+                            "Too many UnifOMR detection_keys (max 16)",
+                        ));
                     }
+                    // Rate-limit before accepting the ~120 MiB detection-key body.
+                    self.check_omr_rate_limit(peer, num_keys)?;
                 }
-                
+
                 current_key.extend_from_slice(&chunk.data);
-                
+
                 if current_key.len() > MAX_DETECTION_KEY_BYTES {
                     return Err(Status::invalid_argument(format!(
                         "UnifOMR detection key[{}] too large: {} bytes",
-                        keys.len(), current_key.len()
+                        keys.len(),
+                        current_key.len()
                     )));
                 }
-                
+
                 if chunk.key_done {
                     keys.push(std::mem::take(&mut current_key));
                 }
-                
-                let total_key_bytes: usize = keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
+
+                let total_key_bytes: usize =
+                    keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
                 if total_key_bytes > MAX_DETECTION_KEYS_TOTAL_BYTES {
                     return Err(Status::invalid_argument(format!(
                         "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
@@ -1005,11 +1021,15 @@ impl DarkFiLightWallet for LightWalletService {
                 return Err(Status::invalid_argument("Empty stream"));
             }
             if !current_key.is_empty() {
-                return Err(Status::invalid_argument("Stream ended before key_done = true for the last key"));
+                return Err(Status::invalid_argument(
+                    "Stream ended before key_done = true for the last key",
+                ));
             }
             if keys.len() != num_keys as usize {
                 return Err(Status::invalid_argument(format!(
-                    "Expected {} keys, but received {}", num_keys, keys.len()
+                    "Expected {} keys, but received {}",
+                    num_keys,
+                    keys.len()
                 )));
             }
             if keys.iter().any(|k| k.is_empty()) {
@@ -1018,17 +1038,12 @@ impl DarkFiLightWallet for LightWalletService {
 
             // Reject oversized multi-key payloads even when individual keys pass
             if let Some(max_len) = keys.iter().map(|k| k.len()).max() {
-                if keys
-                    .len()
-                    .saturating_mul(max_len)
-                    > MAX_DETECTION_KEYS_TOTAL_BYTES
-                {
+                if keys.len().saturating_mul(max_len) > MAX_DETECTION_KEYS_TOTAL_BYTES {
                     return Err(Status::invalid_argument(
                         "UnifOMR detection_keys count×size exceeds total size budget",
                     ));
                 }
             }
-            self.check_omr_rate_limit(peer, keys.len() as u32)?;
 
             if start > end {
                 return Err(Status::invalid_argument(format!(
@@ -1146,6 +1161,22 @@ impl DarkFiLightWallet for LightWalletService {
                     req.query_ciphertexts.len()
                 )));
             }
+            if req
+                .query_ciphertexts
+                .iter()
+                .any(|ct| ct.len() > MAX_PIR_QUERY_CT_BYTES)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "PIR query ciphertext exceeds {MAX_PIR_QUERY_CT_BYTES} bytes"
+                )));
+            }
+            if (req.limb_index as usize) >= crate::pir_server::MAX_PIR_LIMBS {
+                return Err(Status::invalid_argument(format!(
+                    "limb_index {} >= max {}",
+                    req.limb_index,
+                    crate::pir_server::MAX_PIR_LIMBS
+                )));
+            }
 
             let blocks = self
                 .cache
@@ -1163,6 +1194,12 @@ impl DarkFiLightWallet for LightWalletService {
             let payloads: Vec<Vec<u8>> = (start..=end)
                 .map(|h| by_h.remove(&h).unwrap_or_default())
                 .collect();
+            let encoded_total: usize = payloads.iter().map(|p| p.len()).sum();
+            if encoded_total > MAX_PIR_WINDOW_ENCODED_BYTES {
+                return Err(Status::resource_exhausted(format!(
+                    "PIR window encoded size {encoded_total} exceeds {MAX_PIR_WINDOW_ENCODED_BYTES}"
+                )));
+            }
 
             let limb_index = req.limb_index as usize;
             let db = crate::pir_server::limb_column(&payloads, limb_index);
@@ -1221,7 +1258,12 @@ impl DarkFiLightWallet for LightWalletService {
             })?;
         }
         self.cache
-            .store_clue_public_key(&pk, &req.clue_public_key, req.key_version, &req.ownership_proof)
+            .store_clue_public_key(
+                &pk,
+                &req.clue_public_key,
+                req.key_version,
+                &req.ownership_proof,
+            )
             .map_err(|e| Status::invalid_argument(format!("Failed to store clue pk: {e}")))?;
         Ok(Response::new(proto::Empty {}))
     }
@@ -1239,51 +1281,53 @@ impl DarkFiLightWallet for LightWalletService {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&req.payment_pubkey);
 
+        let attest_sk = self
+            .cache
+            .get_or_create_directory_attest_secret()
+            .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+
         #[cfg(feature = "fhe-omr")]
-        let (clue_public_key, ownership_proof, key_version) = {
+        let (clue_public_key, key_version) = {
             let registered = self
                 .cache
                 .get_clue_public_key_entry(&pk)
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
             match registered {
-                Some((ver, proof, real)) => {
-                    let padded = crate::clue_ownership::pad_ownership_proof(&proof)
-                        .map_err(Status::internal)?;
-                    (real, padded, ver)
-                }
+                Some((ver, _stored_proof, real)) => (real, ver),
                 None => {
                     let pepper = self
                         .cache
                         .get_or_create_clue_dir_pepper()
                         .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
-                    let decoy = crate::unifomr::decoy_clue_public_key(&pk, &pepper);
                     (
-                        decoy,
-                        crate::clue_ownership::decoy_ownership_proof(),
-                        0u64,
+                        crate::unifomr::decoy_clue_public_key(&pk, &pepper),
+                        crate::unifomr::decoy_key_version(&pk, &pepper),
                     )
                 }
             }
         };
         #[cfg(not(feature = "fhe-omr"))]
-        let (clue_public_key, ownership_proof, key_version) = {
+        let (clue_public_key, key_version) = {
             match self
                 .cache
                 .get_clue_public_key_entry(&pk)
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?
             {
-                Some((ver, proof, real)) => {
-                    let padded = crate::clue_ownership::pad_ownership_proof(&proof)
-                        .unwrap_or_else(|_| crate::clue_ownership::decoy_ownership_proof());
-                    (real, padded, ver)
-                }
-                None => (
-                    Vec::new(),
-                    crate::clue_ownership::decoy_ownership_proof(),
-                    0u64,
-                ),
+                Some((ver, _stored_proof, real)) => (real, ver),
+                None => (Vec::new(), 0u64),
             }
         };
+
+        let ownership_proof = crate::clue_ownership::pad_ownership_proof(
+            &crate::clue_ownership::sign_directory_attestation(
+                &attest_sk,
+                self.network_byte,
+                key_version,
+                &pk,
+                &clue_public_key,
+            ),
+        )
+        .map_err(Status::internal)?;
 
         // Pad past worst-case decoy RLWE keygen (n=1024) so cache-hit vs decoy
         // is not distinguishable by latency.

@@ -41,11 +41,7 @@ pub struct DarkfidRpcClient {
 
 impl DarkfidRpcClient {
     /// Create a new RPC client. Optionally pin DNS at construction.
-    pub async fn new(
-        endpoint: Url,
-        timeout: Duration,
-        pin_dns: bool,
-    ) -> Result<Self> {
+    pub async fn new(endpoint: Url, timeout: Duration, pin_dns: bool) -> Result<Self> {
         let host = endpoint.host_str().unwrap_or("127.0.0.1").to_string();
         let port = endpoint.port().unwrap_or(18345);
         let connect_addr = if pin_dns {
@@ -332,9 +328,7 @@ impl DarkfidRpcClient {
         let result = parsed
             .get::<std::collections::HashMap<String, JsonValue>>()
             .ok_or_else(|| {
-                LightWalletError::SerializationError(
-                    "Expected JSON object response".to_string(),
-                )
+                LightWalletError::SerializationError("Expected JSON object response".to_string())
             })?;
 
         if let Some(err) = result.get("error") {

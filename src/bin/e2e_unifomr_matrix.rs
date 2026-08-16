@@ -10,16 +10,16 @@
 //!
 //! Prints `MATRIX_PASS:…` / `MATRIX_FAIL:…` lines for the wrapper script.
 
+use darkfi::util::pcg::Pcg32;
 use darkfi_lightwalletd::proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 use darkfi_lightwalletd::proto::{
-    CluePublicKeyRegistration, Empty, DetectionKeyChunk, PaymentPubkey,
+    CluePublicKeyRegistration, DetectionKeyChunk, Empty, PaymentPubkey,
 };
 use darkfi_lightwalletd::unifomr::{
     build_omr_clue_from_pk, clue_keypair_from_wallet, clue_public_key_wire_len,
-    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership,
-    verify_clue_pk_ownership, UnifOmrClient, SCHEME_UNIFOMR,
+    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership, verify_clue_pk_ownership,
+    verify_directory_attestation, UnifOmrClient, SCHEME_UNIFOMR,
 };
-use darkfi::util::pcg::Pcg32;
 use darkfi_sdk::crypto::Keypair;
 
 type Client = DarkFiLightWalletClient<tonic::transport::Channel>;
@@ -57,18 +57,15 @@ async fn connect(url: &str) -> Result<Client, String> {
             .tls_config(tls)
             .map_err(|e| format!("tls_config: {e}"))?;
     }
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|e| {
-            let mut msg = format!("connect {url}: {e}");
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                msg.push_str(&format!(" | caused by: {s}"));
-                src = s.source();
-            }
-            msg
-        })?;
+    let channel = endpoint.connect().await.map_err(|e| {
+        let mut msg = format!("connect {url}: {e}");
+        let mut src = std::error::Error::source(&e);
+        while let Some(s) = src {
+            msg.push_str(&format!(" | caused by: {s}"));
+            src = s.source();
+        }
+        msg
+    })?;
     Ok(DarkFiLightWalletClient::new(channel)
         .max_decoding_message_size(MAX_MSG)
         .max_encoding_message_size(MAX_MSG))
@@ -125,6 +122,7 @@ fn expect_registered_clue(
     expected: &[u8],
     payment_pk: &[u8; 32],
     network: u8,
+    attest_pk: &[u8],
     label: &str,
 ) {
     if !found {
@@ -138,14 +136,23 @@ fn expect_registered_clue(
         );
         return;
     }
-    if let Err(e) = verify_clue_pk_ownership(
+    if let Err(e) = verify_directory_attestation(
+        attest_pk,
         network,
         key_version,
         payment_pk,
         clue_pk,
         ownership_proof,
     ) {
-        fail(label, &format!("ownership proof verify failed: {e}"));
+        fail(label, &format!("directory attestation verify failed: {e}"));
+        return;
+    }
+    if verify_clue_pk_ownership(network, key_version, payment_pk, clue_pk, ownership_proof).is_ok()
+    {
+        fail(
+            label,
+            "lookup proof must not verify as a payment-key Schnorr",
+        );
         return;
     }
     match deserialize_public_key(clue_pk) {
@@ -175,6 +182,7 @@ fn expect_decoy_no_leak(
     key_version: u64,
     payment_pk: &[u8; 32],
     network: u8,
+    attest_pk: &[u8],
     not_equal_to: &[u8],
     label: &str,
 ) {
@@ -200,17 +208,23 @@ fn expect_decoy_no_leak(
         fail(label, "decoy unexpectedly equals a real clue pk");
         return;
     }
-    // Decoy ownership must NOT verify under the queried payment key.
-    if verify_clue_pk_ownership(
+    if let Err(e) = verify_directory_attestation(
+        attest_pk,
         network,
         key_version,
         payment_pk,
         clue_pk,
         ownership_proof,
-    )
-    .is_ok()
+    ) {
+        fail(
+            label,
+            &format!("decoy directory attestation must verify: {e}"),
+        );
+        return;
+    }
+    if verify_clue_pk_ownership(network, key_version, payment_pk, clue_pk, ownership_proof).is_ok()
     {
-        fail(label, "decoy ownership proof unexpectedly verified");
+        fail(label, "decoy must not verify as a payment-key Schnorr");
         return;
     }
     match deserialize_public_key(clue_pk) {
@@ -258,6 +272,26 @@ async fn main() {
         Err(e) => fail("capabilities", &e.to_string()),
     }
 
+    let attest_pk = match client.get_light_info(Empty {}).await {
+        Ok(resp) => {
+            let pk = resp.into_inner().directory_attest_pubkey;
+            if pk.len() == 32 {
+                pass("lightinfo directory_attest_pubkey");
+                pk
+            } else {
+                fail(
+                    "lightinfo",
+                    &format!("directory_attest_pubkey len {}", pk.len()),
+                );
+                Vec::new()
+            }
+        }
+        Err(e) => {
+            fail("lightinfo", &e.to_string());
+            Vec::new()
+        }
+    };
+
     let alice_wallet = [0xA1u8; 32];
     let bob_wallet = [0xB2u8; 32];
     // Real DarkFi payment keypairs (required for ownership proofs).
@@ -294,6 +328,7 @@ async fn main() {
                 &bob_clue_bytes,
                 &bob_pay,
                 network,
+                &attest_pk,
                 "both: GetClue→registered",
             ),
             Err(e) => fail("both:lookup", &e),
@@ -309,6 +344,7 @@ async fn main() {
             &bob_clue_bytes,
             &bob_pay,
             network,
+            &attest_pk,
             "recv_only: GetClue→registered",
         ),
         Err(e) => fail("recv_only:lookup", &e),
@@ -333,6 +369,7 @@ async fn main() {
                 ver,
                 &neither_pay,
                 network,
+                &attest_pk,
                 &alice_clue_bytes,
                 "send_only: decoy (no registration leak)",
             ),
@@ -349,6 +386,7 @@ async fn main() {
             ver,
             &other,
             network,
+            &attest_pk,
             &bob_clue_bytes,
             "neither: decoy (no registration leak)",
         ),
@@ -376,7 +414,7 @@ async fn main() {
                         data: vec![],
                         key_done: false,
                     };
-                    
+
                     let chunk_size = 1024 * 1024;
                     let mut offset = 0;
                     while offset < det_key.len() {

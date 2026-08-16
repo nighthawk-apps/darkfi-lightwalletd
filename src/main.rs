@@ -302,11 +302,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let serve_result = if max_connections > 0 {
             match tokio::net::TcpListener::bind(grpc_addr).await {
                 Ok(listener) => {
-                    let incoming =
-                        darkfi_lightwalletd::limited_incoming::LimitedTcpIncoming::new(
-                            listener,
-                            max_connections,
-                        );
+                    let incoming = darkfi_lightwalletd::limited_incoming::LimitedTcpIncoming::new(
+                        listener,
+                        max_connections,
+                    );
                     builder
                         .add_service(svc)
                         .serve_with_incoming_shutdown(incoming, shutdown)

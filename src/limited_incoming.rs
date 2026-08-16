@@ -98,10 +98,7 @@ impl futures::Stream for LimitedTcpIncoming {
                 AcceptState::Idle => {
                     let permits = Arc::clone(&this.permits);
                     this.accept_state = AcceptState::WaitingPermit(Box::pin(async move {
-                        permits
-                            .acquire_owned()
-                            .await
-                            .expect("semaphore closed")
+                        permits.acquire_owned().await.expect("semaphore closed")
                     }));
                 }
                 AcceptState::WaitingPermit(_) => {
@@ -120,26 +117,24 @@ impl futures::Stream for LimitedTcpIncoming {
                         }
                     }
                 }
-                AcceptState::WaitingAccept(_) => {
-                    match this.listener.poll_accept(cx) {
-                        Poll::Ready(Ok((stream, _))) => {
-                            let AcceptState::WaitingAccept(permit) =
-                                std::mem::replace(&mut this.accept_state, AcceptState::Idle)
-                            else {
-                                unreachable!()
-                            };
-                            return Poll::Ready(Some(Ok(CountedTcpStream {
-                                inner: stream,
-                                _permit: permit,
-                            })));
-                        }
-                        Poll::Ready(Err(e)) => {
-                            this.accept_state = AcceptState::Idle;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Pending => return Poll::Pending,
+                AcceptState::WaitingAccept(_) => match this.listener.poll_accept(cx) {
+                    Poll::Ready(Ok((stream, _))) => {
+                        let AcceptState::WaitingAccept(permit) =
+                            std::mem::replace(&mut this.accept_state, AcceptState::Idle)
+                        else {
+                            unreachable!()
+                        };
+                        return Poll::Ready(Some(Ok(CountedTcpStream {
+                            inner: stream,
+                            _permit: permit,
+                        })));
                     }
-                }
+                    Poll::Ready(Err(e)) => {
+                        this.accept_state = AcceptState::Idle;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
             }
         }
     }

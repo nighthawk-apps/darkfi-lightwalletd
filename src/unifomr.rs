@@ -50,14 +50,17 @@ pub const UNIFOMR_DET_DOMAIN: &[u8] = b"DarkFi-UnifOMR-DetKey-v1";
 /// Domain separation for directory decoy PKs (hides registration bit).
 pub const UNIFOMR_CLUE_DIR_DECOY: &[u8] = b"DarkFi-UnifOMR-ClueDirDecoy-v1";
 
-/// Max clue layers per digest window (matches client `layer_count` cap).
+/// Max clue layers per digest page (matches client `layer_count` cap).
 pub const MAX_CLUE_LAYERS: usize = 64;
+/// Max digest pages per SIMD chunk (DoS bound). 64 pages × 64 layers = 4096 clues.
+pub const MAX_CLUE_PAGES: usize = 64;
 
 // Re-export ownership helpers so callers can use `unifomr::sign_clue_pk_ownership`.
 pub use crate::clue_ownership::{
-    clue_pk_ownership_message, decoy_ownership_proof, pad_ownership_proof,
-    sign_clue_pk_ownership, unpad_ownership_proof, verify_clue_pk_ownership,
-    CLUE_PK_OWNERSHIP_DOMAIN, OWNERSHIP_PROOF_WIRE_LEN,
+    clue_pk_ownership_message, decoy_ownership_proof, directory_attest_message,
+    pad_ownership_proof, sign_clue_pk_ownership, sign_directory_attestation, unpad_ownership_proof,
+    verify_clue_pk_ownership, verify_directory_attestation, CLUE_PK_OWNERSHIP_DOMAIN,
+    DIRECTORY_ATTEST_DOMAIN, OWNERSHIP_PROOF_WIRE_LEN,
 };
 
 const MIN_RESPONSE_TIME: Duration = Duration::from_millis(100);
@@ -277,7 +280,11 @@ impl RlweSecretKey {
         for i in 0..CLUE_H {
             let j = i + (rng.next_u32() as usize) % (CLUE_N - i);
             idxs.swap(i, j);
-            coeffs[idxs[i]] = if rng.next_u32().is_multiple_of(2) { 1 } else { -1 };
+            coeffs[idxs[i]] = if rng.next_u32().is_multiple_of(2) {
+                1
+            } else {
+                -1
+            };
         }
         Self { coeffs }
     }
@@ -321,7 +328,11 @@ impl RlwePublicKey {
         for i in 0..h {
             let j = i + (rng.next_u32() as usize) % (CLUE_N - i);
             idxs.swap(i, j);
-            u[idxs[i]] = if rng.next_u32().is_multiple_of(2) { 1 } else { -1 };
+            u[idxs[i]] = if rng.next_u32().is_multiple_of(2) {
+                1
+            } else {
+                -1
+            };
         }
         // Discrete Gaussian σ=0.5 (paper Param2), not uniform.
         let e1: Vec<i64> = (0..CLUE_N)
@@ -544,6 +555,20 @@ pub fn decoy_clue_public_key(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> Ve
     serialize_public_key(&pk)
 }
 
+/// Deterministic plausible `key_version` for a decoy directory entry.
+///
+/// Real registrations use unix timestamps. Hard-coding `0` leaked the
+/// registration bit to any `GetCluePublicKey` caller.
+pub fn decoy_key_version(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> u64 {
+    let mut h = blake3::Hasher::new_keyed(pepper);
+    h.update(UNIFOMR_CLUE_DIR_DECOY);
+    h.update(b"-key-version");
+    h.update(payment_pubkey);
+    let n = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+    // Plausible unix-timestamp window (~2023-11 through ~2026-06).
+    1_700_000_000 + (n % 80_000_000)
+}
+
 /// Public clue key derived from wallet (sender needs this — typically from address metadata).
 pub fn clue_keypair_from_wallet(
     wallet_secret: &[u8],
@@ -623,13 +648,13 @@ impl UnifOmrClient {
 
     pub fn decrypt_digest_slots(&self, digest: &[u8]) -> Result<Vec<u64>, String> {
         let mut flags = Vec::new();
-        // Wire (any-match, ℓ bits): [u32 chunk_count]
-        //   for each chunk: [u32 layer_count]
-        //     for each layer: ([u32 len][ct]) × CLUE_PLAINTEXT_BITS
-        // Each CT packs one SIMD slot per height (bit b = negacyclic coefficient
-        // b of the partial decrypt). A height matches iff **any** layer has
-        // **all ℓ** coefficients inside R_PRIME (client OR of per-layer ANDs —
-        // avoids CT×CT noise blow-up while keeping ε_p = ((2r′+1)/q)^ℓ).
+        // Wire (any-match, paged layers, ℓ bits): [u32 chunk_count]
+        //   for each chunk: [u32 page_count]
+        //     for each page: [u32 layer_count]
+        //       for each layer: ([u32 len][ct]) × CLUE_PLAINTEXT_BITS
+        // Each CT packs one SIMD slot per height. A height matches iff **any
+        // page** has **any** layer whose **all ℓ** coefficients sit inside
+        // R_PRIME. Pages replace force-match when a height has >64 clues.
         if digest.len() < 4 {
             return Err("empty digest".into());
         }
@@ -640,42 +665,12 @@ impl UnifOmrClient {
 
         for _ in 0..chunk_count {
             if off + 4 > digest.len() {
-                return Err("truncated digest layer_count".into());
+                return Err("truncated digest page_count".into());
             }
-            let layer_count = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
+            let page_count = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
-            if layer_count == 0 || layer_count > MAX_CLUE_LAYERS {
-                return Err(format!("invalid UnifOMR layer_count {layer_count}"));
-            }
-
-            // layers[l][b] = decoded slots for layer l, plaintext bit b.
-            let mut layers: Vec<Vec<Vec<u64>>> = Vec::with_capacity(layer_count);
-            for _ in 0..layer_count {
-                let mut bits: Vec<Vec<u64>> = Vec::with_capacity(CLUE_PLAINTEXT_BITS);
-                for _ in 0..CLUE_PLAINTEXT_BITS {
-                    if off + 4 > digest.len() {
-                        return Err("truncated digest".into());
-                    }
-                    let len = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
-                    off += 4;
-                    if off + len > digest.len() {
-                        return Err("truncated digest ct".into());
-                    }
-                    let ct = Ciphertext::from_bytes(&digest[off..off + len], &self.params)
-                        .map_err(|e| format!("digest ct: {e:?}"))?;
-                    off += len;
-                    let pt = self
-                        .det_sk
-                        .try_decrypt(&ct)
-                        .map_err(|e| format!("digest decrypt: {e:?}"))?;
-                    let slots = Vec::<u64>::try_decode(&pt, Encoding::simd())
-                        .map_err(|e| format!("digest decode: {e:?}"))?;
-                    if slots.len() < degree {
-                        return Err("digest slot count < BFV degree".into());
-                    }
-                    bits.push(slots);
-                }
-                layers.push(bits);
+            if page_count == 0 || page_count > MAX_CLUE_PAGES {
+                return Err(format!("invalid UnifOMR page_count {page_count}"));
             }
 
             let in_range = |raw: u64| -> bool {
@@ -686,11 +681,60 @@ impl UnifOmrClient {
                 };
                 centered.unsigned_abs() <= R_PRIME
             };
+            let mut page_matched = vec![false; degree];
 
-            for i in 0..degree {
-                let matched = layers
-                    .iter()
-                    .any(|bits| bits.iter().all(|slots| in_range(slots[i])));
+            for _ in 0..page_count {
+                if off + 4 > digest.len() {
+                    return Err("truncated digest layer_count".into());
+                }
+                let layer_count =
+                    u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                if layer_count == 0 || layer_count > MAX_CLUE_LAYERS {
+                    return Err(format!("invalid UnifOMR layer_count {layer_count}"));
+                }
+
+                let mut layers: Vec<Vec<Vec<u64>>> = Vec::with_capacity(layer_count);
+                for _ in 0..layer_count {
+                    let mut bits: Vec<Vec<u64>> = Vec::with_capacity(CLUE_PLAINTEXT_BITS);
+                    for _ in 0..CLUE_PLAINTEXT_BITS {
+                        if off + 4 > digest.len() {
+                            return Err("truncated digest".into());
+                        }
+                        let len =
+                            u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
+                        off += 4;
+                        if off + len > digest.len() {
+                            return Err("truncated digest ct".into());
+                        }
+                        let ct = Ciphertext::from_bytes(&digest[off..off + len], &self.params)
+                            .map_err(|e| format!("digest ct: {e:?}"))?;
+                        off += len;
+                        let pt = self
+                            .det_sk
+                            .try_decrypt(&ct)
+                            .map_err(|e| format!("digest decrypt: {e:?}"))?;
+                        let slots = Vec::<u64>::try_decode(&pt, Encoding::simd())
+                            .map_err(|e| format!("digest decode: {e:?}"))?;
+                        if slots.len() < degree {
+                            return Err("digest slot count < BFV degree".into());
+                        }
+                        bits.push(slots);
+                    }
+                    layers.push(bits);
+                }
+
+                for i in 0..degree {
+                    if layers
+                        .iter()
+                        .any(|bits| bits.iter().all(|slots| in_range(slots[i])))
+                    {
+                        page_matched[i] = true;
+                    }
+                }
+            }
+
+            for matched in page_matched {
                 // 0 ⇒ match; t/2 ⇒ non-match (fails the range check by design).
                 flags.push(if matched { 0 } else { t / 2 });
             }
@@ -821,93 +865,126 @@ impl UnifOmrDetector {
         digest.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
 
         for chunk in chunks {
-            let mut per_height: Vec<Vec<RlweCiphertext>> = Vec::with_capacity(degree);
-            let mut overflow: Vec<bool> = Vec::with_capacity(degree);
-            for (h, notes) in chunk {
-                let mut valid = Vec::new();
-                for note in notes {
-                    if note.omr_clue.is_empty() {
-                        continue;
-                    }
-                    match validate_unifomr_clue(&note.omr_clue) {
-                        Ok(()) => match deserialize_clue(&note.omr_clue) {
-                            Ok(ct) => valid.push(ct),
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "lightwalletd::unifomr",
-                                    "LWEmongrass/UnifOMR clue parse failed: {e}"
-                                );
-                            }
-                        },
+            self.encode_chunk_pages(&sk_cts, chunk, degree, t, MAX_CLUE_LAYERS, &mut digest)?;
+        }
+
+        Ok(digest)
+    }
+
+    /// Same as [`Self::evaluate`] with a test-only layer cap (pages of `layer_cap`).
+    #[cfg(test)]
+    fn evaluate_paged(
+        &self,
+        detection_key: &[u8],
+        block_notes: &[(u32, Vec<ClueNote>)],
+        layer_cap: usize,
+    ) -> Result<Vec<u8>, OmrError> {
+        let (key_net, sk_cts) = parse_detection_key(detection_key, &self.params)
+            .map_err(OmrError::DeserializationError)?;
+        if key_net != self.network {
+            return Err(OmrError::InvalidParameter("network mismatch".into()));
+        }
+        let degree = self.params.degree();
+        let t = self.params.plaintext();
+        let mut digest = Vec::new();
+        let chunks: Vec<_> = block_notes.chunks(degree).collect();
+        digest.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+        for chunk in chunks {
+            self.encode_chunk_pages(&sk_cts, chunk, degree, t, layer_cap.max(1), &mut digest)?;
+        }
+        Ok(digest)
+    }
+
+    fn encode_chunk_pages(
+        &self,
+        sk_cts: &[Ciphertext],
+        chunk: &[(u32, Vec<ClueNote>)],
+        degree: usize,
+        t: u64,
+        layer_cap: usize,
+        digest: &mut Vec<u8>,
+    ) -> Result<(), OmrError> {
+        let mut per_height: Vec<Vec<RlweCiphertext>> = Vec::with_capacity(degree);
+        for (h, notes) in chunk {
+            let mut valid = Vec::new();
+            for note in notes {
+                if note.omr_clue.is_empty() {
+                    continue;
+                }
+                match validate_unifomr_clue(&note.omr_clue) {
+                    Ok(()) => match deserialize_clue(&note.omr_clue) {
+                        Ok(ct) => valid.push(ct),
                         Err(e) => {
                             tracing::warn!(
                                 target: "lightwalletd::unifomr",
-                                "LWEmongrass rejected UnifOMR clue: {e}"
+                                "LWEmongrass/UnifOMR clue parse failed: {e}"
                             );
                         }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "lightwalletd::unifomr",
+                            "LWEmongrass rejected UnifOMR clue: {e}"
+                        );
                     }
                 }
-                // Layer-overflow: never silently drop clues (censorship vector —
-                // an attacker could stuff MAX_CLUE_LAYERS clues at a height to
-                // hide the next one). Instead the whole height is forced to
-                // match for every client (fail-open: costs one extra fetch).
-                let over = valid.len() > MAX_CLUE_LAYERS;
-                if over {
-                    tracing::warn!(
-                        target: "lightwalletd::unifomr",
-                        "height {h}: {} clues exceed MAX_CLUE_LAYERS={MAX_CLUE_LAYERS}; \
-                         forcing match for all clients (fail-open, no censorship)",
-                        valid.len()
-                    );
-                    valid.clear();
-                }
-                overflow.push(over);
-                per_height.push(valid);
             }
-            while per_height.len() < degree {
-                per_height.push(Vec::new());
-                overflow.push(false);
+            if valid.len() > layer_cap {
+                tracing::warn!(
+                    target: "lightwalletd::unifomr",
+                    "height {h}: {} clues exceed layer_cap={layer_cap}; \
+                     paging (no force-match)",
+                    valid.len()
+                );
             }
+            let max_keep = layer_cap.saturating_mul(MAX_CLUE_PAGES);
+            if valid.len() > max_keep {
+                tracing::error!(
+                    target: "lightwalletd::unifomr",
+                    "height {h}: truncating {} clues to {max_keep} (page cap)",
+                    valid.len()
+                );
+                valid.truncate(max_keep);
+            }
+            per_height.push(valid);
+        }
+        while per_height.len() < degree {
+            per_height.push(Vec::new());
+        }
 
-            let max_clues = per_height
+        let max_clues = per_height.iter().map(|v| v.len()).max().unwrap_or(0);
+        let page_count = max_clues.div_ceil(layer_cap).max(1);
+        digest.extend_from_slice(&(page_count as u32).to_le_bytes());
+
+        for page in 0..page_count {
+            let start = page * layer_cap;
+            let page_max = per_height
                 .iter()
-                .map(|v| v.len())
+                .map(|v| v.len().saturating_sub(start).min(layer_cap))
                 .max()
                 .unwrap_or(0)
                 .max(1);
-            debug_assert!(max_clues <= MAX_CLUE_LAYERS);
-            digest.extend_from_slice(&(max_clues as u32).to_le_bytes());
+            digest.extend_from_slice(&(page_max as u32).to_le_bytes());
 
-            for layer in 0..max_clues {
+            for layer in 0..page_max {
                 let mut layer_clues: Vec<SlotClue> = Vec::with_capacity(degree);
-                for (i, height_clues) in per_height.iter().enumerate() {
-                    if overflow[i] {
-                        // Forced match on layer 0; padding on the rest.
-                        layer_clues.push(if layer == 0 {
-                            SlotClue::ForcedMatch
-                        } else {
-                            SlotClue::Impertinent
-                        });
-                    } else if layer < height_clues.len() {
-                        layer_clues.push(SlotClue::Clue(height_clues[layer].clone()));
+                for height_clues in per_height.iter() {
+                    let idx = start + layer;
+                    if idx < height_clues.len() {
+                        layer_clues.push(SlotClue::Clue(height_clues[idx].clone()));
                     } else {
-                        // Pad shorter heights: impertinent so OR is unchanged.
                         layer_clues.push(SlotClue::Impertinent);
                     }
                 }
                 for bit in 0..CLUE_PLAINTEXT_BITS {
                     let mut layer_ct = Self::partial_decrypt_simd(
                         &self.params,
-                        &sk_cts,
+                        sk_cts,
                         &layer_clues,
                         degree,
                         t,
                         bit,
                     )?;
-                    // Digest modulus-switch (paper): drop to the last BFV level
-                    // (Q ≈ 2¹²⁰ → single 40-bit modulus). Plaintext slots are
-                    // invariant; rounding noise (≈‖s‖₁/2 ≈ 2¹¹) is far below
-                    // the last-level budget (Q′/2t ≈ 2¹⁹). Shrinks each CT 3×.
                     layer_ct
                         .switch_to_level(layer_ct.max_switchable_level())
                         .map_err(|e| OmrError::EvaluationError(format!("mod-switch: {e:?}")))?;
@@ -917,15 +994,12 @@ impl UnifOmrDetector {
                 }
             }
         }
-
-        Ok(digest)
+        Ok(())
     }
 
     /// Homomorphic `Enc((b − a∗sk)[bit])` packed one height per SIMD slot.
     ///
-    /// [`SlotClue::Impertinent`] slots use `a=0`, `b=t/2` (range check fails);
-    /// [`SlotClue::ForcedMatch`] slots use `a=0`, `b=0` (range check passes on
-    /// every bit for every detection key — layer-overflow fail-open).
+    /// [`SlotClue::Impertinent`] slots use `a=0`, `b=t/2` (range check fails).
     fn partial_decrypt_simd(
         params: &Arc<BfvParameters>,
         sk_cts: &[Ciphertext],
@@ -965,7 +1039,6 @@ impl UnifOmrDetector {
             match clue {
                 SlotClue::Clue(ct) => b_slots[i] = ct.b[bit] % t,
                 SlotClue::Impertinent => b_slots[i] = (t / 2) % t,
-                SlotClue::ForcedMatch => b_slots[i] = 0,
             }
         }
         let pt_b = Plaintext::try_encode(&b_slots, Encoding::simd(), params)
@@ -984,8 +1057,6 @@ enum SlotClue {
     Clue(RlweCiphertext),
     /// No clue at this (height, layer): decrypts to t/2 → never matches.
     Impertinent,
-    /// Layer-overflow fail-open: decrypts to 0 → matches every detection key.
-    ForcedMatch,
 }
 
 /// Timing-padded wrapper used by gRPC handlers.
@@ -1147,8 +1218,8 @@ mod tests {
         }
         let p0 = counts[&0] as f64 / n as f64;
         assert!((p0 - 0.7866).abs() < 0.005, "P(0) off: {p0}");
-        let p1 = (counts.get(&1).copied().unwrap_or(0)
-            + counts.get(&-1).copied().unwrap_or(0)) as f64
+        let p1 = (counts.get(&1).copied().unwrap_or(0) + counts.get(&-1).copied().unwrap_or(0))
+            as f64
             / n as f64;
         assert!((p1 - 0.2129).abs() < 0.005, "P(±1) off: {p1}");
         // Discrete Gaussian with parameter σ=0.5 has true variance
@@ -1181,9 +1252,11 @@ mod tests {
         // collapses matches to 0/t·½, so decode layer CTs here).
         let chunk_count = u32::from_le_bytes(digest[0..4].try_into().unwrap()) as usize;
         assert_eq!(chunk_count, 1);
-        let layer_count = u32::from_le_bytes(digest[4..8].try_into().unwrap()) as usize;
+        let page_count = u32::from_le_bytes(digest[4..8].try_into().unwrap()) as usize;
+        assert_eq!(page_count, 1);
+        let layer_count = u32::from_le_bytes(digest[8..12].try_into().unwrap()) as usize;
         assert_eq!(layer_count, 1);
-        let mut off = 8usize;
+        let mut off = 12usize;
         let t = client.params.plaintext();
         for bit in 0..CLUE_PLAINTEXT_BITS {
             let len = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
@@ -1212,32 +1285,46 @@ mod tests {
     }
 
     #[test]
-    fn test_layer_overflow_forces_match_no_censorship() {
-        // A height stuffed with > MAX_CLUE_LAYERS clues must match every
-        // detection key (fail-open) instead of silently dropping clues.
+    fn test_layer_overflow_pages_without_force_match() {
+        // layer_cap=1 + 2 clues ⇒ 2 pages. Alice's clue is on page 1 so she
+        // still matches; an unrelated detection key must not.
         let alice = [0x33u8; 32];
+        let bob = [0x77u8; 32];
         let spammer = [0x44u8; 32];
         let alice_client = UnifOmrClient::from_wallet(&alice, 0x01).unwrap();
+        let bob_client = UnifOmrClient::from_wallet(&bob, 0x01).unwrap();
+        let (_, alice_pk) = clue_keypair_from_wallet(&alice, 0x01).unwrap();
         let (_, spam_pk) = clue_keypair_from_wallet(&spammer, 0x01).unwrap();
         let mut r = StdRng::seed_from_u64(4242);
         let spam_clue = serialize_clue(&spam_pk.encrypt_zeros(&mut r));
+        let alice_clue = serialize_clue(&alice_pk.encrypt_zeros(&mut r));
         let notes = vec![(
             123u32,
             vec![
                 ClueNote {
-                    omr_clue: spam_clue
-                };
-                MAX_CLUE_LAYERS + 1
+                    omr_clue: spam_clue,
+                },
+                ClueNote {
+                    omr_clue: alice_clue,
+                },
             ],
         )];
-        let det_key = alice_client.build_detection_key(0x01).unwrap();
+        let alice_key = alice_client.build_detection_key(0x01).unwrap();
+        let bob_key = bob_client.build_detection_key(0x01).unwrap();
         let detector = UnifOmrDetector::new(0x01);
-        let digest = detector.evaluate(&det_key, &notes).unwrap();
-        let slots = alice_client.decrypt_digest_slots(&digest).unwrap();
-        let matches = UnifOmrClient::range_check_matches(&slots, 123, 123);
+        let alice_digest = detector.evaluate_paged(&alice_key, &notes, 1).unwrap();
+        let bob_digest = detector.evaluate_paged(&bob_key, &notes, 1).unwrap();
+        let page_count = u32::from_le_bytes(alice_digest[4..8].try_into().unwrap());
+        assert_eq!(page_count, 2, "two clues at layer_cap=1 must page");
+        let alice_slots = alice_client.decrypt_digest_slots(&alice_digest).unwrap();
+        let bob_slots = bob_client.decrypt_digest_slots(&bob_digest).unwrap();
         assert!(
-            matches.contains(&123),
-            "overflowed height must fail open (match) — censorship otherwise"
+            UnifOmrClient::range_check_matches(&alice_slots, 123, 123).contains(&123),
+            "alice clue on page 1 must still match"
+        );
+        assert!(
+            UnifOmrClient::range_check_matches(&bob_slots, 123, 123).is_empty(),
+            "unrelated key must not force-match on overflow"
         );
     }
 
@@ -1278,9 +1365,11 @@ mod tests {
                 .collect();
             let digest = detector.evaluate(&det_key, &notes).unwrap();
             // Raw per-bit slot decode for per-coefficient statistics.
-            let layer_count = u32::from_le_bytes(digest[4..8].try_into().unwrap()) as usize;
+            let page_count = u32::from_le_bytes(digest[4..8].try_into().unwrap()) as usize;
+            assert_eq!(page_count, 1);
+            let layer_count = u32::from_le_bytes(digest[8..12].try_into().unwrap()) as usize;
             assert_eq!(layer_count, 1);
-            let mut off = 8usize;
+            let mut off = 12usize;
             let mut bit_in_range = vec![[false; CLUE_PLAINTEXT_BITS]; degree];
             for bit in 0..CLUE_PLAINTEXT_BITS {
                 let len = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
@@ -1344,5 +1433,18 @@ mod tests {
         let matches = UnifOmrClient::range_check_matches(&slots, 0, (degree - 1) as u32);
         println!("ε_n: {}/{} pertinent clues detected", matches.len(), degree);
         assert_eq!(matches.len(), degree, "false negatives detected");
+    }
+
+    #[test]
+    fn decoy_key_version_is_plausible_and_stable() {
+        let pk = [0x11u8; 32];
+        let pepper = [0x22u8; 32];
+        let v1 = decoy_key_version(&pk, &pepper);
+        let v2 = decoy_key_version(&pk, &pepper);
+        assert_eq!(v1, v2);
+        assert_ne!(v1, 0);
+        assert!((1_700_000_000..1_780_000_000).contains(&v1));
+        let other = decoy_key_version(&[0x33u8; 32], &pepper);
+        assert_ne!(v1, other);
     }
 }

@@ -159,7 +159,8 @@ impl Cache {
         self.block_hashes.insert(height_key, &block.hash)?;
 
         // Store hash → height
-        self.hash_to_height.insert(block.hash, height_key.as_ref())?;
+        self.hash_to_height
+            .insert(block.hash, height_key.as_ref())?;
 
         // Extract and store nullifiers
         let all_nullifiers: Vec<[u8; 32]> = block
@@ -404,6 +405,36 @@ impl Cache {
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut pepper);
         self.meta.insert(KEY, pepper.as_slice())?;
         Ok(pepper)
+    }
+
+    /// Stable lightwalletd SecretKey used to attest `GetCluePublicKey` entries.
+    ///
+    /// Real and decoy lookups are signed with the same key so Schnorr-verify
+    /// no longer leaks the registration bit.
+    pub fn get_or_create_directory_attest_secret(&self) -> Result<darkfi_sdk::crypto::SecretKey> {
+        use darkfi_sdk::crypto::SecretKey;
+        use darkfi_sdk::pasta::group::ff::PrimeField;
+        const KEY: &[u8] = b"unifomr_dir_attest_sk_v1";
+        if let Some(existing) = self.meta.get(KEY)? {
+            if existing.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&existing);
+                return SecretKey::from_bytes(out).map_err(|e| {
+                    LightWalletError::CacheError(format!("invalid directory attest secret: {e}"))
+                });
+            }
+        }
+        let mut seed = [0u8; 8];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let sk = SecretKey::random(&mut darkfi::util::pcg::Pcg32::new(u64::from_le_bytes(seed)));
+        self.meta.insert(KEY, sk.inner().to_repr().as_slice())?;
+        Ok(sk)
+    }
+
+    /// 32-byte directory attest public key advertised in `GetLightInfo`.
+    pub fn directory_attest_public_key(&self) -> Result<[u8; 32]> {
+        let sk = self.get_or_create_directory_attest_secret()?;
+        Ok(darkfi_sdk::crypto::PublicKey::from_secret(sk).to_bytes())
     }
 
     /// Drop orphan OMR clue hints older than [`OMR_CLUE_HINT_TTL_SECS`] (S21).
@@ -1255,7 +1286,11 @@ mod tests {
         let range = cache.get_compact_blocks_range(1, 5).unwrap();
         assert_eq!(range.len(), 5);
         for (i, block) in range.iter().enumerate() {
-            assert_eq!(block.height, (i + 1) as u32, "blocks should be in ascending order");
+            assert_eq!(
+                block.height,
+                (i + 1) as u32,
+                "blocks should be in ascending order"
+            );
         }
     }
 
@@ -1295,4 +1330,3 @@ mod tests {
         );
     }
 }
-

@@ -14,8 +14,8 @@
 
 #![cfg(feature = "testnet-e2e")]
 
-use std::time::Duration;
 use darkfi::util::pcg::Pcg32;
+use std::time::Duration;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
