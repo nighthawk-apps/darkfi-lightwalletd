@@ -727,6 +727,27 @@ impl Cache {
         Ok(Some((height, tree_data.to_vec())))
     }
 
+    fn empty_tip_tree() -> darkfi_sdk::crypto::MerkleTree {
+        use darkfi_sdk::crypto::{MerkleNode, MerkleTree};
+        use darkfi_sdk::pasta::group::ff::Field;
+        use darkfi_sdk::pasta::pallas;
+        let mut tree = MerkleTree::new(TIP_TREE_CHECKPOINTS);
+        // On-chain Money tree starts with a dummy ZERO leaf. Clients that
+        // rebuild from GetNoteCommitments do the same. Without this sentinel
+        // GetTreeState roots never match coin_roots.
+        tree.append(MerkleNode::from(pallas::Base::ZERO));
+        let _ = tree.mark();
+        tree
+    }
+
+    fn coin_to_merkle_node(coin: &[u8; 32]) -> Result<darkfi_sdk::crypto::MerkleNode> {
+        darkfi_sdk::crypto::MerkleNode::from_bytes(*coin).ok_or_else(|| {
+            LightWalletError::SerializationError(
+                "coin bytes are not a canonical pallas::Base".into(),
+            )
+        })
+    }
+
     fn load_or_empty_tip_tree(&self) -> Result<darkfi_sdk::crypto::MerkleTree> {
         if let Some(bytes) = self.meta.get(META_TIP_MERKLE_TREE)? {
             match darkfi_serial::deserialize(&bytes) {
@@ -739,7 +760,7 @@ impl Cache {
                 }
             }
         }
-        Ok(darkfi_sdk::crypto::MerkleTree::new(TIP_TREE_CHECKPOINTS))
+        Ok(Self::empty_tip_tree())
     }
 
     fn store_tip_tree(&self, height: u32, tree: &darkfi_sdk::crypto::MerkleTree) -> Result<()> {
@@ -754,19 +775,13 @@ impl Cache {
     fn append_coins_to_tip_tree(&self, height: u32, coins: &[[u8; 32]]) -> Result<()> {
         let mut tree = self.load_or_empty_tip_tree()?;
         for coin in coins {
-            let node: darkfi_sdk::crypto::MerkleNode =
-                darkfi_serial::deserialize(coin).map_err(|e| {
-                    LightWalletError::SerializationError(format!(
-                        "Invalid coin bytes for Merkle append: {e}"
-                    ))
-                })?;
-            tree.append(node);
+            tree.append(Self::coin_to_merkle_node(coin)?);
         }
         self.store_tip_tree(height, &tree)
     }
 
     fn rebuild_tip_merkle_tree(&self, tip_height: u32) -> Result<()> {
-        let mut tree = darkfi_sdk::crypto::MerkleTree::new(TIP_TREE_CHECKPOINTS);
+        let mut tree = Self::empty_tip_tree();
         if tip_height == 0 && self.get_compact_block(0)?.is_none() {
             self.meta.remove(META_TIP_MERKLE_TREE)?;
             self.meta.remove(META_TIP_MERKLE_HEIGHT)?;
@@ -775,13 +790,7 @@ impl Cache {
         let ranges = self.get_coins_range(0, tip_height)?;
         for (_h, coins) in ranges {
             for coin in coins {
-                let node: darkfi_sdk::crypto::MerkleNode = darkfi_serial::deserialize(&coin)
-                    .map_err(|e| {
-                        LightWalletError::SerializationError(format!(
-                            "Invalid coin bytes during tip tree rebuild: {e}"
-                        ))
-                    })?;
-                tree.append(node);
+                tree.append(Self::coin_to_merkle_node(&coin)?);
             }
         }
         self.store_tip_tree(tip_height, &tree)
@@ -1328,5 +1337,26 @@ mod tests {
             cache.get_clue_public_key(&payment_pk).unwrap().unwrap(),
             clue_pk
         );
+    }
+
+    #[test]
+    fn empty_tip_tree_matches_wallet_zero_sentinel() {
+        use darkfi_sdk::crypto::{MerkleNode, MerkleTree};
+        use darkfi_sdk::pasta::group::ff::Field;
+        use darkfi_sdk::pasta::pallas;
+        let tip = Cache::empty_tip_tree();
+        let mut wallet = MerkleTree::new(u32::MAX as usize);
+        wallet.append(MerkleNode::from(pallas::Base::ZERO));
+        assert_eq!(tip.root(0).unwrap(), wallet.root(0).unwrap());
+    }
+
+    #[test]
+    fn coin_to_merkle_node_accepts_canonical_bytes() {
+        let coin = make_valid_coin(7);
+        assert!(Cache::coin_to_merkle_node(&coin).is_ok());
+        let mut bad = [0xFFu8; 32];
+        bad[31] = 0xFF;
+        // All-0xFF is not a canonical pallas::Base.
+        assert!(Cache::coin_to_merkle_node(&bad).is_err());
     }
 }
