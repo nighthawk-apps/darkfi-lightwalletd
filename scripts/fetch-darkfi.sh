@@ -38,6 +38,10 @@ checkout_pin() {
     git checkout --detach "$ref"
   elif git rev-parse --verify "origin/${ref}^{commit}" >/dev/null 2>&1; then
     git checkout --detach "origin/${ref}"
+  elif git fetch origin "$ref" 2>/dev/null && git rev-parse --verify FETCH_HEAD >/dev/null 2>&1; then
+    # Pinned commit is not an ancestor of any fetched branch tip (common right
+    # after a shallow/default clone). Fetch the exact object by SHA.
+    git checkout --detach FETCH_HEAD
   else
     echo "error: cannot resolve DARKFI_GIT_REF='$ref' in $DARKFI_DIR" >&2
     exit 1
