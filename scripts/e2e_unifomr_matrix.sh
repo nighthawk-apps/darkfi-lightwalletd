@@ -69,8 +69,8 @@ echo -e "\n${CYAN}Mobile FFI UnifOMR unit parity${NC}"
 for label_dir in "ios:$IOS_FFI" "android:$AND_FFI"; do
   label="${label_dir%%:*}"
   dir="${label_dir#*:}"
-  if (cd "$dir" && cargo test --lib test_unifomr_any_match_second_clue -- --nocapture >/tmp/e2e_${label}_unifomr.log 2>&1); then
-    report PASS "${label} any-match unit"
+  if (cd "$dir" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >/tmp/e2e_${label}_unifomr.log 2>&1); then
+    report PASS "${label} per-message multi-clue unit"
   else
     report FAIL "${label} any-match unit"
     tail -20 "/tmp/e2e_${label}_unifomr.log" || true

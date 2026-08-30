@@ -23,8 +23,8 @@
 #![cfg(feature = "fhe-omr")]
 
 use darkfi_lightwalletd::unifomr::{
-    clue_keypair_from_wallet, serialize_clue, validate_unifomr_clue, ClueNote, UnifOmrClient,
-    UnifOmrDetector, SCHEME_UNIFOMR,
+    clue_keypair_from_wallet, flatten_messages, serialize_clue, validate_unifomr_clue, ClueNote,
+    UnifOmrClient, UnifOmrDetector, SCHEME_UNIFOMR,
 };
 use rand::rng;
 
@@ -55,7 +55,8 @@ fn unifomr_detector_scheme_and_digest_roundtrip() {
 
     let notes = vec![(100u32, vec![ClueNote { omr_clue: clue }])];
     let digest = det.evaluate(&det_key, &notes).expect("evaluate");
+    let (_, slot_heights) = flatten_messages(&notes);
     let slots = client.decrypt_digest_slots(&digest).expect("decrypt");
-    let matches = UnifOmrClient::range_check_matches(&slots, 100, 100);
+    let matches = UnifOmrClient::range_check_matches(&slots, &slot_heights);
     assert!(matches.contains(&100), "pertinent height must match");
 }

@@ -17,8 +17,8 @@ use darkfi_lightwalletd::proto::{
 };
 use darkfi_lightwalletd::unifomr::{
     build_omr_clue_from_pk, clue_keypair_from_wallet, clue_public_key_wire_len,
-    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership, verify_clue_pk_ownership,
-    verify_directory_attestation, UnifOmrClient, SCHEME_UNIFOMR,
+    deserialize_public_key, serialize_public_key, sign_clue_pk_ownership, unpack_slot_heights,
+    verify_clue_pk_ownership, verify_directory_attestation, UnifOmrClient, SCHEME_UNIFOMR,
 };
 use darkfi_sdk::crypto::Keypair;
 
@@ -38,6 +38,7 @@ async fn connect(url: &str) -> Result<Client, String> {
     const MAX_MSG: usize = 160 * 1024 * 1024;
     let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
         .map_err(|e| format!("endpoint: {e}"))?
+        .timeout(std::time::Duration::from_secs(1800))
         .tcp_nodelay(true);
     // tonic does not auto-enable TLS from an https:// URL on Endpoint::connect;
     // install system roots for remote Studio/ngrok (and any public LWD).
@@ -446,16 +447,22 @@ async fn main() {
                     .await
                 {
                     Ok(resp) => {
-                        let digest = resp.into_inner().encrypted_digest;
-                        match crypto.decrypt_digest_slots(&digest) {
-                            Ok(slots) => {
-                                let _ = UnifOmrClient::range_check_matches(&slots, start, end);
-                                pass(&format!(
-                                    "GetUnifOmrDigest decrypt ok (range {start}..={end}, slots={})",
-                                    slots.len()
-                                ));
-                            }
-                            Err(e) => fail("GetUnifOmrDigest decrypt", &e),
+                        let resp = resp.into_inner();
+                        let digest = resp.encrypted_digest;
+                        match unpack_slot_heights(&resp.slot_heights) {
+                            Ok(slot_heights) => match crypto.decrypt_digest_slots(&digest) {
+                                Ok(slots) => {
+                                    let _ = UnifOmrClient::range_check_matches(&slots, &slot_heights);
+                                    pass(&format!(
+                                        "GetUnifOmrDigest decrypt ok (range {start}..={end}, \
+                                         msgs={}, slots={})",
+                                        slot_heights.len(),
+                                        slots.len()
+                                    ));
+                                }
+                                Err(e) => fail("GetUnifOmrDigest decrypt", &e),
+                            },
+                            Err(e) => fail("GetUnifOmrDigest slot_heights", &e),
                         }
                     }
                     Err(e) => fail("GetUnifOmrDigest RPC", &e.to_string()),

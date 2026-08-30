@@ -23,7 +23,7 @@
 //! and streams/returns data to wallet clients.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
@@ -65,6 +65,58 @@ const SEND_PEER_BIND_TTL: Duration = Duration::from_secs(86_400);
 /// Hard cap on `recent_send_peers` entries to prevent unbounded memory growth (M2).
 const MAX_SEND_PEER_ENTRIES: usize = 100_000;
 
+/// Inclusive height span as `u64` so `end = u32::MAX` cannot wrap the cap.
+fn height_span(start: u32, end: u32) -> Result<u64, Status> {
+    if start > end {
+        return Err(Status::invalid_argument(format!(
+            "Invalid height range: start={start} > end={end}"
+        )));
+    }
+    Ok((end as u64) - (start as u64) + 1)
+}
+
+fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
+    let span = height_span(start, end)?;
+    if span > MAX_BLOCKS_PER_REQUEST as u64 {
+        return Err(Status::invalid_argument(format!(
+            "Range too large: {span} blocks requested, max is {MAX_BLOCKS_PER_REQUEST}"
+        )));
+    }
+    Ok(span)
+}
+
+/// True if `ip` matches an allow-list entry (`1.2.3.4` or IPv4 CIDR).
+fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
+    let entry = entry.trim();
+    if let Ok(exact) = entry.parse::<IpAddr>() {
+        return ip == exact;
+    }
+    let Some((base, bits)) = entry.split_once('/') else {
+        return false;
+    };
+    let Ok(bits) = bits.parse::<u32>() else {
+        return false;
+    };
+    match (ip, base.parse::<Ipv4Addr>()) {
+        (IpAddr::V4(ip4), Ok(base4)) if bits <= 32 => {
+            let mask = if bits == 0 {
+                0
+            } else {
+                !0u32 << (32 - bits)
+            };
+            (u32::from(ip4) & mask) == (u32::from(base4) & mask)
+        }
+        _ => false,
+    }
+}
+
+fn client_ip_from_forwarded(header: &str) -> Option<IpAddr> {
+    header
+        .split(',')
+        .next()
+        .and_then(|hop| hop.trim().parse::<IpAddr>().ok())
+}
+
 /// Server state shared across all gRPC handlers.
 pub struct LightWalletService {
     /// Local compact block cache
@@ -92,6 +144,8 @@ pub struct LightWalletService {
     tip_notify: tokio::sync::watch::Receiver<u32>,
     /// Limits concurrent FHE `spawn_blocking` workers (CPU / RAM).
     fhe_permits: Arc<tokio::sync::Semaphore>,
+    /// TCP peers from which `X-Forwarded-For` is trusted (empty = ignore the header).
+    trusted_proxies: Vec<String>,
 }
 
 impl LightWalletService {
@@ -111,6 +165,7 @@ impl LightWalletService {
             120,
             DEFAULT_MAX_TX_BYTES,
             tip_notify,
+            Vec::new(),
         )
     }
 
@@ -124,6 +179,7 @@ impl LightWalletService {
         rpc_rate_limit_per_min: u32,
         max_tx_bytes: usize,
         tip_notify: tokio::sync::watch::Receiver<u32>,
+        trusted_proxies: Vec<String>,
     ) -> Self {
         Self {
             cache,
@@ -144,14 +200,31 @@ impl LightWalletService {
             recent_send_peers: Arc::new(Mutex::new(HashMap::new())),
             tip_notify,
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
+            trusted_proxies,
         }
     }
 
-    fn peer_ip<T>(request: &Request<T>) -> IpAddr {
-        request
+    fn peer_ip<T>(&self, request: &Request<T>) -> IpAddr {
+        let remote = request
             .remote_addr()
             .map(|a| a.ip())
-            .unwrap_or_else(|| IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        if self.trusted_proxies.is_empty() {
+            return remote;
+        }
+        let trusted = self
+            .trusted_proxies
+            .iter()
+            .any(|e| ip_matches_proxy_entry(remote, e));
+        if !trusted {
+            return remote;
+        }
+        request
+            .metadata()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(client_ip_from_forwarded)
+            .unwrap_or(remote)
     }
 
     fn remember_send_peer(&self, tx_hash: [u8; 32], peer: IpAddr) {
@@ -197,7 +270,7 @@ impl LightWalletService {
 
     #[allow(clippy::result_large_err)]
     fn check_clue_rate_limit<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        if self.clue_rate_limiter.check(Self::peer_ip(request)) {
+        if self.clue_rate_limiter.check(self.peer_ip(request)) {
             Ok(())
         } else {
             Err(Status::resource_exhausted(
@@ -208,7 +281,7 @@ impl LightWalletService {
 
     #[allow(clippy::result_large_err)]
     fn check_rpc_rate_limit<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        if self.rpc_rate_limiter.check(Self::peer_ip(request)) {
+        if self.rpc_rate_limiter.check(self.peer_ip(request)) {
             Ok(())
         } else {
             Err(Status::resource_exhausted(
@@ -246,19 +319,7 @@ impl DarkFiLightWallet for LightWalletService {
         let start = range.start_height;
         let end = range.end_height;
 
-        if start > end {
-            return Err(Status::invalid_argument(format!(
-                "Invalid block range: start={start} > end={end}"
-            )));
-        }
-
-        // SECURITY: Enforce max range to prevent DoS via unbounded requests
-        if end - start + 1 > MAX_BLOCKS_PER_REQUEST {
-            return Err(Status::invalid_argument(format!(
-                "Range too large: {} blocks requested, max is {MAX_BLOCKS_PER_REQUEST}",
-                end - start + 1
-            )));
-        }
+        reject_oversized_window(start, end)?;
 
         let cache = Arc::clone(&self.cache);
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -492,7 +553,7 @@ impl DarkFiLightWallet for LightWalletService {
         request: Request<proto::RawTransaction>,
     ) -> Result<Response<proto::SendResponse>, Status> {
         self.check_rpc_rate_limit(&request)?;
-        let peer = Self::peer_ip(&request);
+        let peer = self.peer_ip(&request);
         let req = request.into_inner();
         let mut tx_data = req.data;
         let mut omr_clue = req.omr_clue;
@@ -595,7 +656,12 @@ impl DarkFiLightWallet for LightWalletService {
                             req.omr_metadata_enc.len()
                         );
                     } else if let Some(hash) = hash {
-                        if let Err(e) = self.cache.store_omr_metadata_enc(
+                        if self.cache.has_omr_metadata_enc(&hash).unwrap_or(false) {
+                            tracing::info!(
+                                target: "lightwalletd::server",
+                                "OMR metadata_enc already present for tx; first-writer-wins, not overwriting"
+                            );
+                        } else if let Err(e) = self.cache.store_omr_metadata_enc(
                             &hash,
                             req.omr_metadata_enc,
                             Some(req.omr_clue_output_index),
@@ -648,15 +714,7 @@ impl DarkFiLightWallet for LightWalletService {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
 
-        // SECURITY: Enforce max range
-        if range.start_height > range.end_height {
-            return Err(Status::invalid_argument("Invalid range: start > end"));
-        }
-        if range.end_height - range.start_height + 1 > MAX_BLOCKS_PER_REQUEST {
-            return Err(Status::invalid_argument(format!(
-                "Range too large: max is {MAX_BLOCKS_PER_REQUEST}"
-            )));
-        }
+        reject_oversized_window(range.start_height, range.end_height)?;
 
         let cache = Arc::clone(&self.cache);
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -698,15 +756,7 @@ impl DarkFiLightWallet for LightWalletService {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
 
-        // SECURITY: Enforce max range
-        if range.start_height > range.end_height {
-            return Err(Status::invalid_argument("Invalid range: start > end"));
-        }
-        if range.end_height - range.start_height + 1 > MAX_BLOCKS_PER_REQUEST {
-            return Err(Status::invalid_argument(format!(
-                "Range too large: max is {MAX_BLOCKS_PER_REQUEST}"
-            )));
-        }
+        reject_oversized_window(range.start_height, range.end_height)?;
 
         let cache = Arc::clone(&self.cache);
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -899,7 +949,7 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<proto::Empty>, Status> {
         // Prefer clue-on-SendTransaction; standalone Register is transitional and rate-limited.
         self.check_clue_rate_limit(&request)?;
-        let peer = Self::peer_ip(&request);
+        let peer = self.peer_ip(&request);
 
         let req = request.into_inner();
         if req.tx_hash.len() != 32 {
@@ -961,13 +1011,14 @@ impl DarkFiLightWallet for LightWalletService {
         #[cfg(feature = "fhe-omr")]
         {
             use tokio_stream::StreamExt;
-            let peer = Self::peer_ip(&request);
+            let peer = self.peer_ip(&request);
             let mut stream = request.into_inner();
 
             let mut start = 0;
             let mut end = 0;
             let mut num_keys = 0;
             let mut header_received = false;
+            let mut fhe_permit = None;
 
             let mut current_key = Vec::new();
             let mut keys = Vec::new();
@@ -989,8 +1040,17 @@ impl DarkFiLightWallet for LightWalletService {
                             "Too many UnifOMR detection_keys (max 16)",
                         ));
                     }
-                    // Rate-limit before accepting the ~120 MiB detection-key body.
+                    reject_oversized_window(start, end)?;
+                    // Rate-limit and take an FHE slot before accepting the
+                    // ~120 MiB detection-key body so waiters cannot park
+                    // 160 MiB each on the semaphore.
                     self.check_omr_rate_limit(peer, num_keys)?;
+                    fhe_permit = Some(
+                        self.fhe_permits
+                            .acquire()
+                            .await
+                            .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?,
+                    );
                 }
 
                 current_key.extend_from_slice(&chunk.data);
@@ -1045,17 +1105,8 @@ impl DarkFiLightWallet for LightWalletService {
                 }
             }
 
-            if start > end {
-                return Err(Status::invalid_argument(format!(
-                    "Invalid height range: start={start} > end={end}"
-                )));
-            }
-            if end - start + 1 > MAX_BLOCKS_PER_REQUEST {
-                return Err(Status::invalid_argument(format!(
-                    "UnifOMR range too large: {} blocks (max {MAX_BLOCKS_PER_REQUEST})",
-                    end - start + 1
-                )));
-            }
+            let _permit = fhe_permit
+                .ok_or_else(|| Status::invalid_argument("Empty stream"))?;
 
             let tip_height = self
                 .cache
@@ -1063,13 +1114,13 @@ impl DarkFiLightWallet for LightWalletService {
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?
                 .map(|(h, _)| h)
                 .unwrap_or(0);
-            let mut complete = tip_height >= end;
-            if complete {
+            let mut range_complete = tip_height >= end;
+            if range_complete {
                 for h in start..=end {
                     match self.cache.get_block_hash(h) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            complete = false;
+                            range_complete = false;
                             break;
                         }
                         Err(e) => {
@@ -1085,34 +1136,47 @@ impl DarkFiLightWallet for LightWalletService {
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
 
             let network_byte = self.network_byte;
-            let _permit = self
-                .fhe_permits
-                .acquire()
+            // Paper-faithful per-message packing: flatten the window once
+            // (key-independent) into per-message order + the slot → height map,
+            // then encode a digest frame per detection key over the same
+            // messages. A window whose flattened message count exceeds
+            // MAX_OMR_MESSAGES is truncated at a whole-height boundary and
+            // reported via `complete = false`.
+            let (encrypted_digest, slot_heights_wire, truncated) =
+                tokio::task::spawn_blocking(move || {
+                    let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
+                    let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
+                    let (mut messages, mut slot_heights) =
+                        crate::unifomr::flatten_messages(&clue_notes);
+                    let truncated = crate::unifomr::cap_messages_to_whole_heights(
+                        &mut messages,
+                        &mut slot_heights,
+                    );
+                    let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
+                    let digest = if keys.len() == 1 {
+                        crate::unifomr::encode_messages_padded(&detector, &keys[0], &messages)
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        let mut out = Vec::new();
+                        for key in &keys {
+                            let d =
+                                crate::unifomr::encode_messages_padded(&detector, key, &messages)
+                                    .map_err(|e| e.to_string())?;
+                            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&d);
+                        }
+                        out
+                    };
+                    Ok::<(Vec<u8>, Vec<u8>, bool), String>((digest, slot_heights_wire, truncated))
+                })
                 .await
-                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
-            let encrypted_digest = tokio::task::spawn_blocking(move || {
-                let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
-                let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
-                if keys.len() == 1 {
-                    return crate::unifomr::evaluate_padded(&detector, &keys[0], &clue_notes)
-                        .map_err(|e| e.to_string());
-                }
-                let mut out = Vec::new();
-                for key in &keys {
-                    let digest = crate::unifomr::evaluate_padded(&detector, key, &clue_notes)
-                        .map_err(|e| e.to_string())?;
-                    out.extend_from_slice(&(digest.len() as u32).to_le_bytes());
-                    out.extend_from_slice(&digest);
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
-            .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
+                .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
+                .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
 
             Ok(Response::new(proto::OmrDigestResponse {
                 encrypted_digest,
-                complete,
+                complete: range_complete && !truncated,
+                slot_heights: slot_heights_wire,
             }))
         }
     }
@@ -1130,7 +1194,7 @@ impl DarkFiLightWallet for LightWalletService {
         }
         #[cfg(feature = "fhe-omr")]
         {
-            let peer = Self::peer_ip(&request);
+            let peer = self.peer_ip(&request);
             self.check_omr_rate_limit(peer, 1)?;
             let req = request.into_inner();
 
@@ -1139,13 +1203,12 @@ impl DarkFiLightWallet for LightWalletService {
             }
             let start = req.start_height;
             let end = req.end_height;
-            if start > end {
-                return Err(Status::invalid_argument("invalid PIR height window"));
-            }
-            let window = (end - start + 1) as usize;
-            if window > MAX_BLOCKS_PER_REQUEST as usize {
-                return Err(Status::invalid_argument("PIR window too large"));
-            }
+            let window = reject_oversized_window(start, end)? as usize;
+            let _permit = self
+                .fhe_permits
+                .acquire()
+                .await
+                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
             let degree = crate::unifomr::packing_degree();
             let num_stripes = crate::pir_server::sealpir_stripe_count(window, degree);
             if num_stripes > MAX_PIR_STRIPES {
@@ -1205,11 +1268,6 @@ impl DarkFiLightWallet for LightWalletService {
             let db = crate::pir_server::limb_column(&payloads, limb_index);
             let queries = req.query_ciphertexts;
 
-            let _permit = self
-                .fhe_permits
-                .acquire()
-                .await
-                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
             let payload_ciphertexts = tokio::task::spawn_blocking(move || {
                 let server = crate::pir_server::BatchPirServer::with_unifomr_params();
                 server.evaluate_sealpir_stripes(&queries, &db, window)
@@ -1299,10 +1357,15 @@ impl DarkFiLightWallet for LightWalletService {
                         .cache
                         .get_or_create_clue_dir_pepper()
                         .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
-                    (
-                        crate::unifomr::decoy_clue_public_key(&pk, &pepper),
-                        crate::unifomr::decoy_key_version(&pk, &pepper),
-                    )
+                    let pk_c = pk;
+                    tokio::task::spawn_blocking(move || {
+                        (
+                            crate::unifomr::decoy_clue_public_key(&pk_c, &pepper),
+                            crate::unifomr::decoy_key_version(&pk_c, &pepper),
+                        )
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("decoy keygen join error: {e}")))?
                 }
             }
         };
@@ -1314,7 +1377,16 @@ impl DarkFiLightWallet for LightWalletService {
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?
             {
                 Some((ver, _stored_proof, real)) => (real, ver),
-                None => (Vec::new(), 0u64),
+                None => {
+                    // Non-empty dummy so `found=true` + empty body cannot leak
+                    // the registration bit on non-fhe-omr builds.
+                    let dummy = blake3::hash(&pk).as_bytes().to_vec();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(1_700_000_000);
+                    (dummy, now.saturating_sub(u64::from(pk[0]) * 86_400))
+                }
             }
         };
 
@@ -1329,12 +1401,13 @@ impl DarkFiLightWallet for LightWalletService {
         )
         .map_err(Status::internal)?;
 
-        // Pad past worst-case decoy RLWE keygen (n=1024) so cache-hit vs decoy
-        // is not distinguishable by latency.
+        // Fixed deadline (not a floor after leftover work) so load-induced
+        // decoy keygen overruns still aim at the same response time.
         const MIN_CLUE_LOOKUP: Duration = Duration::from_millis(250);
-        let elapsed = start.elapsed();
-        if elapsed < MIN_CLUE_LOOKUP {
-            tokio::time::sleep(MIN_CLUE_LOOKUP - elapsed).await;
+        let deadline = start + MIN_CLUE_LOOKUP;
+        let now = Instant::now();
+        if now < deadline {
+            tokio::time::sleep(deadline.saturating_duration_since(now)).await;
         }
 
         // Always report found=true with a fixed-size valid key (real or decoy)
@@ -1345,5 +1418,32 @@ impl DarkFiLightWallet for LightWalletService {
             ownership_proof,
             key_version,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_span_rejects_wraparound() {
+        assert!(height_span(0, u32::MAX).unwrap() > MAX_BLOCKS_PER_REQUEST as u64);
+        assert!(reject_oversized_window(0, u32::MAX).is_err());
+        assert!(reject_oversized_window(10, 9).is_err());
+        assert_eq!(reject_oversized_window(1, 1).unwrap(), 1);
+        assert_eq!(reject_oversized_window(1, 10_000).unwrap(), 10_000);
+        assert!(reject_oversized_window(1, 10_001).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_match_exact_and_cidr() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(ip_matches_proxy_entry(loopback, "127.0.0.1"));
+        assert!(ip_matches_proxy_entry(loopback, "127.0.0.0/8"));
+        assert!(!ip_matches_proxy_entry(loopback, "10.0.0.0/8"));
+        assert_eq!(
+            client_ip_from_forwarded("203.0.113.9, 127.0.0.1"),
+            "203.0.113.9".parse::<IpAddr>().ok()
+        );
     }
 }

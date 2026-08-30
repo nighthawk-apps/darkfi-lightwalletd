@@ -259,13 +259,24 @@ message LightInfo {
 // === OMR Messages ===
 
 message OmrDigestResponse {
-  // FHE encrypted digest containing the matching block heights.
+  // FHE encrypted digest, paper-faithful per-message packing: one clue per
+  // SIMD slot, ℓ ciphertexts per chunk of D messages. Wire per digest frame:
+  // [u8 version][u32 chunk_count]([u32 len][ct]) × (ℓ × chunk_count).
   // For multi-key requests: length-prefixed frames, one digest per key
   // ([u32 LE len][digest]…), decrypted client-side with the matching key.
   // The client decrypts this locally.
   bytes encrypted_digest = 1;
-  // Whether the digest covers the full requested range
+  // Whether the digest covers the full requested range. False when the window
+  // was truncated at a whole-height boundary because its flattened message
+  // count exceeded the server's MAX_OMR_MESSAGES cap; the client then advances
+  // only through the last covered height (max of slot_heights) and continues.
   bool complete = 2;
+  // Ordered slot -> block-height map for the packed messages: packed little-
+  // endian u32, length == total message count M. Slot index i (across all
+  // chunks, chunk-major) maps to height slot_heights[i]; slots >= M in the
+  // final chunk are padding and ignored. Identical for every detection key in
+  // a multi-key request (same window ordering), so it is sent once.
+  bytes slot_heights = 3;
 }
 
 // === Streaming detection key messages (StreamDetectionKey RPC) ===

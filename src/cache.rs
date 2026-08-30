@@ -289,6 +289,11 @@ impl Cache {
         Ok(())
     }
 
+    /// True if recipient-encrypted OMR metadata is already stored for this tx.
+    pub fn has_omr_metadata_enc(&self, tx_hash: &[u8; 32]) -> Result<bool> {
+        Ok(self.omr_metadata_enc.contains_key(tx_hash.as_slice())?)
+    }
+
     /// True if a clue hint is already stored for this tx (e.g. from SendTransaction).
     ///
     /// Prunes expired hints first so TTL is observed (S21).
@@ -321,6 +326,18 @@ impl Cache {
             return Err(LightWalletError::CacheError(
                 "invalid ownership proof size".into(),
             ));
+        }
+        // Keep registered versions in the same unix-timestamp shape as decoys
+        // so `key_version=1` or a far-future value cannot prove registration.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        const MIN_PLAUSIBLE: u64 = 1_600_000_000; // ~2020-09
+        if key_version < MIN_PLAUSIBLE || key_version > now.saturating_add(86_400) {
+            return Err(LightWalletError::CacheError(format!(
+                "clue key_version {key_version} is outside the plausible unix-timestamp window"
+            )));
         }
         if let Some(existing) = self.omr_clue_pubkeys.get(payment_pubkey.as_slice())? {
             if let Some((stored_version, stored_proof, stored_clue)) =
@@ -544,7 +561,8 @@ impl Cache {
             return Err(LightWalletError::InvalidBlockRange(start, end));
         }
 
-        let mut blocks = Vec::with_capacity((end - start + 1) as usize);
+        let span = ((end as u64).saturating_sub(start as u64).saturating_add(1)).min(10_000);
+        let mut blocks = Vec::with_capacity(span as usize);
         let start_key = start.to_be_bytes();
         let end_key = end.to_be_bytes();
 
@@ -816,6 +834,9 @@ impl Cache {
         if start > end {
             return Err(LightWalletError::InvalidBlockRange(start, end));
         }
+        if (end as u64).saturating_sub(start as u64).saturating_add(1) > 10_000 {
+            return Err(LightWalletError::InvalidBlockRange(start, end));
+        }
 
         let mut by_height: std::collections::BTreeMap<u32, Vec<NoteForDetection>> =
             std::collections::BTreeMap::new();
@@ -857,7 +878,8 @@ impl Cache {
         }
 
         // S19: emit a slot for every height so SIMD index == height - start.
-        let mut result = Vec::with_capacity((end - start + 1) as usize);
+        let span = ((end as u64).saturating_sub(start as u64).saturating_add(1)).min(10_000);
+        let mut result = Vec::with_capacity(span as usize);
         for height in start..=end {
             result.push((height, by_height.remove(&height).unwrap_or_default()));
         }

@@ -89,6 +89,12 @@ pub struct Config {
     /// Optional path to PEM TLS private key for gRPC.
     #[serde(default)]
     pub tls_key_path: Option<String>,
+
+    /// TCP peers (exact IP or IPv4 CIDR) from which `X-Forwarded-For` is trusted.
+    /// Empty (default): ignore the header and use the TCP source address.
+    /// Set to `["127.0.0.1"]` when nginx/HAProxy terminates TLS on loopback.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_darkfid_endpoint() -> String {
@@ -147,7 +153,9 @@ fn default_max_tx_bytes() -> usize {
 }
 
 fn default_request_timeout_s() -> u64 {
-    300
+    // Param2 UnifOMR per-message packing: one SIMD chunk (D=4096, ℓ=2) of
+    // partial-decrypt can exceed 5 minutes on a laptop. 0 = no timeout.
+    1800
 }
 
 fn default_darkfid_rpc_timeout_s() -> u64 {
@@ -214,6 +222,7 @@ impl Default for Config {
             pin_darkfid_dns: default_pin_darkfid_dns(),
             tls_cert_path: None,
             tls_key_path: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }

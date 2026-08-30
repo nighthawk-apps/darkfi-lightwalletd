@@ -37,4 +37,4 @@ Internet → DDoS scrubbing → HAProxy (L4 conn limits)
 3. Point `darkfid_endpoint` at loopback; prefer IP pin at startup when a hostname is used.
 4. Never run production with `omr_rate_limit_per_min = 0` on a public listen.
 5. Publish the leaf-cert SHA-256 pin to wallet release builds ([TLS_PINNING.md](TLS_PINNING.md)).
-6. Set `request_timeout_s = 300` (or higher) and ensure nginx/HAProxy `grpc_read_timeout` / `grpc_send_timeout` are ≥ 300s — Param2 det-keys are ~120 MiB and FHE processing over Tor needs the headroom.
+6. Set `request_timeout_s = 1800` (or higher) and ensure nginx/HAProxy `grpc_read_timeout` / `grpc_send_timeout` are ≥ 1800s — Param2 det-keys are ~120 MiB and per-message SIMD encode needs the headroom.

@@ -192,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rpc_rate_limit_per_min,
         config.max_tx_bytes,
         tip_rx,
+        config.trusted_proxies.clone(),
     );
 
     // Start chain poller in background
