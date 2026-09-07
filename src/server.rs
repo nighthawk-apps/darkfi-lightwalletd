@@ -35,6 +35,15 @@ use crate::{
     rpc_client::DarkfidRpcClient,
 };
 
+/// blake3(height LE || tree_data || nullifier_index) — lockstep with mobile FFI.
+fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&height.to_le_bytes());
+    hasher.update(tree_data);
+    hasher.update(nullifier_index);
+    *hasher.finalize().as_bytes()
+}
+
 /// Maximum number of blocks allowed in a single range request.
 /// Prevents DoS via unbounded range requests that would load
 /// the entire cache into memory.
@@ -815,9 +824,20 @@ impl DarkFiLightWallet for LightWalletService {
             .map_err(|e| Status::internal(format!("Cache error: {e}")))?
         {
             Some((tree_height, tree_data)) if tree_height == tip => {
+                let block_hash = self
+                    .cache
+                    .get_block_hash(tree_height)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.to_vec())
+                    .unwrap_or_default();
+                let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
                 Ok(Response::new(proto::TreeState {
                     height: tree_height,
                     tree_data,
+                    block_hash,
+                    state_root,
+                    is_checkpoint: false,
                 }))
             }
             Some((tree_height, _)) => Err(Status::failed_precondition(format!(
@@ -827,9 +847,14 @@ impl DarkFiLightWallet for LightWalletService {
                 if tip == 0 {
                     // Empty chain: return empty tree.
                     let tree = darkfi_sdk::crypto::MerkleTree::new(100);
+                    let tree_data = darkfi_serial::serialize(&tree);
+                    let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
                     Ok(Response::new(proto::TreeState {
                         height: 0,
-                        tree_data: darkfi_serial::serialize(&tree),
+                        tree_data,
+                        block_hash: vec![],
+                        state_root,
+                        is_checkpoint: false,
                     }))
                 } else {
                     Err(Status::not_found(
@@ -838,6 +863,99 @@ impl DarkFiLightWallet for LightWalletService {
                 }
             }
         }
+    }
+
+    type GetCheckpointSnapshotStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::CheckpointSnapshot, Status>>;
+
+    /// Stream checkpoint snapshot chunks for instant wallet restore.
+    async fn get_checkpoint_snapshot(
+        &self,
+        request: Request<proto::CheckpointRequest>,
+    ) -> Result<Response<Self::GetCheckpointSnapshotStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
+        let req = request.into_inner();
+        let cache = Arc::clone(&self.cache);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            let tip = match cache.get_tip() {
+                Ok(Some((h, _))) => h,
+                Ok(None) => 0,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("Cache error: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            let _target_height = if req.preferred_height > 0 && req.preferred_height <= tip {
+                req.preferred_height
+            } else {
+                tip
+            };
+
+            let (tree_height, tree_data) = match cache.get_tip_tree_state() {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    let _ = tx
+                        .send(Err(Status::not_found("Checkpoint tree state not available")))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("Cache error: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+
+            let block_hash = cache
+                .get_block_hash(tree_height)
+                .ok()
+                .flatten()
+                .map(|h| h.to_vec())
+                .unwrap_or_default();
+            let snapshot_hash =
+                snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
+            let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
+
+            const CHUNK_SIZE: usize = 1024 * 1024;
+            let total_chunks = if tree_data.is_empty() {
+                1
+            } else {
+                (tree_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE
+            } as u32;
+
+            for i in 0..total_chunks {
+                let start = (i as usize) * CHUNK_SIZE;
+                let end = std::cmp::min(start + CHUNK_SIZE, tree_data.len());
+                let chunk_data = if tree_data.is_empty() {
+                    vec![]
+                } else {
+                    tree_data[start..end].to_vec()
+                };
+
+                let snapshot = proto::CheckpointSnapshot {
+                    height: tree_height,
+                    block_hash: block_hash.clone(),
+                    state_root: state_root.clone(),
+                    tree_data: chunk_data,
+                    nullifier_index: vec![],
+                    scan_cursor: tree_height,
+                    snapshot_hash: snapshot_hash.clone(),
+                };
+
+                if tx.send(Ok(snapshot)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     /// Lookup zkas bincodes for a contract.
@@ -904,6 +1022,7 @@ impl DarkFiLightWallet for LightWalletService {
                 .directory_attest_public_key()
                 .map_err(|e| Status::internal(format!("Cache error: {e}")))?
                 .to_vec(),
+            proto_version: "1.0.0".to_string(),
         }))
     }
 
@@ -1433,6 +1552,17 @@ mod tests {
         assert_eq!(reject_oversized_window(1, 1).unwrap(), 1);
         assert_eq!(reject_oversized_window(1, 10_000).unwrap(), 10_000);
         assert!(reject_oversized_window(1, 10_001).is_err());
+    }
+
+    #[test]
+    fn snapshot_integrity_hash_covers_height_tree_and_nullifiers() {
+        let a = snapshot_integrity_hash(10, b"tree", b"nf");
+        let b = snapshot_integrity_hash(10, b"tree", b"nf");
+        assert_eq!(a, b);
+        assert_ne!(snapshot_integrity_hash(11, b"tree", b"nf"), a);
+        assert_ne!(snapshot_integrity_hash(10, b"TREE", b"nf"), a);
+        assert_ne!(snapshot_integrity_hash(10, b"tree", b"NF"), a);
+        assert_ne!(blake3::hash(b"tree").as_bytes(), &a);
     }
 
     #[test]

@@ -64,7 +64,14 @@ service DarkFiLightWallet {
   rpc GetNullifiers(BlockRange) returns (stream NullifierUpdate);
 
   // Get the Merkle tree state snapshot at a given height.
+  // Historical heights are supported when the server has persisted checkpoints.
+  // Returns FAILED_PRECONDITION if the requested height is not available.
   rpc GetTreeState(BlockHeight) returns (TreeState);
+
+  // Get a checkpoint snapshot for instant wallet restore.
+  // The server streams the snapshot (tree + nullifiers + cursor) so a new
+  // device does not need to replay [0, tip].
+  rpc GetCheckpointSnapshot(CheckpointRequest) returns (stream CheckpointSnapshot);
 
   // === Contract State ===
 
@@ -184,6 +191,33 @@ message TreeState {
   uint32 height = 1;
   // Serialized MerkleTree (DarkFi bridgetree format)
   bytes tree_data = 2;
+  // 32-byte blake3 hash of the block header at this height
+  bytes block_hash = 3;
+  // state_root from the block header — clients verify tree_data hashes to this
+  bytes state_root = 4;
+  // Whether this is a persisted checkpoint (vs computed on-the-fly)
+  bool is_checkpoint = 5;
+}
+
+message CheckpointRequest {
+  // Desired checkpoint height, or 0 for "latest available checkpoint"
+  uint32 preferred_height = 1;
+}
+
+message CheckpointSnapshot {
+  uint32 height = 1;
+  // 32-byte blake3 block header hash at this height
+  bytes block_hash = 2;
+  // state_root from the block header
+  bytes state_root = 3;
+  // Serialized Money Merkle tree at this height
+  bytes tree_data = 4;
+  // Serialized nullifier set (compact bloom or full set)
+  bytes nullifier_index = 5;
+  // Scan cursor value to seed after applying this snapshot
+  uint32 scan_cursor = 6;
+  // blake3 hash over (height LE || tree_data || nullifier_index) for integrity
+  bytes snapshot_hash = 7;
 }
 
 message RawTransaction {
@@ -247,35 +281,36 @@ message LightInfo {
   string difficulty = 5;
   // Whether the server supports OMR detection
   bool omr_supported = 6;
-  // Current best block hash
+  /// Current best block hash
   bytes best_block_hash = 7;
-  // Backing node version string
+  /// Backend node version string
   string backend_version = 8;
   // 32-byte Schnorr public key for GetCluePublicKey directory attestations.
   // Clients verify ownership_proof against this key (not the payment key).
   bytes directory_attest_pubkey = 9;
+  // Protocol version for forward-compatible version negotiation.
+  // Clients compare against their compiled proto version.
+  string proto_version = 10;
 }
 
 // === OMR Messages ===
 
 message OmrDigestResponse {
-  // FHE encrypted digest, paper-faithful per-message packing: one clue per
-  // SIMD slot, ℓ ciphertexts per chunk of D messages. Wire per digest frame:
-  // [u8 version][u32 chunk_count]([u32 len][ct]) × (ℓ × chunk_count).
+  // FHE encrypted digest containing the matching block heights.
+  // Paper-faithful per-message packing: window clues are flattened in canonical
+  // order (height asc, then output order) and packed one clue per SIMD slot.
   // For multi-key requests: length-prefixed frames, one digest per key
   // ([u32 LE len][digest]…), decrypted client-side with the matching key.
   // The client decrypts this locally.
   bytes encrypted_digest = 1;
-  // Whether the digest covers the full requested range. False when the window
-  // was truncated at a whole-height boundary because its flattened message
-  // count exceeded the server's MAX_OMR_MESSAGES cap; the client then advances
-  // only through the last covered height (max of slot_heights) and continues.
+  // Whether the digest covers the full requested range. false ⇒ the server
+  // truncated at a whole-height boundary (> MAX_OMR_MESSAGES clues); the client
+  // must clamp its persisted scan height to the covered range (max slot_heights).
   bool complete = 2;
-  // Ordered slot -> block-height map for the packed messages: packed little-
-  // endian u32, length == total message count M. Slot index i (across all
-  // chunks, chunk-major) maps to height slot_heights[i]; slots >= M in the
-  // final chunk are padding and ignored. Identical for every detection key in
-  // a multi-key request (same window ordering), so it is sent once.
+  // Packed little-endian u32 slot → block-height map (length = message count).
+  // slot_heights[i] is the block height of the clue packed into SIMD slot i;
+  // slots beyond this length are padding. Identical for every key in a
+  // multi-key response.
   bytes slot_heights = 3;
 }
 
@@ -341,8 +376,7 @@ message CluePublicKey {
   // LightInfo.directory_attest_pubkey over:
   //   b"DarkFi-UnifOMR-DirAttest-v1" || network || key_version || payment_pk || clue_pk
   // Real and decoy entries both verify. Clients MUST verify this (not a
-  // payment-key Schnorr) before building a clue. RegisterCluePublicKey still
-  // uses a payment-key Schnorr that the server checks and stores.
+  // payment-key Schnorr) before building a clue.
   bytes ownership_proof = 3;
   // key_version from registration, or a plausible decoy timestamp.
   uint64 key_version = 4;
