@@ -61,7 +61,7 @@ rm -rf /tmp/darkfi-lwd-testnet-cache           # LWD cache (if using testnet tom
 | **Malformed clue PK** | Deserialize error | — | Fail send / no clue | Fail send / no clue |
 | **No LWD URL (send)** | — | — | Cannot build UnifOMR clue | Cannot build UnifOMR clue |
 | **PIR empty / decode fail** | Round-2 error | — | Err; gap trial if configured | Err; gap trial decrypt |
-| **Reorg** | Tip hash change | Cache rewind ~10 blocks | Tip regression rewind (checklist) | `update_chain_tip_hash` → DB rewind + UI callback |
+| **Reorg** | Tip hash change | Cache rewind to common ancestor | Tip regression rewind (checklist) | `update_chain_tip_hash` → DB rewind + UI callback |
 | **Rate limit** | `ResourceExhausted` | Per-IP OMR/clue limits | Retry as transient | Classified `Unavailable`, retryable |
 | **Strict OMR mode** | User/opt-in privacy | — | N/A | After max failures → **Error** status, no trial |
 
@@ -74,7 +74,7 @@ rm -rf /tmp/darkfi-lwd-testnet-cache           # LWD cache (if using testnet tom
 - **Sync engine policy:** `darkfi-mobile-ffi/src/lightwallet_sync.rs` — `record_omr_failure`, `choose_sync_type`, backoff.
 - **Moonshine (stricter):** `moonshine/src/sync.rs` — OMR failure **blocks** tip advance unless `--force-trial`.
 - **Send path clues:** `darkfi-mobile-ffi/src/transactions.rs` — directory → UnifOMR only (no legacy scheme fallback).
-- **LWD poller:** `darkfi-lightwalletd/src/chain_poller.rs` — backoff, reorg, tip regression rewind.
+- **LWD poller:** `darkfi-lightwalletd/src/chain_poller.rs` — backoff, IBD vs reorg, common-ancestor rewind.
 
 ---
 

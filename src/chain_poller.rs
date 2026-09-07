@@ -59,6 +59,74 @@ impl Default for ChainPollerConfig {
     }
 }
 
+/// What the poller should do given cache vs darkfid tips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TipAction {
+    Idle,
+    Fetch { from: u32, to: u32 },
+    HoldForBackendCatchup,
+    ReorgFrom { height: u32 },
+}
+
+/// Classify cache vs remote without I/O.
+///
+/// `cached_hash_at_remote_height` is the hash we stored at `remote_height` (if any).
+/// `remote_hash_at_cached_tip` is darkfid's hash for our cached tip height:
+/// `Some` if the node served that height, `None` if it does not have it (IBD).
+pub(crate) fn classify_tips(
+    cached: Option<(u32, [u8; 32])>,
+    remote_height: u32,
+    remote_hash: [u8; 32],
+    cached_hash_at_remote_height: Option<[u8; 32]>,
+    remote_hash_at_cached_tip: Option<[u8; 32]>,
+) -> TipAction {
+    let Some((cached_height, cached_hash)) = cached else {
+        return TipAction::Fetch {
+            from: 0,
+            to: remote_height,
+        };
+    };
+
+    if remote_height < cached_height {
+        if let Some(h) = remote_hash_at_cached_tip {
+            if h == cached_hash {
+                return TipAction::Idle;
+            }
+            return TipAction::ReorgFrom {
+                height: cached_height,
+            };
+        }
+        if cached_hash_at_remote_height == Some(remote_hash) {
+            return TipAction::HoldForBackendCatchup;
+        }
+        return TipAction::ReorgFrom {
+            height: remote_height.min(cached_height),
+        };
+    }
+
+    if cached_height == remote_height {
+        if cached_hash == remote_hash {
+            return TipAction::Idle;
+        }
+        return TipAction::ReorgFrom {
+            height: cached_height,
+        };
+    }
+
+    if let Some(h) = remote_hash_at_cached_tip {
+        if h != cached_hash {
+            return TipAction::ReorgFrom {
+                height: cached_height,
+            };
+        }
+    }
+
+    TipAction::Fetch {
+        from: cached_height.saturating_add(1),
+        to: remote_height,
+    }
+}
+
 /// Chain poller that syncs blocks from darkfid into the local sled cache.
 pub struct ChainPoller {
     rpc_client: Arc<DarkfidRpcClient>,
@@ -162,89 +230,88 @@ impl ChainPoller {
 
     /// Perform a single poll cycle:
     /// 1. Get chain tip from darkfid
-    /// 2. Compare to cached tip
+    /// 2. Compare to cached tip (IBD vs reorg vs fetch)
     /// 3. Fetch and process any new blocks
-    /// 4. Detect reorgs
+    /// 4. Detect reorgs via prev_hash and walk to the common ancestor
     ///
     /// Returns the number of blocks processed.
     async fn poll_once(&self) -> Result<u32> {
-        // Get current chain tip from darkfid
         let (remote_height, remote_hash) = self.rpc_client.get_last_confirmed_block().await?;
-
-        // Get our cached tip
-        let cached_tip = self.cache.get_tip()?;
-        let cached_height = cached_tip.map(|(h, _)| h).unwrap_or(0);
-
-        // darkfid restarted on fresh DB, wrong network, or operator reset:
-        // remote tip can be *below* our cache — must rewind or clients see a stale tip.
-        if remote_height < cached_height {
-            warn!(
-                target: "lightwalletd::chain_poller",
-                "Tip regression: darkfid tip {remote_height} < cache tip {cached_height}; rewinding cache"
-            );
-            return self.handle_reorg(remote_height).await;
-        }
-
-        if cached_height >= remote_height {
-            // Check for reorg at tip
-            if let Some((_, cached_hash)) = cached_tip {
-                let remote_hash_bytes: [u8; 32] = match blake3::Hash::from_hex(&remote_hash) {
-                    Ok(h) => *h.as_bytes(),
-                    Err(e) => {
-                        return Err(crate::error::LightWalletError::RpcError(format!(
-                            "invalid tip hash from darkfid: {e}"
-                        )));
-                    }
-                };
-                if cached_hash != remote_hash_bytes && cached_height == remote_height {
-                    warn!(
-                        target: "lightwalletd::chain_poller",
-                        "Reorg detected at height {cached_height}: hash mismatch"
-                    );
-                    return self.handle_reorg(cached_height).await;
-                }
+        let remote_hash_bytes: [u8; 32] = match blake3::Hash::from_hex(&remote_hash) {
+            Ok(h) => *h.as_bytes(),
+            Err(e) => {
+                return Err(crate::error::LightWalletError::RpcError(format!(
+                    "invalid tip hash from darkfid: {e}"
+                )));
             }
-            return Ok(0);
+        };
+
+        let cached_tip = self.cache.get_tip()?;
+        let cached_hash_at_remote = self.cache.get_block_hash(remote_height)?;
+        let remote_hash_at_cached_tip = match cached_tip {
+            Some((h, _)) if h == remote_height => Some(remote_hash_bytes),
+            Some((h, _)) => match self.rpc_client.get_block(h).await {
+                Ok(block) => Some(*block.hash().inner()),
+                Err(e) if e.is_connection() => return Err(e),
+                Err(_) => None,
+            },
+            None => None,
+        };
+
+        match classify_tips(
+            cached_tip,
+            remote_height,
+            remote_hash_bytes,
+            cached_hash_at_remote,
+            remote_hash_at_cached_tip,
+        ) {
+            TipAction::Idle => Ok(0),
+            TipAction::HoldForBackendCatchup => {
+                debug!(
+                    target: "lightwalletd::chain_poller",
+                    "darkfid catching up (remote {remote_height} < cache); holding cache"
+                );
+                Ok(0)
+            }
+            TipAction::ReorgFrom { height } => self.rewind_to_common_ancestor(height).await,
+            TipAction::Fetch { from, to } => self.fetch_range(from, to).await,
         }
+    }
 
-        // Fetch new blocks from cached_height+1 to remote_height (capped by batch_size)
-        let start = cached_height + 1;
-        let end = std::cmp::min(start + self.config.batch_size - 1, remote_height);
-
+    async fn fetch_range(&self, start: u32, remote_end: u32) -> Result<u32> {
+        let end = std::cmp::min(
+            start.saturating_add(self.config.batch_size.saturating_sub(1)),
+            remote_end,
+        );
         debug!(
             target: "lightwalletd::chain_poller",
-            "Fetching blocks {start}..={end} (remote tip: {remote_height})"
+            "Fetching blocks {start}..={end} (remote tip: {remote_end})"
         );
 
         let mut blocks_processed: u32 = 0;
-
         for height in start..=end {
             let block_info = self.rpc_client.get_block(height).await?;
 
-            // Verify chain continuity (reorg detection)
             if height > 0 {
                 let prev_hash = *block_info.header.previous.inner();
                 if let Some(cached_prev_hash) = self.cache.get_block_hash(height - 1)? {
                     if prev_hash != cached_prev_hash {
                         warn!(
                             target: "lightwalletd::chain_poller",
-                            "Reorg detected at height {height}: prev_hash mismatch"
+                            "Reorg detected at height {height} (prev_hash mismatch)"
                         );
-                        return self.handle_reorg(height - 1).await;
+                        return self
+                            .rewind_to_common_ancestor(height.saturating_sub(1))
+                            .await;
                     }
                 }
             }
 
-            // Process block into compact format
             let compact_block = block_processor::process_block(&block_info).await?;
-
-            // Insert into cache
             self.cache.insert_compact_block(&compact_block)?;
-
             blocks_processed += 1;
         }
 
-        // Flush cache to disk after each batch
         if blocks_processed > 0 {
             self.cache.flush()?;
             self.notify_tip();
@@ -253,25 +320,43 @@ impl ChainPoller {
         Ok(blocks_processed)
     }
 
-    /// Handle a chain reorganization.
-    ///
-    /// Strategy: walk backwards from the reorg point to find the common ancestor,
-    /// then rewind the cache and re-sync.
-    async fn handle_reorg(&self, reorg_height: u32) -> Result<u32> {
-        // Simple strategy: rewind to the block before the reorg point
-        // and let the next poll cycle re-fetch.
-        let rewind_to = reorg_height.saturating_sub(10);
+    /// Walk backwards from `from` until cache and darkfid agree, then rewind once.
+    async fn rewind_to_common_ancestor(&self, from: u32) -> Result<u32> {
+        const MAX_WALK: u32 = 10_000;
+        let mut h = from;
+        let mut walked = 0u32;
 
-        warn!(
-            target: "lightwalletd::chain_poller",
-            "Rewinding cache from {reorg_height} to {rewind_to}"
-        );
+        loop {
+            if let Some(cached_hash) = self.cache.get_block_hash(h)? {
+                match self.rpc_client.get_block(h).await {
+                    Ok(block) => {
+                        if *block.hash().inner() == cached_hash {
+                            warn!(
+                                target: "lightwalletd::chain_poller",
+                                "Rewinding cache to common ancestor at height {h} (started at {from})"
+                            );
+                            self.cache.rewind_to_height(h)?;
+                            self.notify_tip();
+                            return Ok(0);
+                        }
+                    }
+                    Err(e) if e.is_connection() => return Err(e),
+                    Err(_) => {}
+                }
+            }
 
-        self.cache.rewind_to_height(rewind_to)?;
-        self.notify_tip();
-
-        // Return 0 to trigger re-poll on next cycle
-        Ok(0)
+            if h == 0 || walked >= MAX_WALK {
+                warn!(
+                    target: "lightwalletd::chain_poller",
+                    "No common ancestor at or above height {h}; rewinding to {h}"
+                );
+                self.cache.rewind_to_height(h)?;
+                self.notify_tip();
+                return Ok(0);
+            }
+            h -= 1;
+            walked += 1;
+        }
     }
 
     /// Calculate backoff interval with exponential growth.
@@ -298,12 +383,13 @@ mod tests {
             retention_window: 100_000,
             prune_interval_blocks: 10_000,
         };
+        let dir = tempfile::tempdir().unwrap();
         let (tip_tx, _) = tokio::sync::watch::channel(0u32);
         let poller = ChainPoller {
             rpc_client: Arc::new(DarkfidRpcClient::new_simple(
                 url::Url::parse("tcp://127.0.0.1:8340").unwrap(),
             )),
-            cache: Arc::new(Cache::new("/tmp/test_poller_cache").unwrap()),
+            cache: Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap()),
             config,
             tip_notify: tip_tx,
         };
@@ -315,5 +401,45 @@ mod tests {
         assert_eq!(poller.backoff_interval(4), 160);
         assert_eq!(poller.backoff_interval(5), 300); // capped
         assert_eq!(poller.backoff_interval(10), 300); // still capped
+    }
+
+    fn h(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    #[test]
+    fn classify_ibd_holds_cache() {
+        let action = classify_tips(Some((1000, h(1))), 50, h(5), Some(h(5)), None);
+        assert_eq!(action, TipAction::HoldForBackendCatchup);
+    }
+
+    #[test]
+    fn classify_reorg_at_equal_height() {
+        let action = classify_tips(Some((10, h(1))), 10, h(2), Some(h(1)), Some(h(2)));
+        assert_eq!(action, TipAction::ReorgFrom { height: 10 });
+    }
+
+    #[test]
+    fn classify_reorg_while_down_when_remote_ahead() {
+        let action = classify_tips(Some((10, h(1))), 20, h(9), None, Some(h(8)));
+        assert_eq!(action, TipAction::ReorgFrom { height: 10 });
+    }
+
+    #[test]
+    fn classify_fetch_when_same_chain_ahead() {
+        let action = classify_tips(Some((10, h(1))), 20, h(9), None, Some(h(1)));
+        assert_eq!(action, TipAction::Fetch { from: 11, to: 20 });
+    }
+
+    #[test]
+    fn classify_empty_cache_fetches_from_genesis() {
+        let action = classify_tips(None, 5, h(1), None, None);
+        assert_eq!(action, TipAction::Fetch { from: 0, to: 5 });
+    }
+
+    #[test]
+    fn classify_in_sync() {
+        let action = classify_tips(Some((10, h(1))), 10, h(1), Some(h(1)), Some(h(1)));
+        assert_eq!(action, TipAction::Idle);
     }
 }

@@ -30,6 +30,8 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     cache::Cache,
+    compact_block::CompactBlock,
+    continuity::{check_adjacent_pair, check_successor, discontinuity_status},
     proto::{self, dark_fi_light_wallet_server::DarkFiLightWallet},
     rate_limit::PeerRateLimiter,
     rpc_client::DarkfidRpcClient,
@@ -68,6 +70,8 @@ const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
 const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
+/// Max characters in LookupZkas contract id (base58 + headroom).
+const MAX_CONTRACT_ID_CHARS: usize = 128;
 
 /// How long a SendTransaction peer binding remains valid for RegisterOmrClue (S12).
 const SEND_PEER_BIND_TTL: Duration = Duration::from_secs(86_400);
@@ -94,6 +98,64 @@ fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
     Ok(span)
 }
 
+fn cache_status(e: impl std::fmt::Display) -> Status {
+    tracing::error!(target: "lightwalletd::server", "cache error: {e}");
+    Status::internal("cache error")
+}
+
+fn backend_unavailable() -> Status {
+    Status::unavailable("backend unavailable")
+}
+
+/// Stream compact blocks one sled read at a time; abort on holes, mixed forks,
+/// or client disconnect (do not materialize the whole window).
+fn spawn_compact_range<T, F>(
+    cache: Arc<Cache>,
+    start: u32,
+    end: u32,
+    map: F,
+) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
+where
+    T: Send + 'static,
+    F: Fn(&CompactBlock) -> T + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        let mut prev: Option<CompactBlock> = None;
+        for height in start..=end {
+            if tx.is_closed() {
+                return;
+            }
+            let block = match cache.get_compact_block(height) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    let _ = tx.send(Err(discontinuity_status())).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(cache_status(e))).await;
+                    return;
+                }
+            };
+            if let Some(ref p) = prev {
+                if let Err(st) = check_successor(p, &block) {
+                    let _ = tx.send(Err(st)).await;
+                    return;
+                }
+            } else if block.height != start {
+                let _ = tx.send(Err(discontinuity_status())).await;
+                return;
+            }
+            if tx.send(Ok(map(&block))).await.is_err() {
+                return;
+            }
+            prev = Some(block);
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
 /// True if `ip` matches an allow-list entry (`1.2.3.4` or IPv4 CIDR).
 fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     let entry = entry.trim();
@@ -108,11 +170,7 @@ fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     };
     match (ip, base.parse::<Ipv4Addr>()) {
         (IpAddr::V4(ip4), Ok(base4)) if bits <= 32 => {
-            let mask = if bits == 0 {
-                0
-            } else {
-                !0u32 << (32 - bits)
-            };
+            let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
             (u32::from(ip4) & mask) == (u32::from(base4) & mask)
         }
         _ => false,
@@ -193,7 +251,11 @@ impl LightWalletService {
         Self {
             cache,
             rpc_client,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: format!(
+                "{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("GIT_HASH").unwrap_or("unknown")
+            ),
             chain_name,
             network_byte,
             omr_rate_limiter: Arc::new(PeerRateLimiter::new(
@@ -330,30 +392,11 @@ impl DarkFiLightWallet for LightWalletService {
 
         reject_oversized_window(start, end)?;
 
-        let cache = Arc::clone(&self.cache);
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        // Spawn a task to stream blocks from the cache
-        tokio::spawn(async move {
-            match cache.get_compact_blocks_range(start, end) {
-                Ok(blocks) => {
-                    for block in blocks {
-                        let proto_block = block.to_proto();
-                        if tx.send(Ok(proto_block)).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Cache error: {e}"))))
-                        .await;
-                }
-            }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(spawn_compact_range(
+            Arc::clone(&self.cache),
+            start,
+            end,
+            CompactBlock::to_proto,
         )))
     }
 
@@ -370,7 +413,7 @@ impl DarkFiLightWallet for LightWalletService {
             Ok(None) => Err(Status::not_found(format!(
                 "Block not found at height {height}"
             ))),
-            Err(e) => Err(Status::internal(format!("Cache error: {e}"))),
+            Err(e) => Err(cache_status(e)),
         }
     }
 
@@ -411,18 +454,23 @@ impl DarkFiLightWallet for LightWalletService {
                 Ok(None) => {
                     return Err(Status::not_found(format!("Block not found at height {h}")));
                 }
-                Err(e) => {
-                    return Err(Status::internal(format!("Cache error: {e}")));
-                }
+                Err(e) => return Err(cache_status(e)),
             }
+        }
+
+        for w in blocks.windows(2) {
+            check_adjacent_pair(&w[0], &w[1])?;
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
         tokio::spawn(async move {
             for block in blocks {
+                if tx.is_closed() {
+                    return;
+                }
                 if tx.send(Ok(block.to_proto())).await.is_err() {
-                    break; // Client disconnected
+                    break;
                 }
             }
         });
@@ -442,11 +490,18 @@ impl DarkFiLightWallet for LightWalletService {
                 let timestamp = self
                     .cache
                     .get_compact_block(height)
-                    .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+                    .map_err(cache_status)?
                     .map(|b| b.timestamp)
                     .unwrap_or(0);
 
-                let block_target = self.rpc_client.get_block_target().await.unwrap_or(0);
+                let block_target = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.rpc_client.get_block_target(),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
 
                 Ok(Response::new(proto::ChainTip {
                     height,
@@ -456,7 +511,7 @@ impl DarkFiLightWallet for LightWalletService {
                 }))
             }
             Ok(None) => Err(Status::unavailable("No blocks cached yet")),
-            Err(e) => Err(Status::internal(format!("Cache error: {e}"))),
+            Err(e) => Err(cache_status(e)),
         }
     }
 
@@ -484,33 +539,62 @@ impl DarkFiLightWallet for LightWalletService {
                 let current_height = *tip_rx.borrow_and_update();
 
                 if current_height > last_height {
-                    if let Ok(blocks) =
-                        cache.get_compact_blocks_range(last_height + 1, current_height)
-                    {
-                        for block in blocks {
-                            let proto_block = block.to_proto();
-                            // Backpressure: if the client can't keep up, drop the
-                            // subscription rather than blocking the server task.
-                            // Use a bounded send with timeout — if the client
-                            // hasn't drained within 30s, they're too slow.
-                            match tokio::time::timeout(
-                                Duration::from_secs(30),
-                                tx.send(Ok(proto_block)),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(_)) => return, // Client disconnected
-                                Err(_) => {
-                                    tracing::warn!(
-                                        target: "lightwalletd::server",
-                                        "SubscribeBlocks client too slow; dropping subscription"
-                                    );
-                                    return;
-                                }
+                    let mut prev: Option<crate::compact_block::CompactBlock> = None;
+                    let mut disconnected = false;
+                    for height in (last_height + 1)..=current_height {
+                        let block = match cache.get_compact_block(height) {
+                            Ok(Some(b)) => b,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    target: "lightwalletd::server",
+                                    "SubscribeBlocks chain discontinuity"
+                                );
+                                disconnected = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "lightwalletd::server",
+                                    "SubscribeBlocks cache error: {e}"
+                                );
+                                disconnected = true;
+                                break;
+                            }
+                        };
+                        if let Some(ref p) = prev {
+                            if check_successor(p, &block).is_err() {
+                                tracing::warn!(
+                                    target: "lightwalletd::server",
+                                    "SubscribeBlocks chain discontinuity"
+                                );
+                                disconnected = true;
+                                break;
                             }
                         }
+                        let proto_block = block.to_proto();
+                        match tokio::time::timeout(
+                            Duration::from_secs(30),
+                            tx.send(Ok(proto_block)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => return,
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "lightwalletd::server",
+                                    "SubscribeBlocks client too slow; dropping subscription"
+                                );
+                                return;
+                            }
+                        }
+                        prev = Some(block);
+                    }
+                    if !disconnected {
                         last_height = current_height;
+                    } else {
+                        // Wait for poller rewind; do not advance the cursor over a mixed fork.
+                        last_height = current_height.min(last_height);
                     }
                 } else if current_height < last_height {
                     // Reorg / rewind: reset cursor; next advance streams from new tip path.
@@ -546,9 +630,8 @@ impl DarkFiLightWallet for LightWalletService {
                 omr_clue_output_index: 0,
                 omr_metadata_enc: vec![],
             })),
-            Err(e) => Err(Status::internal(format!(
-                "Failed to fetch transaction: {e}"
-            ))),
+            Err(e) if e.is_connection() => Err(backend_unavailable()),
+            Err(_) => Err(Status::not_found("transaction not found")),
         }
     }
 
@@ -725,32 +808,18 @@ impl DarkFiLightWallet for LightWalletService {
 
         reject_oversized_window(range.start_height, range.end_height)?;
 
-        let cache = Arc::clone(&self.cache);
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        tokio::spawn(async move {
-            match cache.get_coins_range(range.start_height, range.end_height) {
-                Ok(entries) => {
-                    for (height, coins) in entries {
-                        let update = proto::NoteCommitmentUpdate {
-                            height,
-                            coins: coins.iter().map(|c| c.to_vec()).collect(),
-                        };
-                        if tx.send(Ok(update)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Cache error: {e}"))))
-                        .await;
-                }
-            }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(spawn_compact_range(
+            Arc::clone(&self.cache),
+            range.start_height,
+            range.end_height,
+            |block| proto::NoteCommitmentUpdate {
+                height: block.height,
+                coins: block
+                    .txs
+                    .iter()
+                    .flat_map(|tx| tx.outputs.iter().map(|o| o.coin.to_vec()))
+                    .collect(),
+            },
         )))
     }
 
@@ -767,38 +836,25 @@ impl DarkFiLightWallet for LightWalletService {
 
         reject_oversized_window(range.start_height, range.end_height)?;
 
-        let cache = Arc::clone(&self.cache);
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        tokio::spawn(async move {
-            match cache.get_nullifiers_range(range.start_height, range.end_height) {
-                Ok(entries) => {
-                    for (height, nullifiers) in entries {
-                        let update = proto::NullifierUpdate {
-                            height,
-                            nullifiers: nullifiers.iter().map(|n| n.to_vec()).collect(),
-                        };
-                        if tx.send(Ok(update)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Cache error: {e}"))))
-                        .await;
-                }
-            }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
+        Ok(Response::new(spawn_compact_range(
+            Arc::clone(&self.cache),
+            range.start_height,
+            range.end_height,
+            |block| proto::NullifierUpdate {
+                height: block.height,
+                nullifiers: block
+                    .txs
+                    .iter()
+                    .flat_map(|tx| tx.nullifiers.iter().map(|n| n.to_vec()))
+                    .collect(),
+            },
         )))
     }
 
     /// Get Merkle tree state at a given height.
     ///
-    /// MVP: tip-only. Historical / pruned heights return FAILED_PRECONDITION.
+    /// Tip-only: historical / pruned heights return FAILED_PRECONDITION.
+    /// Checkpoints are not retained on disk (GetCheckpointSnapshot is also tip-only).
     async fn get_tree_state(
         &self,
         request: Request<proto::BlockHeight>,
@@ -807,7 +863,7 @@ impl DarkFiLightWallet for LightWalletService {
         let tip = self
             .cache
             .get_tip()
-            .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+            .map_err(cache_status)?
             .map(|(h, _)| h)
             .unwrap_or(0);
 
@@ -818,11 +874,7 @@ impl DarkFiLightWallet for LightWalletService {
             )));
         }
 
-        match self
-            .cache
-            .get_tip_tree_state()
-            .map_err(|e| Status::internal(format!("Cache error: {e}")))?
-        {
+        match self.cache.get_tip_tree_state().map_err(cache_status)? {
             Some((tree_height, tree_data)) if tree_height == tip => {
                 let block_hash = self
                     .cache
@@ -883,30 +935,31 @@ impl DarkFiLightWallet for LightWalletService {
                 Ok(Some((h, _))) => h,
                 Ok(None) => 0,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Cache error: {e}"))))
-                        .await;
+                    let _ = tx.send(Err(cache_status(e))).await;
                     return;
                 }
             };
-            let _target_height = if req.preferred_height > 0 && req.preferred_height <= tip {
-                req.preferred_height
-            } else {
-                tip
-            };
+            if req.preferred_height > 0 && req.preferred_height != tip {
+                let _ = tx
+                    .send(Err(Status::failed_precondition(
+                        "GetCheckpointSnapshot is tip-only; historical checkpoints are not retained",
+                    )))
+                    .await;
+                return;
+            }
 
             let (tree_height, tree_data) = match cache.get_tip_tree_state() {
                 Ok(Some(pair)) => pair,
                 Ok(None) => {
                     let _ = tx
-                        .send(Err(Status::not_found("Checkpoint tree state not available")))
+                        .send(Err(Status::not_found(
+                            "Checkpoint tree state not available",
+                        )))
                         .await;
                     return;
                 }
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(Status::internal(format!("Cache error: {e}"))))
-                        .await;
+                    let _ = tx.send(Err(cache_status(e))).await;
                     return;
                 }
             };
@@ -917,8 +970,7 @@ impl DarkFiLightWallet for LightWalletService {
                 .flatten()
                 .map(|h| h.to_vec())
                 .unwrap_or_default();
-            let snapshot_hash =
-                snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
+            let snapshot_hash = snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
             let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
 
             const CHUNK_SIZE: usize = 1024 * 1024;
@@ -965,6 +1017,9 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<proto::ZkasResponse>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let contract_id = request.into_inner().id;
+        if contract_id.is_empty() || contract_id.len() > MAX_CONTRACT_ID_CHARS {
+            return Err(Status::invalid_argument("invalid contract id"));
+        }
 
         match self.rpc_client.lookup_zkas(&contract_id).await {
             Ok(bincodes) => {
@@ -979,7 +1034,8 @@ impl DarkFiLightWallet for LightWalletService {
                     bincodes: proto_bincodes,
                 }))
             }
-            Err(e) => Err(Status::internal(format!("Failed to lookup zkas: {e}"))),
+            Err(e) if e.is_connection() => Err(backend_unavailable()),
+            Err(_) => Err(Status::not_found("contract not found")),
         }
     }
 
@@ -991,7 +1047,7 @@ impl DarkFiLightWallet for LightWalletService {
         let (height, hash) = self
             .cache
             .get_tip()
-            .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+            .map_err(cache_status)?
             .unwrap_or((0, [0u8; 32]));
 
         // darkfid RPC can stall during heavy sync; never block LightInfo forever.
@@ -1016,11 +1072,15 @@ impl DarkFiLightWallet for LightWalletService {
             difficulty,
             omr_supported: cfg!(feature = "fhe-omr"),
             best_block_hash: hash.to_vec(),
-            backend_version: format!("lightwalletd {}", env!("CARGO_PKG_VERSION")),
+            backend_version: format!(
+                "lightwalletd {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("GIT_HASH").unwrap_or("unknown")
+            ),
             directory_attest_pubkey: self
                 .cache
                 .directory_attest_public_key()
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+                .map_err(cache_status)?
                 .to_vec(),
             proto_version: "1.0.0".to_string(),
         }))
@@ -1224,13 +1284,12 @@ impl DarkFiLightWallet for LightWalletService {
                 }
             }
 
-            let _permit = fhe_permit
-                .ok_or_else(|| Status::invalid_argument("Empty stream"))?;
+            let _permit = fhe_permit.ok_or_else(|| Status::invalid_argument("Empty stream"))?;
 
             let tip_height = self
                 .cache
                 .get_tip()
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+                .map_err(cache_status)?
                 .map(|(h, _)| h)
                 .unwrap_or(0);
             let mut range_complete = tip_height >= end;
@@ -1243,7 +1302,7 @@ impl DarkFiLightWallet for LightWalletService {
                             break;
                         }
                         Err(e) => {
-                            return Err(Status::internal(format!("Cache error: {e}")));
+                            return Err(cache_status(e));
                         }
                     }
                 }
@@ -1252,7 +1311,7 @@ impl DarkFiLightWallet for LightWalletService {
             let block_notes = self
                 .cache
                 .get_encrypted_notes_range(start, end)
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+                .map_err(cache_status)?;
 
             let network_byte = self.network_byte;
             // Paper-faithful per-message packing: flatten the window once
@@ -1363,7 +1422,7 @@ impl DarkFiLightWallet for LightWalletService {
             let blocks = self
                 .cache
                 .get_compact_blocks_range(start, end)
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+                .map_err(cache_status)?;
 
             // Align payloads to every height in [start, end] (S19-style).
             // Encode as protobuf CompactBlock so moonshine + mobile share one codec.
@@ -1461,21 +1520,21 @@ impl DarkFiLightWallet for LightWalletService {
         let attest_sk = self
             .cache
             .get_or_create_directory_attest_secret()
-            .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+            .map_err(cache_status)?;
 
         #[cfg(feature = "fhe-omr")]
         let (clue_public_key, key_version) = {
             let registered = self
                 .cache
                 .get_clue_public_key_entry(&pk)
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+                .map_err(cache_status)?;
             match registered {
                 Some((ver, _stored_proof, real)) => (real, ver),
                 None => {
                     let pepper = self
                         .cache
                         .get_or_create_clue_dir_pepper()
-                        .map_err(|e| Status::internal(format!("Cache error: {e}")))?;
+                        .map_err(cache_status)?;
                     let pk_c = pk;
                     tokio::task::spawn_blocking(move || {
                         (
@@ -1493,7 +1552,7 @@ impl DarkFiLightWallet for LightWalletService {
             match self
                 .cache
                 .get_clue_public_key_entry(&pk)
-                .map_err(|e| Status::internal(format!("Cache error: {e}")))?
+                .map_err(cache_status)?
             {
                 Some((ver, _stored_proof, real)) => (real, ver),
                 None => {

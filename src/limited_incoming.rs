@@ -6,6 +6,7 @@
  */
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -19,6 +20,18 @@ use tonic::transport::server::Connected;
 pub struct CountedTcpStream {
     inner: TcpStream,
     _permit: OwnedSemaphorePermit,
+    connections: Arc<AtomicUsize>,
+}
+
+impl Drop for CountedTcpStream {
+    fn drop(&mut self) {
+        let prev = self.connections.fetch_sub(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: "lightwalletd::grpc",
+            "connection closed; current={}",
+            prev.saturating_sub(1)
+        );
+    }
 }
 
 impl Connected for CountedTcpStream {
@@ -75,6 +88,7 @@ enum AcceptState {
 pub struct LimitedTcpIncoming {
     listener: TcpListener,
     permits: Arc<Semaphore>,
+    connections: Arc<AtomicUsize>,
     accept_state: AcceptState,
 }
 
@@ -83,8 +97,14 @@ impl LimitedTcpIncoming {
         Self {
             listener,
             permits: Arc::new(Semaphore::new(max_connections.max(1))),
+            connections: Arc::new(AtomicUsize::new(0)),
             accept_state: AcceptState::Idle,
         }
+    }
+
+    /// Live accepted connections (Prometheus-style gauge without a scrape port).
+    pub fn current_connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
     }
 }
 
@@ -124,9 +144,15 @@ impl futures::Stream for LimitedTcpIncoming {
                         else {
                             unreachable!()
                         };
+                        let n = this.connections.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::debug!(
+                            target: "lightwalletd::grpc",
+                            "connection accepted; current={n}"
+                        );
                         return Poll::Ready(Some(Ok(CountedTcpStream {
                             inner: stream,
                             _permit: permit,
+                            connections: Arc::clone(&this.connections),
                         })));
                     }
                     Poll::Ready(Err(e)) => {

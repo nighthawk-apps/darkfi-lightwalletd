@@ -28,7 +28,7 @@
 
 // Using bincode for compact block serialization (serde-based) to avoid
 // lifetime issues with darkfi_serial's async derive macros.
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     compact_block::CompactBlock,
@@ -48,6 +48,11 @@ const OMR_CLUE_HINT_META_TREE: &str = "lightwalletd_omr_clue_hint_meta";
 const OMR_CLUE_PUBKEYS_TREE: &str = "lightwalletd_omr_clue_pubkeys_v2";
 const OMR_METADATA_ENC_TREE: &str = "lightwalletd_omr_metadata_enc";
 
+/// On-disk cache layout version. Bump when compact-block bincode or tree
+/// names change incompatibly. Missing key is treated as a pre-versioned
+/// store and stamped in place (no wipe).
+const CACHE_FORMAT_VERSION: u32 = 1;
+
 /// Orphan OMR clue hints expire after this many seconds if the tx never confirms (S21).
 /// Orphan clue hints must outlive slow localnet / congested confirms.
 /// 24h keeps SendTransaction clues available until the tx is indexed.
@@ -60,6 +65,7 @@ const META_TIP_HEIGHT: &[u8] = b"tip_height";
 const META_TIP_HASH: &[u8] = b"tip_hash";
 const META_TIP_MERKLE_TREE: &[u8] = b"tip_merkle_tree";
 const META_TIP_MERKLE_HEIGHT: &[u8] = b"tip_merkle_height";
+const META_CACHE_FORMAT: &[u8] = b"cache_format";
 
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
@@ -123,9 +129,58 @@ impl Cache {
             omr_metadata_enc,
             meta,
         };
+        cache.ensure_cache_format()?;
+        cache.verify_tip_readable()?;
         // Best-effort prune of orphan hints left from previous runs (S21).
         let _ = cache.prune_expired_omr_clue_hints();
         Ok(cache)
+    }
+
+    fn ensure_cache_format(&self) -> Result<()> {
+        match self.meta.get(META_CACHE_FORMAT)? {
+            None => {
+                self.meta
+                    .insert(META_CACHE_FORMAT, &CACHE_FORMAT_VERSION.to_be_bytes())?;
+                Ok(())
+            }
+            Some(bytes) => {
+                let found = if bytes.len() == 4 {
+                    u32::from_be_bytes(bytes.as_ref().try_into().unwrap_or([0; 4]))
+                } else {
+                    0
+                };
+                if found != CACHE_FORMAT_VERSION {
+                    return Err(LightWalletError::CacheFormatMismatch {
+                        found,
+                        expected: CACHE_FORMAT_VERSION,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn verify_tip_readable(&self) -> Result<()> {
+        let Some((height, _)) = self.get_tip()? else {
+            return Ok(());
+        };
+        match self.get_compact_block(height) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                warn!(
+                    target: "lightwalletd::cache",
+                    "Tip height {height} has no compact block; cache may be mid-rewind"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    target: "lightwalletd::cache",
+                    "Tip compact block at {height} is unreadable; delete the cache directory and resync"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Insert a compact block into the cache.
@@ -1380,5 +1435,21 @@ mod tests {
         bad[31] = 0xFF;
         // All-0xFF is not a canonical pallas::Base.
         assert!(Cache::coin_to_merkle_node(&bad).is_err());
+    }
+
+    #[test]
+    fn cache_format_stamped_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let cache = Cache::new(path).unwrap();
+        let raw = cache
+            .meta
+            .get(META_CACHE_FORMAT)
+            .unwrap()
+            .expect("format key");
+        let ver = u32::from_be_bytes(raw.as_ref().try_into().unwrap());
+        assert_eq!(ver, CACHE_FORMAT_VERSION);
+        drop(cache);
+        let _reopen = Cache::new(path).unwrap();
     }
 }

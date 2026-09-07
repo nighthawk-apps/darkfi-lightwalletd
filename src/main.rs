@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 "#;
     println!("{}", nighthawk_header);
 
-    info!(target: "lightwalletd", "darkfi-lightwalletd v{}", env!("CARGO_PKG_VERSION"));
+    info!(target: "lightwalletd", "darkfi-lightwalletd v{} ({})", env!("CARGO_PKG_VERSION"), option_env!("GIT_HASH").unwrap_or("unknown"));
     info!(target: "lightwalletd", "Anonymous. Uncensored. Sovereign.");
 
     // Load config from --config <path> CLI argument, or use defaults (then finalize).
@@ -166,6 +166,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+
+    match rpc_client.get_last_confirmed_block().await {
+        Ok((height, _)) => {
+            info!(
+                target: "lightwalletd",
+                "darkfid backend reachable (last_confirmed_block height {height})"
+            );
+            if let Err(e) = rpc_client.get_block(height).await {
+                error!(
+                    target: "lightwalletd",
+                    "darkfid backend check failed (blockchain.get_block): {e}"
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            error!(
+                target: "lightwalletd",
+                "darkfid backend check failed (blockchain.last_confirmed_block): {e}"
+            );
+            std::process::exit(1);
+        }
+    }
 
     #[cfg(feature = "fhe-omr")]
     info!(
@@ -284,6 +307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
         builder = builder.concurrency_limit_per_connection(max_streams.max(1));
+        builder = builder
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
         if request_timeout_s > 0 {
             builder = builder.timeout(std::time::Duration::from_secs(request_timeout_s));
         }
@@ -303,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let serve_result = if max_connections > 0 {
             match tokio::net::TcpListener::bind(grpc_addr).await {
                 Ok(listener) => {
+                    info!(target: "lightwalletd", "gRPC listening on {grpc_addr}");
                     let incoming = darkfi_lightwalletd::limited_incoming::LimitedTcpIncoming::new(
                         listener,
                         max_connections,
@@ -318,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
+            info!(target: "lightwalletd", "gRPC listening on {grpc_addr}");
             builder
                 .add_service(svc)
                 .serve_with_shutdown(grpc_addr, shutdown)

@@ -53,6 +53,24 @@ pub enum LightWalletError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("Unsupported cache format {found} (expected {expected})")]
+    CacheFormatMismatch { found: u32, expected: u32 },
+}
+
+impl LightWalletError {
+    /// True when the backend likely does not have the requested object.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            LightWalletError::TxNotFound(_) | LightWalletError::BlockNotFound(_)
+        )
+    }
+
+    /// Transient darkfid transport failure (retry next poll; do not rewind).
+    pub fn is_connection(&self) -> bool {
+        matches!(self, LightWalletError::ConnectionError(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LightWalletError>;
