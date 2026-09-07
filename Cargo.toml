@@ -11,9 +11,9 @@ edition = "2021"
 # =============================================================================
 # Nighthawk Apps — standalone lightwalletd
 # =============================================================================
-# Copyright (C) 2026 Nighthawk Apps. Builds against a sibling ../darkfi checkout
-# (see scripts/fetch-darkfi.sh / scripts/build.sh). Does not modify upstream
-# darkfi crates; UnifOMR + compact-block serving live entirely in this repo.
+# Copyright (C) 2026 Nighthawk Apps. Builds against sibling
+# ../darkfi-nighthawk-testnet (nighthawk24 `nighthawk-testnet` pin).
+# Does not modify upstream darkrenaissance/darkfi.
 # =============================================================================
 
 [[bin]]
@@ -37,10 +37,10 @@ testnet-e2e = []
 
 [dependencies]
 # DarkFi core
-darkfi = { path = "../darkfi", features = ["async-daemonize", "bs58", "blockchain", "rpc", "util"] }
-darkfi_money_contract = { path = "../darkfi/src/contract/money", features = ["client", "no-entrypoint"] }
-darkfi-sdk = { path = "../darkfi/src/sdk" }
-darkfi-serial = { path = "../darkfi/src/serial", features = ["async"] }
+darkfi = { path = "../darkfi-nighthawk-testnet", features = ["async-daemonize", "bs58", "blockchain", "rpc", "util"] }
+darkfi_money_contract = { path = "../darkfi-nighthawk-testnet/src/contract/money", features = ["client", "no-entrypoint"] }
+darkfi-sdk = { path = "../darkfi-nighthawk-testnet/src/sdk" }
+darkfi-serial = { path = "../darkfi-nighthawk-testnet/src/serial", features = ["async"] }
 
 # gRPC (tls feature for optional ServerTlsConfig)
 # tls-roots: system CA trust for remote HTTPS LWD (Studio ngrok / public TLS).
@@ -87,7 +87,7 @@ async-stream = "0.3.6"
 
 [dev-dependencies]
 tempfile = "3"
-darkfi-contract-test-harness = { path = "../darkfi/src/contract/test-harness" }
+darkfi-contract-test-harness = { path = "../darkfi-nighthawk-testnet/src/contract/test-harness" }
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Fetch the sibling `darkfi` checkout required by Cargo path deps (`../darkfi`).
+# Fetch the sibling DarkFi pin required by Cargo path deps
+# (`../darkfi-nighthawk-testnet`, nighthawk24 branch nighthawk-testnet).
 #
 # Layout (default):
 #   <parent>/
-#     darkfi/                 ← cloned here
-#     darkfi-lightwalletd/    ← this repo
+#     darkfi-nighthawk-testnet/  ← cloned here
+#     darkfi-lightwalletd/       ← this repo
 #
 # Behavior:
-#   - Missing ../darkfi → clone + checkout scripts/darkfi.rev (or DARKFI_GIT_REF)
-#   - Existing ../darkfi → reuse as-is (no checkout), unless FORCE_DARKFI_PIN=1
+#   - Missing ../darkfi-nighthawk-testnet → clone + checkout scripts/darkfi.rev
+#   - Existing tree → reuse as-is, unless FORCE_DARKFI_PIN=1
 #
 # Overrides:
 #   DARKFI_DIR=/path/to/darkfi ./scripts/fetch-darkfi.sh
@@ -20,8 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PARENT="$(cd "$ROOT/.." && pwd)"
 
-DARKFI_DIR="${DARKFI_DIR:-$PARENT/darkfi}"
-DARKFI_GIT_URL="${DARKFI_GIT_URL:-https://github.com/darkrenaissance/darkfi.git}"
+DARKFI_DIR="${DARKFI_DIR:-$PARENT/darkfi-nighthawk-testnet}"
+DARKFI_GIT_URL="${DARKFI_GIT_URL:-https://github.com/nighthawk24/darkfi.git}"
 REV_FILE="$SCRIPT_DIR/darkfi.rev"
 DEFAULT_REF="$(tr -d '[:space:]' <"$REV_FILE" 2>/dev/null || true)"
 DARKFI_GIT_REF="${DARKFI_GIT_REF:-${DEFAULT_REF:-master}}"
