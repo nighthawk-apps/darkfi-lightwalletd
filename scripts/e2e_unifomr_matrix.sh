@@ -21,6 +21,12 @@ AND_FFI="$(cd "$LWD_DIR/../new-nighthawk-android-wallet/rust/darkfi-mobile-ffi" 
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
 NETWORK="${NETWORK:-testnet}"
 
+# This MacBook Pro e2e must hit loopback LWD, not Studio/ngrok.
+if [[ "$LWD_URL" == *ngrok* || "$LWD_URL" == *epidermis* ]]; then
+  echo "refusing Studio/ngrok LWD_URL=$LWD_URL — use http://127.0.0.1:9067"
+  exit 1
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'

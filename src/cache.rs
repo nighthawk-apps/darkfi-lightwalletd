@@ -249,6 +249,20 @@ impl Cache {
             )?;
         }
 
+        // Historical backfill (e.g. missing genesis after a birthday import)
+        // must not rewind META_TIP or append coins at the end of the live tree.
+        if let Some((tip_h, _)) = self.get_tip()? {
+            if block.height < tip_h {
+                debug!(
+                    target: "lightwalletd::cache",
+                    "Cached historical compact block at height {} (tip stays {tip_h})",
+                    block.height
+                );
+                self.rebuild_tip_merkle_tree(tip_h)?;
+                return Ok(());
+            }
+        }
+
         // Update chain tip
         self.meta.insert(META_TIP_HEIGHT, &height_key)?;
         self.meta.insert(META_TIP_HASH, &block.hash)?;
@@ -481,6 +495,8 @@ impl Cache {
 
     /// Stable lightwalletd SecretKey used to attest `GetCluePublicKey` entries.
     ///
+    /// Persisted in sled meta (`unifomr_dir_attest_sk_v1`) so a restart does not
+    /// rotate the advertised `GetLightInfo.directory_attest_pubkey`.
     /// Real and decoy lookups are signed with the same key so Schnorr-verify
     /// no longer leaks the registration bit.
     pub fn get_or_create_directory_attest_secret(&self) -> Result<darkfi_sdk::crypto::SecretKey> {
@@ -1275,6 +1291,23 @@ mod tests {
 
         let tip = cache.get_tip().unwrap().unwrap();
         assert_eq!(tip.0, 5);
+    }
+
+    #[test]
+    fn historical_genesis_insert_does_not_rewind_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        cache.insert_compact_block(&make_test_block(1)).unwrap();
+        cache.insert_compact_block(&make_test_block(2)).unwrap();
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, 2);
+
+        cache.insert_compact_block(&make_test_block(0)).unwrap();
+        assert_eq!(
+            cache.get_tip().unwrap().unwrap().0,
+            2,
+            "backfilling height 0 must not rewind tip"
+        );
+        assert!(cache.get_compact_block(0).unwrap().is_some());
     }
 
     #[test]

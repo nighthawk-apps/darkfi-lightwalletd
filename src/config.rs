@@ -95,6 +95,18 @@ pub struct Config {
     /// Set to `["127.0.0.1"]` when nginx/HAProxy terminates TLS on loopback.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Rate-limiter map size that triggers stale-IP GC (default 4096).
+    #[serde(default = "default_rate_limit_gc_threshold")]
+    pub rate_limit_gc_threshold: usize,
+
+    /// Hard cap on SendTransaction peer bindings (default 100_000).
+    #[serde(default = "default_max_send_peer_entries")]
+    pub max_send_peer_entries: usize,
+
+    /// Max bytes for a single UnifOMR detection key (default 160 MiB).
+    #[serde(default = "default_max_detection_key_bytes")]
+    pub max_detection_key_bytes: usize,
 }
 
 fn default_darkfid_endpoint() -> String {
@@ -166,6 +178,18 @@ fn default_pin_darkfid_dns() -> bool {
     true
 }
 
+fn default_rate_limit_gc_threshold() -> usize {
+    4096
+}
+
+fn default_max_send_peer_entries() -> usize {
+    100_000
+}
+
+fn default_max_detection_key_bytes() -> usize {
+    160 * 1024 * 1024
+}
+
 /// Expand a leading `~/` to the user home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -223,6 +247,9 @@ impl Default for Config {
             tls_cert_path: None,
             tls_key_path: None,
             trusted_proxies: Vec::new(),
+            rate_limit_gc_threshold: default_rate_limit_gc_threshold(),
+            max_send_peer_entries: default_max_send_peer_entries(),
+            max_detection_key_bytes: default_max_detection_key_bytes(),
         }
     }
 }
@@ -296,6 +323,15 @@ impl Config {
         }
         if self.max_streams_per_conn == 0 {
             return Err("max_streams_per_conn must be >= 1".into());
+        }
+        if self.rate_limit_gc_threshold == 0 {
+            return Err("rate_limit_gc_threshold must be >= 1".into());
+        }
+        if self.max_send_peer_entries == 0 {
+            return Err("max_send_peer_entries must be >= 1".into());
+        }
+        if self.max_detection_key_bytes == 0 {
+            return Err("max_detection_key_bytes must be >= 1".into());
         }
 
         let raw_cache = self.cache_path.clone();
@@ -396,6 +432,19 @@ mod tests {
         .finalize()
         .unwrap_err();
         assert!(err.contains("mainnet") || err.contains("testnet"));
+    }
+
+    #[test]
+    fn finalize_rejects_zero_resource_caps() {
+        let err = Config {
+            network: "testnet".into(),
+            chain_name: "darkfi-testnet".into(),
+            rate_limit_gc_threshold: 0,
+            ..Config::default()
+        }
+        .finalize()
+        .unwrap_err();
+        assert!(err.contains("rate_limit_gc_threshold"));
     }
 
     #[test]

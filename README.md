@@ -44,18 +44,23 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi` checkout** | Sibling `../darkfi` (fetched by build script) |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `327fa9f13` (nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi/                 # fetched to sibling ../darkfi
-  darkfi-lightwalletd/    # this repo
+  darkfi-nighthawk-testnet/   # pin 327fa9f13 — or symlink to Android third_party/darkfi
+  darkfi-lightwalletd/        # this repo
   moonshine/
   new-nighthawk-android-wallet/
   nighthawk-ios-wallet/
+```
+
+```bash
+# Reuse the Android pin instead of a second clone:
+ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
 ```bash
@@ -67,7 +72,7 @@ sudo apt install protobuf-compiler   # Debian/Ubuntu
 
 ## Build
 
-Independent clone (pulls `darkfi` next to this repo, then builds):
+Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then builds):
 
 ```bash
 ./scripts/build.sh
@@ -75,18 +80,19 @@ Independent clone (pulls `darkfi` next to this repo, then builds):
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev`. Overrides:
+`scripts/darkfi.rev` (`327fa9f134fc756b84be2ce327afaae1cd41a956`). Overrides:
 
 ```bash
-DARKFI_DIR=/path/to/darkfi DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
+DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
 ./scripts/build.sh --no-default-features   # without UnifOMR / FHE
 ```
 
-If `../darkfi` already exists (e.g. you develop the full Nighthawk tree):
+If `../darkfi-nighthawk-testnet` already exists (symlink to Android `third_party/darkfi` is OK):
 
 ```bash
-cargo build --release
-cargo test
+cargo build --release --all-features
+# Unit tests do not need compiled contract *.zk.bin (no test-harness dep).
+cargo test --release --lib
 ```
 
 ---

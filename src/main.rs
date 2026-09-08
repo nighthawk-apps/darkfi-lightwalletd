@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tip_tx, tip_rx) = tokio::sync::watch::channel(initial_tip);
 
     // Create gRPC service with rate limits + tx size cap
-    let service = LightWalletService::with_limits(
+    let mut service = LightWalletService::with_limits(
         Arc::clone(&cache),
         Arc::clone(&rpc_client),
         config.chain_name.clone(),
@@ -216,6 +216,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_tx_bytes,
         tip_rx,
         config.trusted_proxies.clone(),
+    );
+    service.apply_resource_caps(
+        config.max_detection_key_bytes,
+        config.max_send_peer_entries,
+        config.rate_limit_gc_threshold,
     );
 
     // Start chain poller in background

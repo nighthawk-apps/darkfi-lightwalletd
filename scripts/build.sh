@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Independent build entrypoint: ensure sibling `darkfi/` exists, then cargo build.
+# Independent build entrypoint: ensure sibling `darkfi-nighthawk-testnet/` exists,
+# then cargo build.
 #
 # Usage:
 #   ./scripts/build.sh
 #   ./scripts/build.sh --no-default-features
-#   DARKFI_DIR=/path/to/darkfi ./scripts/build.sh
+#   DARKFI_DIR=/path/to/darkfi-nighthawk-testnet ./scripts/build.sh
 #
 set -euo pipefail
 

@@ -36,6 +36,11 @@ pin_darkfid_dns = true
 # the client address from X-Forwarded-For instead of 127.0.0.1.
 # trusted_proxies = ["127.0.0.1", "::1"]
 
+# Resource caps (audit P2). Defaults shown.
+rate_limit_gc_threshold = 4096
+max_send_peer_entries = 100000
+max_detection_key_bytes = 167772160
+
 # SECURITY: cleartext is ONLY allowed on 127.0.0.1 / ::1 / localhost.
 # For public binds you MUST set TLS:
 # grpc_listen = "0.0.0.0:9067"

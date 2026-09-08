@@ -246,6 +246,17 @@ impl ChainPoller {
             }
         };
 
+        // A cache imported from a birthday / snapshot can have tip > 0 while
+        // height 0 is absent. GetNoteCommitments(0..=tip) then abort with
+        // chain discontinuity and wallets cannot rebuild spend Merkle trees.
+        if self.cache.get_compact_block(0)?.is_none() {
+            info!(
+                target: "lightwalletd::chain_poller",
+                "Height 0 missing from cache; backfilling genesis compact block"
+            );
+            return self.fetch_range(0, 0).await;
+        }
+
         let cached_tip = self.cache.get_tip()?;
         let cached_hash_at_remote = self.cache.get_block_hash(remote_height)?;
         let remote_hash_at_cached_tip = match cached_tip {

@@ -213,6 +213,9 @@ pub struct LightWalletService {
     fhe_permits: Arc<tokio::sync::Semaphore>,
     /// TCP peers from which `X-Forwarded-For` is trusted (empty = ignore the header).
     trusted_proxies: Vec<String>,
+    max_detection_key_bytes: usize,
+    max_detection_keys_total_bytes: usize,
+    max_send_peer_entries: usize,
 }
 
 impl LightWalletService {
@@ -272,7 +275,28 @@ impl LightWalletService {
             tip_notify,
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
             trusted_proxies,
+            max_detection_key_bytes: MAX_DETECTION_KEY_BYTES,
+            max_detection_keys_total_bytes: MAX_DETECTION_KEYS_TOTAL_BYTES,
+            max_send_peer_entries: MAX_SEND_PEER_ENTRIES,
         }
+    }
+
+    /// Override DoS caps from operator config (defaults stay conservative).
+    pub fn apply_resource_caps(
+        &mut self,
+        max_detection_key_bytes: usize,
+        max_send_peer_entries: usize,
+        rate_limit_gc_threshold: usize,
+    ) {
+        self.max_detection_key_bytes = max_detection_key_bytes.max(1);
+        self.max_detection_keys_total_bytes = max_detection_key_bytes.max(1);
+        self.max_send_peer_entries = max_send_peer_entries.max(1);
+        self.omr_rate_limiter
+            .set_gc_threshold(rate_limit_gc_threshold);
+        self.clue_rate_limiter
+            .set_gc_threshold(rate_limit_gc_threshold);
+        self.rpc_rate_limiter
+            .set_gc_threshold(rate_limit_gc_threshold);
     }
 
     fn peer_ip<T>(&self, request: &Request<T>) -> IpAddr {
@@ -303,11 +327,11 @@ impl LightWalletService {
             let now = Instant::now();
             map.retain(|_, (_, t)| now.duration_since(*t) < SEND_PEER_BIND_TTL);
             // M2: hard-cap to prevent unbounded growth under sustained traffic.
-            if map.len() >= MAX_SEND_PEER_ENTRIES {
+            if map.len() >= self.max_send_peer_entries {
                 // Evict oldest entries to make room.
                 let mut entries: Vec<_> = map.iter().map(|(k, (_, t))| (*k, *t)).collect();
                 entries.sort_by_key(|(_, t)| *t);
-                let evict_count = map.len().saturating_sub(MAX_SEND_PEER_ENTRIES) + 1;
+                let evict_count = map.len().saturating_sub(self.max_send_peer_entries) + 1;
                 for (k, _) in entries.into_iter().take(evict_count) {
                     map.remove(&k);
                 }
@@ -1234,7 +1258,7 @@ impl DarkFiLightWallet for LightWalletService {
 
                 current_key.extend_from_slice(&chunk.data);
 
-                if current_key.len() > MAX_DETECTION_KEY_BYTES {
+                if current_key.len() > self.max_detection_key_bytes {
                     return Err(Status::invalid_argument(format!(
                         "UnifOMR detection key[{}] too large: {} bytes",
                         keys.len(),
@@ -1248,10 +1272,11 @@ impl DarkFiLightWallet for LightWalletService {
 
                 let total_key_bytes: usize =
                     keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
-                if total_key_bytes > MAX_DETECTION_KEYS_TOTAL_BYTES {
+                if total_key_bytes > self.max_detection_keys_total_bytes {
                     return Err(Status::invalid_argument(format!(
                         "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
-                         (max {MAX_DETECTION_KEYS_TOTAL_BYTES})"
+                         (max {})",
+                        self.max_detection_keys_total_bytes
                     )));
                 }
             }
@@ -1277,7 +1302,7 @@ impl DarkFiLightWallet for LightWalletService {
 
             // Reject oversized multi-key payloads even when individual keys pass
             if let Some(max_len) = keys.iter().map(|k| k.len()).max() {
-                if keys.len().saturating_mul(max_len) > MAX_DETECTION_KEYS_TOTAL_BYTES {
+                if keys.len().saturating_mul(max_len) > self.max_detection_keys_total_bytes {
                     return Err(Status::invalid_argument(
                         "UnifOMR detection_keys count×size exceeds total size budget",
                     ));

@@ -87,7 +87,8 @@ async-stream = "0.3.6"
 
 [dev-dependencies]
 tempfile = "3"
-darkfi-contract-test-harness = { path = "../darkfi-nighthawk-testnet/src/contract/test-harness" }
+# Do not path-depend on darkfi-contract-test-harness: it include_bytes! compiled
+# *.zk.bin files that a pin checkout does not ship. Cache/unit tests use tempfile only.
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -27,16 +28,30 @@ use std::time::{Duration, Instant};
 pub struct PeerRateLimiter {
     limit: u32,
     window: Duration,
+    gc_threshold: AtomicUsize,
     inner: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl PeerRateLimiter {
     pub fn new(limit_per_window: u32, window: Duration) -> Self {
+        Self::with_gc_threshold(limit_per_window, window, 4096)
+    }
+
+    pub fn with_gc_threshold(
+        limit_per_window: u32,
+        window: Duration,
+        gc_threshold: usize,
+    ) -> Self {
         Self {
             limit: limit_per_window,
             window,
+            gc_threshold: AtomicUsize::new(gc_threshold.max(1)),
             inner: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn set_gc_threshold(&self, n: usize) {
+        self.gc_threshold.store(n.max(1), Ordering::Relaxed);
     }
 
     /// Returns `true` if the request is allowed (consumes 1 credit).
@@ -61,8 +76,7 @@ impl PeerRateLimiter {
         };
         let now = Instant::now();
         // Opportunistic GC: drop stale IP entries when the map grows.
-        const GC_THRESHOLD: usize = 256;
-        if guard.len() >= GC_THRESHOLD {
+        if guard.len() >= self.gc_threshold.load(Ordering::Relaxed) {
             let window = self.window;
             guard.retain(|_, (_, t)| now.duration_since(*t) < window);
         }
@@ -100,6 +114,7 @@ mod tests {
         let limiter = PeerRateLimiter {
             limit: 10,
             window: Duration::from_secs(60),
+            gc_threshold: AtomicUsize::new(4096),
             inner: Mutex::new(HashMap::new()),
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
