@@ -51,7 +51,9 @@ async fn rpc(method: &str, params: JsonValue, timeout_s: u64) -> Result<JsonValu
     if let Some(err) = map.get("error") {
         return Err(format!("rpc error: {err:?}"));
     }
-    map.get("result").cloned().ok_or_else(|| "no result".to_string())
+    map.get("result")
+        .cloned()
+        .ok_or_else(|| "no result".to_string())
 }
 
 async fn contract_state(tree: &str) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
@@ -141,7 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut lwd = DarkFiLightWalletClient::connect(LWD.to_string()).await?;
     let tip = lwd.get_chain_tip(Empty {}).await?.into_inner();
-    println!("LWD tip height={} hash={}", tip.height, hex::encode(&tip.hash));
+    println!(
+        "LWD tip height={} hash={}",
+        tip.height,
+        hex::encode(&tip.hash)
+    );
 
     let st = lwd
         .get_tree_state(darkfi_lightwalletd::proto::BlockHeight { height: tip.height })
@@ -218,7 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if diverged.is_some() {
             break;
         }
-        eprintln!("  scanned {end}/{} appended={appended} last_ok={last_ok}", tip.height);
+        eprintln!(
+            "  scanned {end}/{} appended={appended} last_ok={last_ok}",
+            tip.height
+        );
         start = end.saturating_add(1);
         if start == 0 {
             break;
@@ -232,10 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rebuilt == LWD GetTreeState: {}",
         final_root == lwd_root_bytes
     );
-    println!(
-        "rebuilt in coin_roots: {}",
-        roots.contains(&final_root)
-    );
+    println!("rebuilt in coin_roots: {}", roots.contains(&final_root));
     match diverged {
         Some(h) => println!("FIRST DIVERGENCE HEIGHT: {h}"),
         None => println!("no per-height divergence (roots always in coin_roots after each height)"),

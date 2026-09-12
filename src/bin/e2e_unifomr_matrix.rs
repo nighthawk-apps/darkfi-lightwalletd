@@ -452,7 +452,8 @@ async fn main() {
                         match unpack_slot_heights(&resp.slot_heights) {
                             Ok(slot_heights) => match crypto.decrypt_digest_slots(&digest) {
                                 Ok(slots) => {
-                                    let _ = UnifOmrClient::range_check_matches(&slots, &slot_heights);
+                                    let _ =
+                                        UnifOmrClient::range_check_matches(&slots, &slot_heights);
                                     pass(&format!(
                                         "GetUnifOmrDigest decrypt ok (range {start}..={end}, \
                                          msgs={}, slots={})",

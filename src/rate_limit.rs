@@ -37,11 +37,7 @@ impl PeerRateLimiter {
         Self::with_gc_threshold(limit_per_window, window, 4096)
     }
 
-    pub fn with_gc_threshold(
-        limit_per_window: u32,
-        window: Duration,
-        gc_threshold: usize,
-    ) -> Self {
+    pub fn with_gc_threshold(limit_per_window: u32, window: Duration, gc_threshold: usize) -> Self {
         Self {
             limit: limit_per_window,
             window,
