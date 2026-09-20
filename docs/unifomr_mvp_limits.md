@@ -42,7 +42,7 @@ discrete Gaussian σ=0.5, `‖u‖₀ = h/2 = 40`, `‖s‖₀ = h = 80` ⇒ σ_
   for `M` flattened messages. The slot → height map is returned once, out-of-band,
   in `OmrDigestResponse.slot_heights` (packed little-endian `u32`).
 - **Ownership-proof replay fix (v2)** — `RegisterCluePublicKey` proofs sign
-  `b"DarkFi-UnifOMR-CluePK-v2" || network_byte || key_version (u32 LE) ||
+  `b"DarkFi-UnifOMR-CluePK-v2" || network_byte || key_version (u64 LE) ||
   payment_pubkey || clue_public_key`. The network byte kills cross-network
   replay; `key_version` (unix seconds) is monotonic — the server only replaces
   a registration when the new version is strictly greater (signed rotation),

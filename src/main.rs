@@ -326,9 +326,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max_encoding_message_size(160 * 1024 * 1024);
 
         let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C handler");
+            #[cfg(unix)]
+            {
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )
+                .expect("Failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to install CTRL+C handler");
+            }
             info!(target: "lightwalletd", "Received shutdown signal");
         };
 

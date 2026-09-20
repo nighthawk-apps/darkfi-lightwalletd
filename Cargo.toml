@@ -1,6 +1,6 @@
 [package]
 name = "darkfi-lightwalletd"
-version = "0.2.0"
+version = "0.2.1"
 homepage = "https://nighthawkapps.com"
 description = "DarkFi lightwallet server — compact block serving for shielded wallet sync (UnifOMR)"
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
@@ -70,8 +70,6 @@ blake3 = "1.8.6"
 
 # Config
 serde = { version = "1.0.228", features = ["derive"] }
-structopt = "0.3.26"
-structopt-toml = "0.5.1"
 toml = "0.9.8"
 
 # Misc

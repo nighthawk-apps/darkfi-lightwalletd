@@ -23,6 +23,11 @@ Internet → DDoS scrubbing → HAProxy (L4 conn limits)
 - `client_max_body_size 160m;` (Param2 UnifOMR det-keys are ~120 MiB; the default 4m will reject `GetUnifOmrDigest`)
 - `grpc_read_timeout` / `grpc_send_timeout` ≤ 300s (must match `request_timeout_s`; Param2 FHE + Tor can exceed 60s)
 - Proxy to `grpc://127.0.0.1:9068`
+- Set `X-Forwarded-For` to the *immediate* client IP (do **not** use
+  `$proxy_add_x_forwarded_for`, which appends and lets a client spoof the
+  leftmost hop). Example: `proxy_set_header X-Forwarded-For $remote_addr;`
+- List the nginx/HAProxy listen IPs in lightwalletd `trusted_proxies`.
+  The server walks `X-Forwarded-For` right-to-left and skips trusted hops.
 
 ## Kernel / iptables
 

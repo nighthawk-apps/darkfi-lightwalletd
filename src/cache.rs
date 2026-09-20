@@ -18,13 +18,18 @@
 
 //! Cache layer for the lightwallet server.
 //!
-//! Uses sled to store:
+//! Uses sled 0.34 to store:
 //! - Compact blocks indexed by height
 //! - Block hash ↔ height bidirectional index
 //! - Server metadata (chain tip, version)
 //!
 //! All data in this cache is derived from the darkfid full node and can
 //! be rebuilt from scratch if corrupted or deleted.
+//!
+//! sled is unmaintained. A store swap (redb / kvdb-overlay) is a
+//! `CACHE_FORMAT_VERSION` bump that wipes on-disk caches — operators
+//! resync from darkfid. Keep sled for 0.2.1 so existing deployments
+//! do not rebuild on this pin bump.
 
 // Using bincode for compact block serialization (serde-based) to avoid
 // lifetime issues with darkfi_serial's async derive macros.
@@ -495,14 +500,16 @@ impl Cache {
 
     /// Stable lightwalletd SecretKey used to attest `GetCluePublicKey` entries.
     ///
-    /// Persisted in sled meta (`unifomr_dir_attest_sk_v1`) so a restart does not
+    /// Persisted in sled meta (`unifomr_dir_attest_sk_v2`) so a restart does not
     /// rotate the advertised `GetLightInfo.directory_attest_pubkey`.
     /// Real and decoy lookups are signed with the same key so Schnorr-verify
     /// no longer leaks the registration bit.
     pub fn get_or_create_directory_attest_secret(&self) -> Result<darkfi_sdk::crypto::SecretKey> {
         use darkfi_sdk::crypto::SecretKey;
         use darkfi_sdk::pasta::group::ff::PrimeField;
-        const KEY: &[u8] = b"unifomr_dir_attest_sk_v1";
+        // v2: 256-bit CSPRNG key. v1 used Pcg32 seeded from 8 OS bytes (64-bit
+        // key space) and is discarded so directory_attest_pubkey rotates once.
+        const KEY: &[u8] = b"unifomr_dir_attest_sk_v2";
         if let Some(existing) = self.meta.get(KEY)? {
             if existing.len() == 32 {
                 let mut out = [0u8; 32];
@@ -512,9 +519,13 @@ impl Cache {
                 });
             }
         }
-        let mut seed = [0u8; 8];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
-        let sk = SecretKey::random(&mut darkfi::util::pcg::Pcg32::new(u64::from_le_bytes(seed)));
+        let sk = loop {
+            let mut bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+            if let Ok(sk) = SecretKey::from_bytes(bytes) {
+                break sk;
+            }
+        };
         self.meta.insert(KEY, sk.inner().to_repr().as_slice())?;
         Ok(sk)
     }

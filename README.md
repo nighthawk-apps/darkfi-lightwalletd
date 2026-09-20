@@ -44,14 +44,14 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `327fa9f13` (nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `d30627982` (nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi-nighthawk-testnet/   # pin 327fa9f13 — or symlink to Android third_party/darkfi
+  darkfi-nighthawk-testnet/   # pin d30627982 — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
   new-nighthawk-android-wallet/
@@ -80,7 +80,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev` (`327fa9f134fc756b84be2ce327afaae1cd41a956`). Overrides:
+`scripts/darkfi.rev` (`d3062798209adda89a6ee1b3ebef2210a0ee0042`). Overrides:
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh

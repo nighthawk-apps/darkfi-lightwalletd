@@ -53,8 +53,7 @@ const MAX_BLOCKS_PER_REQUEST: u32 = 10_000;
 /// Max heights in a sparse GetCompactBlocksAtHeights request.
 const MAX_SPARSE_HEIGHTS: usize = 512;
 /// Max serialized detection key size before parse (S24 / DoS).
-/// UnifOMR GenDetKey is ~38MB at n=1024 (BFV CTs). Allow headroom.
-// Param2 (D=4096, moduli 40×3, n=1024) det-keys measure ~120 MiB on the wire.
+/// Param2 (D=4096, moduli 40×3, n=1024) det-keys measure ~120 MiB on the wire.
 const MAX_DETECTION_KEY_BYTES: usize = 160 * 1024 * 1024;
 /// Cap on sum of all detection_keys lengths in one request.
 const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 160 * 1024 * 1024;
@@ -177,11 +176,26 @@ fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     }
 }
 
-fn client_ip_from_forwarded(header: &str) -> Option<IpAddr> {
-    header
-        .split(',')
-        .next()
-        .and_then(|hop| hop.trim().parse::<IpAddr>().ok())
+/// Client IP from `X-Forwarded-For` when the TCP peer is a trusted proxy.
+///
+/// Walk hops **right-to-left** and skip entries that match `trusted` (the
+/// proxies themselves). nginx `$proxy_add_x_forwarded_for` *appends*, so the
+/// leftmost hop is client-controlled and must not be used for rate limits.
+fn client_ip_from_forwarded(header: &str, trusted: &[String]) -> Option<IpAddr> {
+    for hop in header.split(',').rev() {
+        let hop = hop.trim();
+        if hop.is_empty() {
+            continue;
+        }
+        let Ok(ip) = hop.parse::<IpAddr>() else {
+            continue;
+        };
+        if trusted.iter().any(|e| ip_matches_proxy_entry(ip, e)) {
+            continue;
+        }
+        return Some(ip);
+    }
+    None
 }
 
 /// Server state shared across all gRPC handlers.
@@ -196,8 +210,10 @@ pub struct LightWalletService {
     chain_name: String,
     /// UnifOMR wire network byte (`0x00` mainnet / `0x01` testnet)
     network_byte: u8,
-    /// Per-peer UnifOMR digest / PIR rate limiter (S6)
+    /// Per-peer UnifOMR digest rate limiter (S6)
     omr_rate_limiter: Arc<PeerRateLimiter>,
+    /// Per-peer FetchPirBatch limiter (higher than digest — one window is many limbs)
+    pir_rate_limiter: Arc<PeerRateLimiter>,
     /// Per-peer RegisterOmrClue rate limiter (S12) — tighter than digest.
     clue_rate_limiter: Arc<PeerRateLimiter>,
     /// Per-peer GetBlockRange / SendTransaction rate limiter.
@@ -265,6 +281,9 @@ impl LightWalletService {
                 omr_rate_limit_per_min,
                 Duration::from_secs(60),
             )),
+            // PIR is one RPC per limb (~39 for a typical compact block). The
+            // digest limiter (default 30/min) would fail every window.
+            pir_rate_limiter: Arc::new(PeerRateLimiter::new(600, Duration::from_secs(60))),
             clue_rate_limiter: Arc::new(PeerRateLimiter::new(32, Duration::from_secs(60))),
             rpc_rate_limiter: Arc::new(PeerRateLimiter::new(
                 rpc_rate_limit_per_min,
@@ -293,6 +312,8 @@ impl LightWalletService {
         self.max_send_peer_entries = max_send_peer_entries.max(1);
         self.omr_rate_limiter
             .set_gc_threshold(rate_limit_gc_threshold);
+        self.pir_rate_limiter
+            .set_gc_threshold(rate_limit_gc_threshold);
         self.clue_rate_limiter
             .set_gc_threshold(rate_limit_gc_threshold);
         self.rpc_rate_limiter
@@ -318,7 +339,7 @@ impl LightWalletService {
             .metadata()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(client_ip_from_forwarded)
+            .and_then(|h| client_ip_from_forwarded(h, &self.trusted_proxies))
             .unwrap_or(remote)
     }
 
@@ -359,6 +380,17 @@ impl LightWalletService {
         } else {
             Err(Status::resource_exhausted(
                 "OMR digest rate limit exceeded; retry later",
+            ))
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check_pir_rate_limit(&self, peer: IpAddr) -> Result<(), Status> {
+        if self.pir_rate_limiter.check_n(peer, 1) {
+            Ok(())
+        } else {
+            Err(Status::resource_exhausted(
+                "PIR rate limit exceeded; retry later",
             ))
         }
     }
@@ -412,7 +444,13 @@ impl DarkFiLightWallet for LightWalletService {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let start = range.start_height;
-        let end = range.end_height;
+        let mut end = range.end_height;
+        if let Ok(Some((tip, _))) = self.cache.get_tip() {
+            end = end.min(tip);
+        }
+        if start > end {
+            return Err(Status::invalid_argument("block range start exceeds tip"));
+        }
 
         reject_oversized_window(start, end)?;
 
@@ -1398,7 +1436,7 @@ impl DarkFiLightWallet for LightWalletService {
         #[cfg(feature = "fhe-omr")]
         {
             let peer = self.peer_ip(&request);
-            self.check_omr_rate_limit(peer, 1)?;
+            self.check_pir_rate_limit(peer)?;
             let req = request.into_inner();
 
             if req.query_ciphertexts.is_empty() {
@@ -1655,8 +1693,14 @@ mod tests {
         assert!(ip_matches_proxy_entry(loopback, "127.0.0.1"));
         assert!(ip_matches_proxy_entry(loopback, "127.0.0.0/8"));
         assert!(!ip_matches_proxy_entry(loopback, "10.0.0.0/8"));
+        let trusted = vec!["127.0.0.1".to_string()];
+        // nginx appends; leftmost hop is client-spoofable and must be ignored.
         assert_eq!(
-            client_ip_from_forwarded("203.0.113.9, 127.0.0.1"),
+            client_ip_from_forwarded("1.2.3.4, 203.0.113.9, 127.0.0.1", &trusted),
+            "203.0.113.9".parse::<IpAddr>().ok()
+        );
+        assert_eq!(
+            client_ip_from_forwarded("203.0.113.9", &trusted),
             "203.0.113.9".parse::<IpAddr>().ok()
         );
     }

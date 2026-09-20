@@ -14,7 +14,7 @@ Use against **standalone** `darkfi-lightwalletd` with `fhe-omr`. Tick when prove
 - [x] RLWE `n=1024` (paper Param2) with negacyclic mul
 - [x] Android n=1024 parity (FFI / client crypto aligned with LWD)
 - [x] PIR assemble length (length-prefixed SealPIR limbs / CompactBlock reassembly)
-- [x] R_PRIME interim ceiling (`R_PRIME=32768`; paper `r′=149` after mod-switch **not claimed** — see `docs/unifomr_mvp_limits.md` SHIP NOTICE)
+- [x] `R_PRIME=149` (paper `r′`) shipped; digest CTs modulus-switched to last BFV level (see `docs/unifomr_mvp_limits.md`)
 - [x] Param2 `CLUE_ERROR_BOUND=84` / `CLUE_Q=1032193` active (archived MVP `r=2` not in use)
 - [x] Clue hint 24h TTL (orphan `SendTransaction` clues)
 - [x] GetClue 250ms pad (timing padding on `GetCluePublicKey`)
