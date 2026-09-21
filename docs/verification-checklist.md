@@ -21,6 +21,7 @@ Use against **standalone** `darkfi-lightwalletd` with `fhe-omr`. Tick when prove
 - [x] Live e2e registration matrix on testnet LWD cache (both / recv_only / send_only / neither + GetUnifOmrDigest)
 - [x] iOS/Android UnifOMR any-match unit parity (`test_unifomr_any_match_second_clue`)
 - [ ] Receiver with clue PK registered receives via UnifOMR (`GetUnifOmrDigest` + `FetchPirBatch`) funded e2e
+  - 2026-09-21: started live funded matrix (`scripts/e2e_funded_100_tx_matrix.sh`); broadcast UnifOMR sample txs `098e732e…` and `7280d595…` via local LWD 0.2.2. Blocked on spendable DRK for full 100-tx (alice/bob/carol/dave notes orphaned after merkle rebuild; need faucet/mining top-up).
 - [ ] Sender with registered recipient builds UnifOMR clue and sees tx in history (funded)
 - [ ] Sender without LWD / UnifOMR path fails closed (no legacy scheme)
 - [ ] Receiver without UnifOMR matches discovers via trial decrypt
