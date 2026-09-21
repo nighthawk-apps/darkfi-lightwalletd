@@ -3,7 +3,7 @@
 **Audit date:** 2026-09-20  
 **Model:** Claude Fable 5.1  
 **Review date:** 2026-09-21  
-**Shipped revision:** `2a935b9` (v0.2.1)  
+**Shipped revision:** `2a935b9` (v0.2.2)  
 
 Full auditor transcripts (unchanged):
 
@@ -32,4 +32,4 @@ FHE permit held during large body upload; unlimited some RPCs; raw IPs in `recen
 
 ## Deploy note
 
-Mac Studio (2026-09-20): launchd `org.darkfi.lightwalletd` runs 0.2.1; ngrok `epidermis-sandbox-marshland.ngrok-free.dev` → `127.0.0.1:9067` unchanged.
+Mac Studio (2026-09-20): launchd `org.darkfi.lightwalletd` runs 0.2.2; ngrok `epidermis-sandbox-marshland.ngrok-free.dev` → `127.0.0.1:9067` unchanged.
