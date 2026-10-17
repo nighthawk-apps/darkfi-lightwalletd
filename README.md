@@ -44,7 +44,7 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `d30627982` (nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `d30627982` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:

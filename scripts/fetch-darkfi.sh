@@ -2,6 +2,11 @@
 # Fetch the sibling DarkFi pin required by Cargo path deps
 # (`../darkfi-nighthawk-testnet`, nighthawk24 branch nighthawk-testnet).
 #
+# Upstream DarkFi is https://git.dark.fi/darkrenaissance/darkfi
+# Do not clone the GitHub mirror (github.com/darkrenaissance/darkfi).
+# scripts/darkfi.rev is not published on git.dark.fi, so the default
+# clone stays the nighthawk24 fork that contains that pin.
+#
 # Layout (default):
 #   <parent>/
 #     darkfi-nighthawk-testnet/  ← cloned here

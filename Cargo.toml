@@ -13,7 +13,7 @@ edition = "2021"
 # =============================================================================
 # Copyright (C) 2026 Nighthawk Apps. Builds against sibling
 # ../darkfi-nighthawk-testnet (nighthawk24 `nighthawk-testnet` pin).
-# Does not modify upstream darkrenaissance/darkfi.
+# Does not modify upstream DarkFi (https://git.dark.fi/darkrenaissance/darkfi).
 # =============================================================================
 
 [[bin]]
