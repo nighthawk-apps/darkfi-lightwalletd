@@ -26,7 +26,7 @@
 //! 5. Retries with exponential backoff on failures
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
@@ -166,6 +166,8 @@ impl ChainPoller {
     pub async fn run(&self) {
         let mut consecutive_failures: u32 = 0;
         let mut blocks_since_last_prune: u32 = 0;
+        let mut last_ok = Instant::now();
+        let mut logged_sustained = false;
 
         loop {
             match self.poll_once().await {
@@ -178,6 +180,8 @@ impl ChainPoller {
                         blocks_since_last_prune += blocks_processed;
                     }
                     consecutive_failures = 0;
+                    last_ok = Instant::now();
+                    logged_sustained = false;
 
                     // Periodic cache pruning
                     if self.config.retention_window > 0
@@ -216,6 +220,13 @@ impl ChainPoller {
                         target: "lightwalletd::chain_poller",
                         "Poll failed (attempt {consecutive_failures}): {e}"
                     );
+                    if !logged_sustained && last_ok.elapsed() >= Duration::from_secs(300) {
+                        error!(
+                            target: "lightwalletd::chain_poller",
+                            "darkfid tip unreachable for 5 minutes"
+                        );
+                        logged_sustained = true;
+                    }
                 }
             }
 

@@ -48,9 +48,9 @@ tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 
 # Async runtime
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 smol = "2.0.2"
-futures = "0.3.32"
+futures = "0.3.34"
 
 # Blockchain store / cache
 sled = "0.34"
@@ -66,14 +66,14 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tracing-appender = "0.2.5"
 
 # Crypto
-blake3 = "1.8.6"
+blake3 = "1.8.7"
 
 # Config
-serde = { version = "1.0.228", features = ["derive"] }
-toml = "0.9.8"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "0.9.12"
 
 # Misc
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 hex = "0.4.3"
 tokio = { version = "1", features = ["full"] }
 fhe = { version = "0.1.1", optional = true }

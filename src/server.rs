@@ -67,6 +67,10 @@ const MAX_PIR_QUERY_CT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 /// Max opaque recipient OMR metadata on SendTransaction.
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
+/// Compact-block wire version reported by GetLightInfo.
+/// Bump when the compact format or RPC contract changes.
+const LIGHTWALLET_PROTO_VERSION: &str = "1.0.0";
+
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
 const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
 /// Max characters in LookupZkas contract id (base58 + headroom).
@@ -85,6 +89,25 @@ fn height_span(start: u32, end: u32) -> Result<u64, Status> {
         )));
     }
     Ok((end as u64) - (start as u64) + 1)
+}
+
+/// `end == 0` means "through the cached tip". Any other end is clamped to the tip.
+fn resolve_block_range(
+    cache: &crate::cache::Cache,
+    start: u32,
+    end: u32,
+) -> Result<(u32, u32), Status> {
+    let tip = match cache.get_tip() {
+        Ok(Some((tip, _))) => tip,
+        Ok(None) => return Err(Status::unavailable("No blocks cached yet")),
+        Err(e) => return Err(cache_status(e)),
+    };
+    let end = if end == 0 { tip } else { end.min(tip) };
+    if start > end {
+        return Err(Status::invalid_argument("block range start exceeds tip"));
+    }
+    reject_oversized_window(start, end)?;
+    Ok((start, end))
 }
 
 fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
@@ -443,16 +466,7 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
-        let start = range.start_height;
-        let mut end = range.end_height;
-        if let Ok(Some((tip, _))) = self.cache.get_tip() {
-            end = end.min(tip);
-        }
-        if start > end {
-            return Err(Status::invalid_argument("block range start exceeds tip"));
-        }
-
-        reject_oversized_window(start, end)?;
+        let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
 
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
@@ -594,9 +608,15 @@ impl DarkFiLightWallet for LightWalletService {
             let mut last_height = cache.get_tip().unwrap_or(None).map(|(h, _)| h).unwrap_or(0);
 
             loop {
-                // Wait for tip notification (or spurious wake / lag).
-                if tip_rx.changed().await.is_err() {
-                    return; // sender dropped — shut down
+                // Stop when the client hangs up, without waiting for the next tip.
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    changed = tip_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
                 }
                 let current_height = *tip_rx.borrow_and_update();
 
@@ -867,13 +887,12 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetNoteCommitmentsStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
-
-        reject_oversized_window(range.start_height, range.end_height)?;
+        let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
 
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
-            range.start_height,
-            range.end_height,
+            start,
+            end,
             |block| proto::NoteCommitmentUpdate {
                 height: block.height,
                 coins: block
@@ -895,13 +914,12 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetNullifiersStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
-
-        reject_oversized_window(range.start_height, range.end_height)?;
+        let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
 
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
-            range.start_height,
-            range.end_height,
+            start,
+            end,
             |block| proto::NullifierUpdate {
                 height: block.height,
                 nullifiers: block
@@ -1144,7 +1162,7 @@ impl DarkFiLightWallet for LightWalletService {
                 .directory_attest_public_key()
                 .map_err(cache_status)?
                 .to_vec(),
-            proto_version: "1.0.0".to_string(),
+            proto_version: LIGHTWALLET_PROTO_VERSION.to_string(),
         }))
     }
 
@@ -1665,6 +1683,39 @@ impl DarkFiLightWallet for LightWalletService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_height_zero_resolves_to_cached_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::new(dir.path().to_str().unwrap()).unwrap();
+        assert!(resolve_block_range(&cache, 0, 0).is_err());
+
+        cache
+            .insert_compact_block(&crate::compact_block::CompactBlock {
+                height: 40,
+                hash: [9u8; 32],
+                prev_hash: [0u8; 32],
+                timestamp: 1,
+                txs: vec![],
+            })
+            .unwrap();
+        assert_eq!(resolve_block_range(&cache, 0, 0).unwrap(), (0, 40));
+        assert_eq!(resolve_block_range(&cache, 10, 0).unwrap(), (10, 40));
+        assert_eq!(resolve_block_range(&cache, 0, 10_000).unwrap(), (0, 40));
+        assert!(resolve_block_range(&cache, 41, 0).is_err());
+
+        cache
+            .insert_compact_block(&crate::compact_block::CompactBlock {
+                height: 20_000,
+                hash: [8u8; 32],
+                prev_hash: [0u8; 32],
+                timestamp: 2,
+                txs: vec![],
+            })
+            .unwrap();
+        assert!(resolve_block_range(&cache, 0, 0).is_err());
+        assert_eq!(resolve_block_range(&cache, 19_000, 0).unwrap(), (19_000, 20_000));
+    }
 
     #[test]
     fn height_span_rejects_wraparound() {

@@ -35,6 +35,16 @@ pub const MAX_PIR_LIMBS: usize = 4096;
 /// Max stripes (must match server `MAX_PIR_STRIPES`).
 pub const MAX_PIR_STRIPES: usize = 8;
 
+/// Round a needed limb count up to the next power of two.
+///
+/// The client always issues this many `FetchPirBatch` calls, so the server
+/// sees a size bucket rather than the exact matched payload length.
+/// Minimum bucket is 8 limbs (56 bytes of payload plus the length limb).
+pub fn padded_limb_count(needed: usize) -> usize {
+    let n = needed.max(8).min(MAX_PIR_LIMBS);
+    n.next_power_of_two().min(MAX_PIR_LIMBS)
+}
+
 /// Derive PIR client seed from wallet secret (independent of detection key).
 pub fn derive_pir_seed(wallet_secret: &[u8], network: u8) -> Result<[u8; 32], String> {
     if wallet_secret.len() < 32 {
@@ -342,6 +352,13 @@ pub fn limb_column(payloads: &[Vec<u8>], limb_index: usize) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_limb_count_hides_exact_size() {
+        assert_eq!(padded_limb_count(1), 8);
+        assert_eq!(padded_limb_count(9), 16);
+        assert_eq!(padded_limb_count(MAX_PIR_LIMBS), MAX_PIR_LIMBS);
+    }
 
     #[test]
     fn test_batch_pir_single_select() {

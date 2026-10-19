@@ -51,6 +51,10 @@ use crate::{
     error::{LightWalletError, Result},
 };
 
+/// Reject chain-supplied counts before they become allocations.
+const MAX_TXS_PER_BLOCK: usize = 100_000;
+const MAX_CALLS_PER_TX: usize = 10_000;
+
 /// Process a full `BlockInfo` from darkfid into a `CompactBlock`.
 ///
 /// This strips:
@@ -74,9 +78,21 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
         block_hash.as_string()
     );
 
+    if block.txs.len() > MAX_TXS_PER_BLOCK {
+        return Err(LightWalletError::ProcessingError(format!(
+            "block {height} has {} transactions (cap {MAX_TXS_PER_BLOCK})",
+            block.txs.len()
+        )));
+    }
     let mut compact_txs = Vec::with_capacity(block.txs.len());
 
     for tx in &block.txs {
+        if tx.calls.len() > MAX_CALLS_PER_TX {
+            return Err(LightWalletError::ProcessingError(format!(
+                "block {height} transaction has {} calls (cap {MAX_CALLS_PER_TX})",
+                tx.calls.len()
+            )));
+        }
         let tx_hash = tx.hash();
         let mut outputs = Vec::new();
         let mut nullifiers = Vec::new();
