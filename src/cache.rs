@@ -58,9 +58,10 @@ const OMR_METADATA_ENC_TREE: &str = "lightwalletd_omr_metadata_enc";
 /// store and stamped in place (no wipe).
 const CACHE_FORMAT_VERSION: u32 = 1;
 
-/// Orphan OMR clue hints expire after this many seconds if the tx never confirms (S21).
-/// Orphan clue hints must outlive slow localnet / congested confirms.
-/// 24h keeps SendTransaction clues available until the tx is indexed.
+/// OMR clue hints expire this many seconds after they were stored (S21).
+///
+/// Hints are not consumed on merge, so this bounds both slow confirms and the
+/// reorg window in which a rewound block can get its clue re-merged.
 pub const OMR_CLUE_HINT_TTL_SECS: u64 = 86_400;
 /// Max opaque recipient OMR metadata size (DoS / cache bloat).
 pub const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
@@ -71,6 +72,8 @@ const META_TIP_HASH: &[u8] = b"tip_hash";
 const META_TIP_MERKLE_TREE: &[u8] = b"tip_merkle_tree";
 const META_TIP_MERKLE_HEIGHT: &[u8] = b"tip_merkle_height";
 const META_CACHE_FORMAT: &[u8] = b"cache_format";
+const META_CLUE_DIR_PEPPER: &[u8] = b"unifomr_clue_dir_pepper_v1";
+const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor_v1";
 
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
@@ -376,6 +379,13 @@ impl Cache {
         Ok(self.omr_clue_hints.contains_key(tx_hash.as_slice())?)
     }
 
+    /// Drop a clue hint (e.g. its transaction was rejected by darkfid).
+    pub fn remove_omr_clue_hint(&self, tx_hash: &[u8; 32]) -> Result<()> {
+        self.omr_clue_hints.remove(tx_hash.as_slice())?;
+        self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
+        Ok(())
+    }
+
     /// Store UnifOMR clue public key + ownership proof for a payment pubkey.
     ///
     /// Wire value (v3): `b"v3" || key_version u64 LE || proof_len u32 LE
@@ -484,8 +494,7 @@ impl Cache {
 
     /// Stable server pepper for clue-directory decoys (hides registration bit).
     pub fn get_or_create_clue_dir_pepper(&self) -> Result<[u8; 32]> {
-        const KEY: &[u8] = b"unifomr_clue_dir_pepper_v1";
-        if let Some(existing) = self.meta.get(KEY)? {
+        if let Some(existing) = self.meta.get(META_CLUE_DIR_PEPPER)? {
             if existing.len() == 32 {
                 let mut out = [0u8; 32];
                 out.copy_from_slice(&existing);
@@ -494,8 +503,45 @@ impl Cache {
         }
         let mut pepper = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut pepper);
-        self.meta.insert(KEY, pepper.as_slice())?;
-        Ok(pepper)
+        let current = self.meta.get(META_CLUE_DIR_PEPPER)?;
+        match self
+            .meta
+            .compare_and_swap(META_CLUE_DIR_PEPPER, current, Some(pepper.as_slice()))?
+        {
+            Ok(()) => {
+                self.get_or_create_clue_dir_pepper_anchor()?;
+                Ok(pepper)
+            }
+            // A concurrent first lookup won; use its pepper.
+            Err(_) => self.get_or_create_clue_dir_pepper(),
+        }
+    }
+
+    /// Unix time the clue-directory pepper was first used (decoy `key_version` anchor).
+    pub fn get_or_create_clue_dir_pepper_anchor(&self) -> Result<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.get_or_create_clue_dir_pepper_anchor_at(now)
+    }
+
+    pub(crate) fn get_or_create_clue_dir_pepper_anchor_at(&self, now: u64) -> Result<u64> {
+        let parse = |v: &[u8]| -> Option<u64> { Some(u64::from_le_bytes(v.try_into().ok()?)) };
+        if let Some(existing) = self.meta.get(META_CLUE_DIR_PEPPER_ANCHOR)? {
+            if let Some(anchor) = parse(&existing) {
+                return Ok(anchor);
+            }
+        }
+        let current = self.meta.get(META_CLUE_DIR_PEPPER_ANCHOR)?;
+        match self.meta.compare_and_swap(
+            META_CLUE_DIR_PEPPER_ANCHOR,
+            current,
+            Some(now.to_le_bytes().as_slice()),
+        )? {
+            Ok(()) => Ok(now),
+            Err(_) => self.get_or_create_clue_dir_pepper_anchor_at(now),
+        }
     }
 
     /// Stable lightwalletd SecretKey used to attest `GetCluePublicKey` entries.
@@ -563,10 +609,15 @@ impl Cache {
         Ok(())
     }
 
-    /// Merge pending OMR clues into compact block outputs, then remove consumed hints.
+    /// Merge pending OMR clues into compact block outputs.
     ///
     /// S20: apply to a single output — either the stored index, or the first
     /// empty output when the index is `u32::MAX` / raw clue bytes.
+    ///
+    /// Hints are kept until [`OMR_CLUE_HINT_TTL_SECS`] expiry rather than
+    /// consumed: a reorg rewinds the block and darkfid re-serves it with empty
+    /// clues, so the hint must still be there to re-merge. Merging is
+    /// idempotent (a clue already on the tx is not attached a second time).
     pub fn apply_omr_clue_hints(&self, block: &mut CompactBlock) -> Result<()> {
         for tx in &mut block.txs {
             let tx_hash: [u8; 32] = tx.tx_hash;
@@ -577,21 +628,16 @@ impl Cache {
                 if clue.is_empty() {
                     self.omr_clue_hints.remove(tx_hash.as_slice())?;
                     self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
-                } else {
-                    if let Some(idx) = output_index {
-                        if let Some(output) = tx.outputs.get_mut(idx as usize) {
-                            if output.omr_clue.is_empty() {
-                                output.omr_clue = clue;
-                            }
-                        }
-                    } else {
-                        if let Some(output) = tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty())
-                        {
+                } else if tx.outputs.iter().all(|o| o.omr_clue != clue) {
+                    let target = match output_index {
+                        Some(idx) => tx.outputs.get_mut(idx as usize),
+                        None => tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty()),
+                    };
+                    if let Some(output) = target {
+                        if output.omr_clue.is_empty() {
                             output.omr_clue = clue;
                         }
                     }
-                    self.omr_clue_hints.remove(tx_hash.as_slice())?;
-                    self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
                 }
             }
 
@@ -1227,7 +1273,46 @@ mod tests {
         assert_eq!(block.txs[0].outputs[0].omr_clue, clue);
         assert!(block.txs[0].outputs[1].omr_clue.is_empty());
         assert!(block.txs[0].outputs[2].omr_clue.is_empty());
-        assert!(!cache.has_omr_clue_hint(&tx_hash).unwrap());
+        assert!(
+            cache.has_omr_clue_hint(&tx_hash).unwrap(),
+            "hint kept until TTL"
+        );
+
+        // Re-applying to an already-merged block must not attach it again.
+        cache.apply_omr_clue_hints(&mut block).unwrap();
+        assert_eq!(block.txs[0].outputs[0].omr_clue, clue);
+        assert!(block.txs[0].outputs[1].omr_clue.is_empty());
+        assert!(block.txs[0].outputs[2].omr_clue.is_empty());
+    }
+
+    #[test]
+    fn test_omr_clue_hint_survives_reorg() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+
+        for h in 0..5 {
+            cache.insert_compact_block(&make_test_block(h)).unwrap();
+        }
+        let clue = vec![0x5Au8; 16];
+        let mut block = make_multi_output_block(5, 2);
+        let tx_hash = [0xE5u8; 32];
+        block.txs[0].tx_hash = tx_hash;
+        cache
+            .store_omr_clue_hint(&tx_hash, clue.clone(), None)
+            .unwrap();
+
+        cache.insert_compact_block(&block).unwrap();
+        let stored = cache.get_compact_block(5).unwrap().unwrap();
+        assert_eq!(stored.txs[0].outputs[0].omr_clue, clue);
+
+        cache.rewind_to_height(4).unwrap();
+        assert!(cache.get_compact_block(5).unwrap().is_none());
+
+        // darkfid re-serves the block without clues.
+        cache.insert_compact_block(&block).unwrap();
+        let stored = cache.get_compact_block(5).unwrap().unwrap();
+        assert_eq!(stored.txs[0].outputs[0].omr_clue, clue);
+        assert!(stored.txs[0].outputs[1].omr_clue.is_empty());
     }
 
     #[test]

@@ -390,7 +390,9 @@ message BatchPirRequest {
   // Inclusive height window the selection vector indexes into (slot i = start_height + i).
   uint32 start_height = 2;
   uint32 end_height = 3;
-  // Which u64-limb of the compact-block serialization to retrieve (0-based).
+  // Which limb of the protobuf CompactBlock to retrieve (0-based). Limb 0 is the
+  // byte length; limb i >= 1 is bytes [2(i-1), 2i) as a little-endian u16
+  // (last chunk zero-padded), so every limb stays below the BFV plaintext modulus.
   uint32 limb_index = 4;
 }
 

@@ -59,6 +59,9 @@ const MAX_DETECTION_KEY_BYTES: usize = 160 * 1024 * 1024;
 const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 160 * 1024 * 1024;
 /// Concurrent FHE worker slots (GetUnifOmrDigest / FetchPirBatch).
 const DEFAULT_FHE_PERMITS: usize = 2;
+/// Max wait for the next DetectionKeyChunk while an FHE permit may be held.
+#[cfg(feature = "fhe-omr")]
+const DETECTION_KEY_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 const MAX_PIR_STRIPES: usize = 8;
 /// Max bytes per SealPIR query ciphertext (rejects multi-MB garbage).
@@ -108,6 +111,35 @@ fn resolve_block_range(
     }
     reject_oversized_window(start, end)?;
     Ok((start, end))
+}
+
+/// Last height of `[start, end]` a digest may cover, and whether that is all of it.
+///
+/// Stops at the tip and strictly before the first height missing from the
+/// cache, so clients advancing to `max(slot_heights)` never skip a hole.
+/// `None` means no height is evaluable (hole or tip below `start`).
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+#[allow(clippy::result_large_err)]
+fn digest_evaluable_end(
+    cache: &Cache,
+    start: u32,
+    end: u32,
+) -> Result<(Option<u32>, bool), Status> {
+    let tip = cache
+        .get_tip()
+        .map_err(cache_status)?
+        .map(|(h, _)| h)
+        .unwrap_or(0);
+    let last = end.min(tip);
+    if start > last {
+        return Ok((None, false));
+    }
+    for h in start..=last {
+        if cache.get_block_hash(h).map_err(cache_status)?.is_none() {
+            return Ok((h.checked_sub(1).filter(|&p| p >= start), false));
+        }
+    }
+    Ok((Some(last), tip >= end))
 }
 
 fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
@@ -304,8 +336,8 @@ impl LightWalletService {
                 omr_rate_limit_per_min,
                 Duration::from_secs(60),
             )),
-            // PIR is one RPC per limb (~39 for a typical compact block). The
-            // digest limiter (default 30/min) would fail every window.
+            // PIR is one RPC per limb (2 payload bytes each, padded to a power
+            // of two). The digest limiter (default 30/min) would fail every window.
             pir_rate_limiter: Arc::new(PeerRateLimiter::new(600, Duration::from_secs(60))),
             clue_rate_limiter: Arc::new(PeerRateLimiter::new(32, Duration::from_secs(60))),
             rpc_rate_limiter: Arc::new(PeerRateLimiter::new(
@@ -437,6 +469,32 @@ impl LightWalletService {
             Err(Status::resource_exhausted(
                 "RPC rate limit exceeded; retry later",
             ))
+        }
+    }
+
+    /// Store a validated SendTransaction clue; `true` if this call stored it.
+    ///
+    /// S3: first-writer-wins — an existing hint is never overwritten.
+    fn store_send_clue_hint(&self, hash: &[u8; 32], clue: Vec<u8>, output_index: u32) -> bool {
+        if self.cache.has_omr_clue_hint(hash).unwrap_or(false) {
+            tracing::info!(
+                target: "lightwalletd::server",
+                "OMR clue already present for tx; first-writer-wins, not overwriting"
+            );
+            return false;
+        }
+        match self
+            .cache
+            .store_omr_clue_hint(hash, clue, Some(output_index))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "lightwalletd::server",
+                    "Failed to store OMR clue hint: {e}"
+                );
+                false
+            }
         }
     }
 
@@ -755,6 +813,27 @@ impl DarkFiLightWallet for LightWalletService {
             .ok()
             .map(|tx| *tx.hash().inner());
 
+        // S22: surface whether the attached clue was accepted (tx may still succeed).
+        let mut clue_accepted = false;
+        if !omr_clue.is_empty() {
+            // S12: validate on SendTransaction the same as RegisterOmrClue.
+            if let Err(e) = Self::validate_omr_clue(&omr_clue) {
+                tracing::warn!(
+                    target: "lightwalletd::server",
+                    "Rejecting OMR clue on SendTransaction: {e}"
+                );
+                omr_clue.clear();
+            } else if let Some(hash) = tx_hash_for_clue {
+                // Stored before broadcast: the tx can be mined (and the block
+                // indexed) before broadcast_tx returns.
+                clue_accepted = self.store_send_clue_hint(
+                    &hash,
+                    std::mem::take(&mut omr_clue),
+                    req.omr_clue_output_index,
+                );
+            }
+        }
+
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.rpc_client.broadcast_tx(&tx_data),
@@ -787,37 +866,11 @@ impl DarkFiLightWallet for LightWalletService {
                     self.remember_send_peer(hash, peer);
                 }
 
-                // S22: surface whether the attached clue was accepted (tx may still succeed).
-                let mut clue_accepted = false;
+                // Validated clue whose hash only darkfid could tell us.
                 if !omr_clue.is_empty() {
-                    // S12: validate on SendTransaction the same as RegisterOmrClue.
-                    if let Err(e) = Self::validate_omr_clue(&omr_clue) {
-                        tracing::warn!(
-                            target: "lightwalletd::server",
-                            "Rejecting OMR clue on SendTransaction: {e}"
-                        );
-                    } else if let Some(hash) = hash {
-                        // S3: first-writer-wins — do not overwrite an existing clue.
-                        if self.cache.has_omr_clue_hint(&hash).unwrap_or(false) {
-                            tracing::info!(
-                                target: "lightwalletd::server",
-                                "OMR clue already present for tx; first-writer-wins, not overwriting"
-                            );
-                        } else {
-                            match self.cache.store_omr_clue_hint(
-                                &hash,
-                                omr_clue,
-                                Some(req.omr_clue_output_index),
-                            ) {
-                                Ok(()) => clue_accepted = true,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "lightwalletd::server",
-                                        "Failed to store OMR clue hint: {e}"
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(hash) = hash {
+                        clue_accepted =
+                            self.store_send_clue_hint(&hash, omr_clue, req.omr_clue_output_index);
                     }
                 }
 
@@ -859,6 +912,17 @@ impl DarkFiLightWallet for LightWalletService {
                     target: "lightwalletd::server",
                     "Transaction broadcast failed: {e}"
                 );
+                // Rejected txs must not park clue hints for the full TTL.
+                if clue_accepted {
+                    if let Some(hash) = tx_hash_for_clue {
+                        if let Err(e) = self.cache.remove_omr_clue_hint(&hash) {
+                            tracing::warn!(
+                                target: "lightwalletd::server",
+                                "Failed to drop OMR clue hint for rejected tx: {e}"
+                            );
+                        }
+                    }
+                }
                 Ok(Response::new(proto::SendResponse {
                     tx_hash: Vec::new(),
                     error: "Transaction broadcast failed".to_string(),
@@ -1282,7 +1346,13 @@ impl DarkFiLightWallet for LightWalletService {
             let mut current_key = Vec::new();
             let mut keys = Vec::new();
 
-            while let Some(chunk_res) = stream.next().await {
+            loop {
+                let next = tokio::time::timeout(DETECTION_KEY_CHUNK_IDLE_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("UnifOMR detection-key upload stalled")
+                    })?;
+                let Some(chunk_res) = next else { break };
                 let chunk = chunk_res?;
 
                 if !header_received {
@@ -1305,8 +1375,8 @@ impl DarkFiLightWallet for LightWalletService {
                     // 160 MiB each on the semaphore.
                     self.check_omr_rate_limit(peer, num_keys)?;
                     fhe_permit = Some(
-                        self.fhe_permits
-                            .acquire()
+                        Arc::clone(&self.fhe_permits)
+                            .acquire_owned()
                             .await
                             .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?,
                     );
@@ -1365,34 +1435,16 @@ impl DarkFiLightWallet for LightWalletService {
                 }
             }
 
-            let _permit = fhe_permit.ok_or_else(|| Status::invalid_argument("Empty stream"))?;
+            let permit = fhe_permit.ok_or_else(|| Status::invalid_argument("Empty stream"))?;
 
-            let tip_height = self
-                .cache
-                .get_tip()
-                .map_err(cache_status)?
-                .map(|(h, _)| h)
-                .unwrap_or(0);
-            let mut range_complete = tip_height >= end;
-            if range_complete {
-                for h in start..=end {
-                    match self.cache.get_block_hash(h) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            range_complete = false;
-                            break;
-                        }
-                        Err(e) => {
-                            return Err(cache_status(e));
-                        }
-                    }
-                }
-            }
-
-            let block_notes = self
-                .cache
-                .get_encrypted_notes_range(start, end)
-                .map_err(cache_status)?;
+            let (eval_end, range_complete) = digest_evaluable_end(&self.cache, start, end)?;
+            let block_notes = match eval_end {
+                Some(eval_end) => self
+                    .cache
+                    .get_encrypted_notes_range(start, eval_end)
+                    .map_err(cache_status)?,
+                None => Vec::new(),
+            };
 
             let network_byte = self.network_byte;
             // Paper-faithful per-message packing: flatten the window once
@@ -1403,6 +1455,8 @@ impl DarkFiLightWallet for LightWalletService {
             // reported via `complete = false`.
             let (encrypted_digest, slot_heights_wire, truncated) =
                 tokio::task::spawn_blocking(move || {
+                    // Held for the computation even if the handler is cancelled.
+                    let _permit = permit;
                     let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
                     let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
                     let (mut messages, mut slot_heights) =
@@ -1463,11 +1517,6 @@ impl DarkFiLightWallet for LightWalletService {
             let start = req.start_height;
             let end = req.end_height;
             let window = reject_oversized_window(start, end)? as usize;
-            let _permit = self
-                .fhe_permits
-                .acquire()
-                .await
-                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
             let degree = crate::unifomr::packing_degree();
             let num_stripes = crate::pir_server::sealpir_stripe_count(window, degree);
             if num_stripes > MAX_PIR_STRIPES {
@@ -1500,40 +1549,49 @@ impl DarkFiLightWallet for LightWalletService {
                 )));
             }
 
-            let blocks = self
-                .cache
-                .get_compact_blocks_range(start, end)
-                .map_err(cache_status)?;
-
-            // Align payloads to every height in [start, end] (S19-style).
-            // Encode as protobuf CompactBlock so moonshine + mobile share one codec.
-            use prost::Message;
-            let mut by_h: std::collections::BTreeMap<u32, Vec<u8>> =
-                std::collections::BTreeMap::new();
-            for b in blocks {
-                by_h.insert(b.height, b.to_proto().encode_to_vec());
-            }
-            let payloads: Vec<Vec<u8>> = (start..=end)
-                .map(|h| by_h.remove(&h).unwrap_or_default())
-                .collect();
-            let encoded_total: usize = payloads.iter().map(|p| p.len()).sum();
-            if encoded_total > MAX_PIR_WINDOW_ENCODED_BYTES {
-                return Err(Status::resource_exhausted(format!(
-                    "PIR window encoded size {encoded_total} exceeds {MAX_PIR_WINDOW_ENCODED_BYTES}"
-                )));
-            }
-
+            let permit = Arc::clone(&self.fhe_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
+            let cache = Arc::clone(&self.cache);
             let limb_index = req.limb_index as usize;
-            let db = crate::pir_server::limb_column(&payloads, limb_index);
             let queries = req.query_ciphertexts;
 
+            #[allow(clippy::result_large_err)]
             let payload_ciphertexts = tokio::task::spawn_blocking(move || {
+                // Held for the computation even if the handler is cancelled.
+                let _permit = permit;
+                let blocks = cache
+                    .get_compact_blocks_range(start, end)
+                    .map_err(cache_status)?;
+
+                // Align payloads to every height in [start, end] (S19-style).
+                // Encode as protobuf CompactBlock so moonshine + mobile share one codec.
+                use prost::Message;
+                let mut by_h: std::collections::BTreeMap<u32, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+                for b in blocks {
+                    by_h.insert(b.height, b.to_proto().encode_to_vec());
+                }
+                let payloads: Vec<Vec<u8>> = (start..=end)
+                    .map(|h| by_h.remove(&h).unwrap_or_default())
+                    .collect();
+                let encoded_total: usize = payloads.iter().map(|p| p.len()).sum();
+                if encoded_total > MAX_PIR_WINDOW_ENCODED_BYTES {
+                    return Err(Status::resource_exhausted(format!(
+                        "PIR window encoded size {encoded_total} exceeds \
+                         {MAX_PIR_WINDOW_ENCODED_BYTES}"
+                    )));
+                }
+
+                let db = crate::pir_server::limb_column(&payloads, limb_index);
                 let server = crate::pir_server::BatchPirServer::with_unifomr_params();
-                server.evaluate_sealpir_stripes(&queries, &db, window)
+                server
+                    .evaluate_sealpir_stripes(&queries, &db, window)
+                    .map_err(|e| Status::invalid_argument(format!("PIR evaluation error: {e}")))
             })
             .await
-            .map_err(|e| Status::internal(format!("PIR worker join error: {e}")))?
-            .map_err(|e| Status::invalid_argument(format!("PIR evaluation error: {e}")))?;
+            .map_err(|e| Status::internal(format!("PIR worker join error: {e}")))??;
 
             Ok(Response::new(proto::BatchPirResponse {
                 payload_ciphertexts,
@@ -1616,11 +1674,15 @@ impl DarkFiLightWallet for LightWalletService {
                         .cache
                         .get_or_create_clue_dir_pepper()
                         .map_err(cache_status)?;
+                    let anchor = self
+                        .cache
+                        .get_or_create_clue_dir_pepper_anchor()
+                        .map_err(cache_status)?;
                     let pk_c = pk;
                     tokio::task::spawn_blocking(move || {
                         (
                             crate::unifomr::decoy_clue_public_key(&pk_c, &pepper),
-                            crate::unifomr::decoy_key_version(&pk_c, &pepper),
+                            crate::unifomr::decoy_key_version(&pk_c, &pepper, anchor),
                         )
                     })
                     .await
@@ -1640,11 +1702,11 @@ impl DarkFiLightWallet for LightWalletService {
                     // Non-empty dummy so `found=true` + empty body cannot leak
                     // the registration bit on non-fhe-omr builds.
                     let dummy = blake3::hash(&pk).as_bytes().to_vec();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(1_700_000_000);
-                    (dummy, now.saturating_sub(u64::from(pk[0]) * 86_400))
+                    let anchor = self
+                        .cache
+                        .get_or_create_clue_dir_pepper_anchor()
+                        .map_err(cache_status)?;
+                    (dummy, anchor.saturating_sub(u64::from(pk[0]) * 86_400))
                 }
             }
         };
@@ -1714,7 +1776,50 @@ mod tests {
             })
             .unwrap();
         assert!(resolve_block_range(&cache, 0, 0).is_err());
-        assert_eq!(resolve_block_range(&cache, 19_000, 0).unwrap(), (19_000, 20_000));
+        assert_eq!(
+            resolve_block_range(&cache, 19_000, 0).unwrap(),
+            (19_000, 20_000)
+        );
+    }
+
+    #[test]
+    fn digest_stops_before_first_missing_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::new(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(digest_evaluable_end(&cache, 0, 5).unwrap(), (None, false));
+
+        for h in [10u32, 11, 12, 14, 15] {
+            cache
+                .insert_compact_block(&crate::compact_block::CompactBlock {
+                    height: h,
+                    hash: [h as u8; 32],
+                    prev_hash: [h.wrapping_sub(1) as u8; 32],
+                    timestamp: h as u64,
+                    txs: vec![],
+                })
+                .unwrap();
+        }
+        // Fully cached window below the tip.
+        assert_eq!(
+            digest_evaluable_end(&cache, 10, 12).unwrap(),
+            (Some(12), true)
+        );
+        // Interior hole at 13: evaluate only 10..=12, never 14/15.
+        assert_eq!(
+            digest_evaluable_end(&cache, 10, 15).unwrap(),
+            (Some(12), false)
+        );
+        // Hole at the window start: nothing evaluable.
+        assert_eq!(digest_evaluable_end(&cache, 13, 15).unwrap(), (None, false));
+        // End beyond tip: truncate at tip, incomplete.
+        assert_eq!(
+            digest_evaluable_end(&cache, 14, 20).unwrap(),
+            (Some(15), false)
+        );
+        // Start beyond tip.
+        assert_eq!(digest_evaluable_end(&cache, 16, 20).unwrap(), (None, false));
+        // Hole at 0 below the first cached block.
+        assert_eq!(digest_evaluable_end(&cache, 0, 12).unwrap(), (None, false));
     }
 
     #[test]

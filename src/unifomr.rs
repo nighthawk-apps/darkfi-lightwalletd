@@ -568,24 +568,18 @@ pub fn decoy_clue_public_key(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> Ve
 
 /// Deterministic plausible `key_version` for a decoy directory entry.
 ///
-/// Real registrations use unix timestamps. A static band ending mid-2026
-/// leaked the registration bit once real versions moved past it. Draw from
-/// a rolling last-180-day window, stable per (pk, pepper, UTC day) so
-/// repeat lookups the same day match.
-pub fn decoy_key_version(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> u64 {
+/// Real registrations use unix timestamps and never change between lookups,
+/// so a decoy must be constant per (pk, pepper) as well. `anchor` is the
+/// pepper's creation time (see `Cache::get_or_create_clue_dir_pepper_anchor`);
+/// the decoy is drawn from the 180 days before it.
+pub fn decoy_key_version(payment_pubkey: &[u8; 32], pepper: &[u8; 32], anchor: u64) -> u64 {
     const SPAN_SECS: u64 = 180 * 86_400;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1_700_000_000);
-    let day = now / 86_400;
     let mut h = blake3::Hasher::new_keyed(pepper);
     h.update(UNIFOMR_CLUE_DIR_DECOY);
     h.update(b"-key-version");
     h.update(payment_pubkey);
-    h.update(&day.to_le_bytes());
     let n = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
-    now.saturating_sub(n % SPAN_SECS)
+    anchor.saturating_sub(n % SPAN_SECS)
 }
 
 /// Public clue key derived from wallet (sender needs this — typically from address metadata).
@@ -693,6 +687,19 @@ impl UnifOmrClient {
         let mut off = 5usize;
         let degree = self.params.degree();
         let t = self.params.plaintext();
+        let max_chunks = MAX_OMR_MESSAGES.div_ceil(degree);
+        if chunk_count > max_chunks {
+            return Err(format!(
+                "digest chunk_count {chunk_count} exceeds max {max_chunks}"
+            ));
+        }
+        let min_chunk_bytes = CLUE_PLAINTEXT_BITS * 4;
+        if chunk_count.saturating_mul(min_chunk_bytes) > digest.len() - off {
+            return Err(format!(
+                "digest chunk_count {chunk_count} exceeds remaining {} bytes",
+                digest.len() - off
+            ));
+        }
 
         let in_range = |raw: u64| -> bool {
             let centered = if raw > t / 2 {
@@ -703,7 +710,7 @@ impl UnifOmrClient {
             centered.unsigned_abs() <= R_PRIME
         };
 
-        let mut flags = Vec::with_capacity(chunk_count.saturating_mul(degree));
+        let mut flags = Vec::with_capacity(chunk_count * degree);
         for _ in 0..chunk_count {
             // Decode the ℓ per-bit slot vectors for this chunk of D messages.
             let mut bits: Vec<Vec<u64>> = Vec::with_capacity(CLUE_PLAINTEXT_BITS);
@@ -770,6 +777,23 @@ impl UnifOmrClient {
     }
 }
 
+/// Reject client-supplied ciphertexts that are not fresh encryptions.
+///
+/// Plaintext×CT products with a mismatched level panic inside `fhe`, and
+/// extra polynomials (unrelinearized products) inflate server work.
+pub fn check_fresh_ciphertext(ct: &Ciphertext, params: &BfvParameters) -> Result<(), String> {
+    if ct.len() != 2 {
+        return Err(format!("expected 2 polynomials, got {}", ct.len()));
+    }
+    let level = params
+        .level_of_context(ct[0].ctx())
+        .map_err(|e| format!("ciphertext context: {e:?}"))?;
+    if level != 0 {
+        return Err(format!("expected level 0, got {level}"));
+    }
+    Ok(())
+}
+
 /// Parse detection key into per-coefficient broadcast ciphertexts.
 pub fn parse_detection_key(
     key: &[u8],
@@ -802,6 +826,7 @@ pub fn parse_detection_key(
         }
         let ct = Ciphertext::from_bytes(&key[off..off + len], params)
             .map_err(|e| format!("det key ct: {e:?}"))?;
+        check_fresh_ciphertext(&ct, params).map_err(|e| format!("det key ct: {e}"))?;
         off += len;
         cts.push(ct);
     }
@@ -1501,20 +1526,83 @@ mod tests {
     }
 
     #[test]
+    fn test_digest_rejects_untrusted_chunk_count() {
+        let client = UnifOmrClient::from_wallet(&[0x77u8; 32], 0x01).unwrap();
+        let mut digest = vec![DIGEST_FORMAT_VERSION];
+        digest.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = client.decrypt_digest_slots(&digest).unwrap_err();
+        assert!(err.contains("chunk_count"), "{err}");
+
+        // Within the cap but more chunks than the remaining bytes can hold.
+        let mut digest = vec![DIGEST_FORMAT_VERSION];
+        digest.extend_from_slice(&64u32.to_le_bytes());
+        digest.extend_from_slice(&[0u8; 8]);
+        let err = client.decrypt_digest_slots(&digest).unwrap_err();
+        assert!(err.contains("remaining"), "{err}");
+
+        let mut empty = vec![DIGEST_FORMAT_VERSION];
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        assert!(client.decrypt_digest_slots(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_detection_key_rejects_non_fresh_ciphertext() {
+        let params = bfv_params();
+        let mut r = StdRng::seed_from_u64(5);
+        let sk = SecretKey::random(&params, &mut r);
+        let pt = Plaintext::try_encode(&[1u64], Encoding::simd(), &params).unwrap();
+        let fresh: Ciphertext = sk.try_encrypt(&pt, &mut r).unwrap();
+        let header = |out: &mut Vec<u8>| {
+            out.extend_from_slice(&[0x02, 0x01, SCHEME_UNIFOMR]);
+            out.extend_from_slice(&(CLUE_N as u16).to_le_bytes());
+        };
+        let with_first_ct = |ct: &Ciphertext| {
+            let mut key = Vec::new();
+            header(&mut key);
+            let bytes = ct.to_bytes();
+            key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            key.extend_from_slice(&bytes);
+            key
+        };
+
+        let mut switched = fresh.clone();
+        switched.switch_to_level(1).unwrap();
+        let err = parse_detection_key(&with_first_ct(&switched), &params).unwrap_err();
+        assert!(err.contains("level"), "{err}");
+
+        let squared = &fresh * &fresh;
+        let err = parse_detection_key(&with_first_ct(&squared), &params).unwrap_err();
+        assert!(err.contains("polynomials"), "{err}");
+
+        // A fresh first CT passes the shape check and fails later on truncation.
+        let err = parse_detection_key(&with_first_ct(&fresh), &params).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+    }
+
+    #[test]
     fn decoy_key_version_is_plausible_and_stable() {
         let pk = [0x11u8; 32];
         let pepper = [0x22u8; 32];
-        let v1 = decoy_key_version(&pk, &pepper);
-        let v2 = decoy_key_version(&pk, &pepper);
-        assert_eq!(v1, v2);
-        assert_ne!(v1, 0);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::new(dir.path().to_str().unwrap()).unwrap();
+        let created = 1_780_000_000u64;
+        let anchor = cache
+            .get_or_create_clue_dir_pepper_anchor_at(created)
             .unwrap();
-        assert!(v1 <= now);
-        assert!(now.saturating_sub(v1) <= 180 * 86_400);
-        let other = decoy_key_version(&[0x33u8; 32], &pepper);
+        assert_eq!(anchor, created);
+        let v1 = decoy_key_version(&pk, &pepper, anchor);
+        assert_ne!(v1, 0);
+        assert!(v1 <= anchor);
+        assert!(anchor - v1 <= 180 * 86_400);
+        // Later lookups (one second, one day, one year on) see the same value.
+        for later in [created + 1, created + 86_400, created + 365 * 86_400] {
+            let a = cache
+                .get_or_create_clue_dir_pepper_anchor_at(later)
+                .unwrap();
+            assert_eq!(a, anchor, "anchor must not move with now");
+            assert_eq!(decoy_key_version(&pk, &pepper, a), v1);
+        }
+        let other = decoy_key_version(&[0x33u8; 32], &pepper, anchor);
         assert_ne!(v1, other);
     }
 }

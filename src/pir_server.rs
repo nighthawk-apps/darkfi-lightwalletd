@@ -24,13 +24,17 @@ use rand::rngs::StdRng;
 use rand::{rng, SeedableRng};
 use std::sync::Arc;
 
-use crate::unifomr::{bfv_params, SCHEME_UNIFOMR};
+use crate::unifomr::{bfv_params, check_fresh_ciphertext, SCHEME_UNIFOMR};
 
 /// Domain separation for Round-2 PIR key material.
 pub const UNIFOMR_PIR_DOMAIN: &[u8] = b"DarkFi-UnifOMR-PirKey-v1";
 
-/// Hard cap on limbs fetched per height (32 KiB payloads).
+/// Hard cap on limbs fetched per height (length limb + 8190 payload bytes).
 pub const MAX_PIR_LIMBS: usize = 4096;
+
+/// Payload bytes per data limb. Each limb must stay below the BFV plaintext
+/// modulus `t = 1_032_193` (~2^19.98), so only 16 bits fit.
+pub const PIR_LIMB_BYTES: usize = 2;
 
 /// Max stripes (must match server `MAX_PIR_STRIPES`).
 pub const MAX_PIR_STRIPES: usize = 8;
@@ -39,7 +43,7 @@ pub const MAX_PIR_STRIPES: usize = 8;
 ///
 /// The client always issues this many `FetchPirBatch` calls, so the server
 /// sees a size bucket rather than the exact matched payload length.
-/// Minimum bucket is 8 limbs (56 bytes of payload plus the length limb).
+/// Minimum bucket is 8 limbs (14 bytes of payload plus the length limb).
 pub fn padded_limb_count(needed: usize) -> usize {
     let n = needed.max(8).min(MAX_PIR_LIMBS);
     n.next_power_of_two().min(MAX_PIR_LIMBS)
@@ -70,7 +74,7 @@ pub fn sealpir_stripe_count(window_size: usize, degree: usize) -> usize {
 }
 
 /// Max compact-block bytes reassemblable via PIR (`MAX_PIR_LIMBS` includes length limb).
-pub const MAX_PIR_PAYLOAD_BYTES: usize = (MAX_PIR_LIMBS.saturating_sub(1)) * 8;
+pub const MAX_PIR_PAYLOAD_BYTES: usize = (MAX_PIR_LIMBS - 1) * PIR_LIMB_BYTES;
 
 /// Total limb columns required for a length-prefixed payload (`length` = first limb).
 pub fn pir_payload_limb_count(length_limb: u64) -> Option<usize> {
@@ -78,10 +82,10 @@ pub fn pir_payload_limb_count(length_limb: u64) -> Option<usize> {
     if len == 0 || len > MAX_PIR_PAYLOAD_BYTES {
         return None;
     }
-    Some(1 + len.div_ceil(8))
+    Some(1 + len.div_ceil(PIR_LIMB_BYTES))
 }
 
-/// Decode length-prefixed PIR limbs: `limbs[0] = byte_len`, then LE u64 data limbs.
+/// Decode length-prefixed PIR limbs: `limbs[0] = byte_len`, then LE u16 data limbs.
 pub fn decode_length_prefixed_limbs(limbs: &[u64]) -> Vec<u8> {
     let Some(need) = limbs.first().copied().and_then(pir_payload_limb_count) else {
         return Vec::new();
@@ -95,7 +99,7 @@ pub fn decode_length_prefixed_limbs(limbs: &[u64]) -> Vec<u8> {
 
 /// Reconstruct per-index payloads from limb columns.
 ///
-/// Wire format (per height): limb0 = original byte length, then packed LE u64 limbs.
+/// Wire format (per height): limb0 = original byte length, then one LE u16 per limb.
 /// `limb_cols[limb_i][idx]` is the decrypted limb for height-index `idx`.
 pub fn assemble_payloads(indices: &[usize], limb_cols: &[Vec<u64>]) -> Vec<Vec<u8>> {
     indices
@@ -143,6 +147,7 @@ impl BatchPirServer {
     pub fn evaluate_limb_bytes(&self, query_bytes: &[u8], db: &[u64]) -> Result<Vec<u8>, String> {
         let query = Ciphertext::from_bytes(query_bytes, &self.params)
             .map_err(|e| format!("PIR query deserialize: {e:?}"))?;
+        check_fresh_ciphertext(&query, &self.params).map_err(|e| format!("PIR query: {e}"))?;
         Ok(self.evaluate_limb(&query, db)?.to_bytes())
     }
 
@@ -314,38 +319,55 @@ impl BatchPirClient {
     }
 }
 
-/// Pack compact-block bytes into length-prefixed u64 limbs for PIR columns.
+/// Pack compact-block bytes into length-prefixed limbs for PIR columns.
 ///
 /// Limb 0 is `data.len()` so Round-2 reassembly preserves trailing zero bytes
-/// and exact protobuf length (not `limbs×8`).
+/// and exact protobuf length. Each following limb is one
+/// [`PIR_LIMB_BYTES`]-byte chunk as `u16::from_le_bytes` (last chunk zero-padded).
 pub fn bytes_to_limbs(data: &[u8]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(1 + data.len().div_ceil(8));
+    let mut out = Vec::with_capacity(1 + data.len().div_ceil(PIR_LIMB_BYTES));
     out.push(data.len() as u64);
-    for chunk in data.chunks(8) {
-        let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        out.push(u64::from_le_bytes(buf));
+    for chunk in data.chunks(PIR_LIMB_BYTES) {
+        out.push(chunk_to_limb(chunk));
     }
     out
 }
 
+fn chunk_to_limb(chunk: &[u8]) -> u64 {
+    let mut buf = [0u8; PIR_LIMB_BYTES];
+    buf[..chunk.len()].copy_from_slice(chunk);
+    u16::from_le_bytes(buf) as u64
+}
+
 pub fn limbs_to_bytes(limbs: &[u64], len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    for limb in limbs {
-        out.extend_from_slice(&limb.to_le_bytes());
+    let mut out = Vec::with_capacity(limbs.len() * PIR_LIMB_BYTES);
+    for &limb in limbs {
+        out.extend_from_slice(&(limb as u16).to_le_bytes());
     }
     out.truncate(len);
     out
+}
+
+/// Limb `limb_index` of `bytes_to_limbs(data)` without materializing all limbs.
+///
+/// Oversized payloads report a length of `MAX_PIR_PAYLOAD_BYTES + 1` so limb 0
+/// stays below `t` (clients reject any length above the cap identically).
+pub fn payload_limb(data: &[u8], limb_index: usize) -> u64 {
+    if limb_index == 0 {
+        return data.len().min(MAX_PIR_PAYLOAD_BYTES + 1) as u64;
+    }
+    let off = (limb_index - 1).saturating_mul(PIR_LIMB_BYTES);
+    match data.get(off..) {
+        Some(rest) if !rest.is_empty() => chunk_to_limb(&rest[..rest.len().min(PIR_LIMB_BYTES)]),
+        _ => 0,
+    }
 }
 
 /// Build one PIR db column: limb `limb_index` of each height's payload (0 if missing/short).
 pub fn limb_column(payloads: &[Vec<u8>], limb_index: usize) -> Vec<u64> {
     payloads
         .iter()
-        .map(|p| {
-            let limbs = bytes_to_limbs(p);
-            limbs.get(limb_index).copied().unwrap_or(0)
-        })
+        .map(|p| payload_limb(p, limb_index))
         .collect()
 }
 
@@ -412,5 +434,130 @@ mod tests {
         let cols: Vec<Vec<u64>> = (0..limbs.len()).map(|i| vec![limbs[i]]).collect();
         let got = assemble_payloads(&[0], &cols);
         assert_eq!(got[0], data);
+    }
+
+    #[test]
+    fn test_limb_format_constants() {
+        assert_eq!(MAX_PIR_PAYLOAD_BYTES, 8190);
+        assert_eq!(pir_payload_limb_count(0), None);
+        assert_eq!(pir_payload_limb_count(1), Some(2));
+        assert_eq!(pir_payload_limb_count(3), Some(3));
+        assert_eq!(
+            pir_payload_limb_count(MAX_PIR_PAYLOAD_BYTES as u64),
+            Some(MAX_PIR_LIMBS)
+        );
+        assert_eq!(
+            pir_payload_limb_count(MAX_PIR_PAYLOAD_BYTES as u64 + 1),
+            None
+        );
+        assert_eq!(bytes_to_limbs(&[0x34, 0x12, 0xFF]), vec![3, 0x1234, 0x00FF]);
+    }
+
+    #[test]
+    fn test_limbs_below_plaintext_modulus() {
+        use rand::RngCore;
+        let t = bfv_params().plaintext();
+        let mut data = vec![0u8; 8 * 1024];
+        StdRng::seed_from_u64(0x8C1B).fill_bytes(&mut data);
+        data[..64].fill(0xFF);
+        let limbs = bytes_to_limbs(&data);
+        assert_eq!(limbs.len(), 1 + data.len().div_ceil(PIR_LIMB_BYTES));
+        for (i, &limb) in limbs.iter().enumerate() {
+            assert!(limb < t, "limb {i} = {limb} >= t = {t}");
+        }
+        // 8 KiB is just over the cap: the column clamps the length limb only.
+        assert_eq!(payload_limb(&data, 0), MAX_PIR_PAYLOAD_BYTES as u64 + 1);
+        assert_eq!(payload_limb(&data, 1), limbs[1]);
+
+        let payloads = vec![
+            data[..MAX_PIR_PAYLOAD_BYTES].to_vec(),
+            data[..1001].to_vec(),
+            Vec::new(),
+        ];
+        let expected: Vec<Vec<u64>> = payloads.iter().map(|p| bytes_to_limbs(p)).collect();
+        for i in 0..MAX_PIR_LIMBS + 2 {
+            let col = limb_column(&payloads, i);
+            for (p, exp) in expected.iter().enumerate() {
+                assert_eq!(
+                    col[p],
+                    exp.get(i).copied().unwrap_or(0),
+                    "payload {p} limb {i}"
+                );
+            }
+            assert!(col.iter().all(|&v| v < t));
+        }
+        let big = vec![0xFFu8; 2 * 1_032_193];
+        assert_eq!(payload_limb(&big, 0), MAX_PIR_PAYLOAD_BYTES as u64 + 1);
+    }
+
+    #[test]
+    fn test_pir_bfv_roundtrip_compact_block() {
+        use prost::Message;
+        let output = crate::proto::CompactOutput {
+            coin: vec![0x11; 32],
+            encrypted_note: vec![0xFF; 2800],
+            value_commit: vec![0xFE; 33],
+            token_commit: vec![0x7F; 32],
+            omr_clue: Vec::new(),
+            omr_metadata_enc: vec![0xFF; 64],
+        };
+        let block = |height: u32| crate::proto::CompactBlock {
+            height,
+            hash: vec![height as u8; 32],
+            prev_hash: vec![0xFF; 32],
+            timestamp: 1_780_000_000 + height as u64,
+            txs: vec![crate::proto::CompactTx {
+                tx_hash: vec![0xEE; 32],
+                outputs: vec![output.clone()],
+                nullifiers: vec![vec![0xFF; 32]],
+                fee: u64::MAX,
+            }],
+        };
+        let payloads: Vec<Vec<u8>> = (0..3).map(|h| block(100 + h).encode_to_vec()).collect();
+        let target = 1usize;
+        let window = payloads.len();
+        let limbs = bytes_to_limbs(&payloads[target]);
+        assert!((3000..3300).contains(&payloads[target].len()));
+        assert!(
+            limbs.contains(&0xFFFF),
+            "payload must exercise 0xFFFF limbs"
+        );
+
+        let client = BatchPirClient::from_seed([0x5Cu8; 32]);
+        let server = BatchPirServer::with_unifomr_params();
+        let queries = client.generate_sealpir_queries(&[target], window).unwrap();
+        let needed = pir_payload_limb_count(limbs[0]).unwrap();
+        let mut cols = Vec::with_capacity(padded_limb_count(needed));
+        for limb_index in 0..padded_limb_count(needed) {
+            let db = limb_column(&payloads, limb_index);
+            let resp = server
+                .evaluate_sealpir_stripes(&queries, &db, window)
+                .unwrap();
+            cols.push(client.decrypt_sealpir_stripes(&resp, window).unwrap());
+        }
+        let got = assemble_payloads(&[target], &cols);
+        assert_eq!(got[0], payloads[target]);
+        let decoded = crate::proto::CompactBlock::decode(got[0].as_slice()).unwrap();
+        assert_eq!(decoded.height, 101);
+    }
+
+    #[test]
+    fn test_pir_rejects_non_fresh_query() {
+        let client = BatchPirClient::from_seed([0x71u8; 32]);
+        let server = BatchPirServer::with_unifomr_params();
+        let db = vec![1u64; 4];
+        let q = client.generate_query(0, 4).unwrap();
+        assert!(server.evaluate_limb_bytes(&q, &db).is_ok());
+
+        let mut ct = Ciphertext::from_bytes(&q, &client.params).unwrap();
+        let squared = &ct * &ct;
+        assert_eq!(squared.len(), 3);
+        assert!(server
+            .evaluate_limb_bytes(&squared.to_bytes(), &db)
+            .is_err());
+
+        ct.switch_to_level(1).unwrap();
+        let err = server.evaluate_limb_bytes(&ct.to_bytes(), &db).unwrap_err();
+        assert!(err.contains("level"), "{err}");
     }
 }
