@@ -2,6 +2,8 @@
 
 Privacy-preserving light wallet server for the DarkFi network. Serves compact blocks, UnifOMR digests, and transaction relay to mobile and desktop light wallets over gRPC.
 
+**0.2.4.** `SendTransaction` accepts `extra_omr_clues`, one UniFOMR clue per sender output (transfer change and fee change) in addition to the recipient clue. Each clue is stored against its output index. A repeat registration for an index that already has a clue is left as first-writer-wins.
+
 ## Contents
 
 - [Architecture](#architecture)
@@ -239,7 +241,7 @@ Defined in `proto/lightwallet.proto`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **SendTransaction + omr_clue** | ✅ | Hint keyed by tx hash (**24h** TTL) |
+| **SendTransaction + omr_clue** | ✅ | Hint keyed by tx hash and output index (**24h** TTL). `extra_omr_clues` covers the sender's other outputs |
 | **clue_accepted (S22)** | ✅ | Tx may succeed while clue is rejected |
 | **RegisterOmrClue peer bind (S12)** | ✅ | Prior `SendTransaction` from same peer within **24h** |
 | **Envelope parse** | ✅ | Wire OMR envelope can supply FHE clue |

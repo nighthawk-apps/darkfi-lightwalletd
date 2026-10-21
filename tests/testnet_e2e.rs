@@ -214,6 +214,7 @@ async fn testnet_send_transaction_clue_accepted() {
             omr_clue: omr_clue.clone(),
             omr_clue_output_index: 0,
             omr_metadata_enc: vec![],
+            extra_omr_clues: vec![],
         })
         .await
         .expect("SendTransaction RPC failed")

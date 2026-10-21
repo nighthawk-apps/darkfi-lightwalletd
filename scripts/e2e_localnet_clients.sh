@@ -76,7 +76,8 @@ build_client() {
 # in the same target dir. Build into crate-local target dirs.
 build_named() {
   local dir="$1" out="$2"
-  (cd "$dir" && cargo build --release --bin localnet_tx)
+  shift 2
+  (cd "$dir" && cargo build --release --bin localnet_tx "$@")
   local built
   built="$(find "$dir" "$dir/../.." -path '*/release/localnet_tx' -type f -printf '%T@ %p\n' | sort -nr | awk 'NR==1{print $2}')"
   cp -f "$built" "$out"
@@ -84,7 +85,7 @@ build_named() {
 
 if [[ ! -x "$WORK/android-desktop-tx" ]]; then
   echo "building android/desktop localnet_tx"
-  build_named "$AND_FFI" "$WORK/android-desktop-tx"
+  build_named "$AND_FFI" "$WORK/android-desktop-tx" --features localnet
 fi
 if [[ ! -x "$WORK/ios-tx" ]]; then
   echo "building ios localnet_tx"

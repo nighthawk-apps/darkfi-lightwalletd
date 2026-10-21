@@ -76,7 +76,7 @@ impl AsyncWrite for CountedTcpStream {
     }
 }
 
-type PermitFut = Pin<Box<dyn Future<Output = OwnedSemaphorePermit> + Send>>;
+type PermitFut = Pin<Box<dyn Future<Output = std::io::Result<OwnedSemaphorePermit>> + Send>>;
 
 enum AcceptState {
     Idle,
@@ -118,7 +118,12 @@ impl futures::Stream for LimitedTcpIncoming {
                 AcceptState::Idle => {
                     let permits = Arc::clone(&this.permits);
                     this.accept_state = AcceptState::WaitingPermit(Box::pin(async move {
-                        permits.acquire_owned().await.expect("semaphore closed")
+                        permits.acquire_owned().await.map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "connection limiter closed",
+                            )
+                        })
                     }));
                 }
                 AcceptState::WaitingPermit(_) => {
@@ -128,8 +133,12 @@ impl futures::Stream for LimitedTcpIncoming {
                         unreachable!()
                     };
                     match fut.as_mut().poll(cx) {
-                        Poll::Ready(permit) => {
+                        Poll::Ready(Ok(permit)) => {
                             this.accept_state = AcceptState::WaitingAccept(permit);
+                        }
+                        Poll::Ready(Err(err)) => {
+                            this.accept_state = AcceptState::Idle;
+                            return Poll::Ready(Some(Err(err)));
                         }
                         Poll::Pending => {
                             this.accept_state = AcceptState::WaitingPermit(fut);

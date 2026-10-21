@@ -306,12 +306,17 @@ impl Cache {
         }
         self.prune_expired_omr_clue_hints()?;
 
-        // Wire format: [output_index:u32 LE | 0xFFFF_FFFF = first-empty] || clue
-        let mut stored = Vec::with_capacity(4 + clue.len());
-        let idx = output_index.unwrap_or(u32::MAX);
-        stored.extend_from_slice(&idx.to_le_bytes());
-        stored.extend_from_slice(&clue);
-
+        let mut clues = match self.omr_clue_hints.get(tx_hash.as_slice())? {
+            Some(bytes) => decode_omr_clue_hints(&bytes),
+            None => Vec::new(),
+        };
+        // First writer wins per output index. A second clue for the same
+        // index is ignored so a payment clue cannot be replaced by change.
+        if clues.iter().any(|(idx, _)| *idx == output_index) {
+            return Ok(());
+        }
+        clues.push((output_index, clue.clone()));
+        let stored = encode_omr_clue_hints(&clues);
         self.omr_clue_hints
             .insert(tx_hash.as_slice(), stored.as_slice())?;
         let now = std::time::SystemTime::now()
@@ -377,6 +382,17 @@ impl Cache {
     pub fn has_omr_clue_hint(&self, tx_hash: &[u8; 32]) -> Result<bool> {
         self.prune_expired_omr_clue_hints()?;
         Ok(self.omr_clue_hints.contains_key(tx_hash.as_slice())?)
+    }
+
+    /// True when a clue is already stored for this tx and output index.
+    pub fn omr_clue_index_taken(&self, tx_hash: &[u8; 32], output_index: u32) -> Result<bool> {
+        self.prune_expired_omr_clue_hints()?;
+        let Some(bytes) = self.omr_clue_hints.get(tx_hash.as_slice())? else {
+            return Ok(false);
+        };
+        Ok(decode_omr_clue_hints(&bytes)
+            .into_iter()
+            .any(|(idx, _)| idx == Some(output_index)))
     }
 
     /// Drop a clue hint (e.g. its transaction was rejected by darkfid).
@@ -622,20 +638,25 @@ impl Cache {
         for tx in &mut block.txs {
             let tx_hash: [u8; 32] = tx.tx_hash;
 
-            // Merge FHE clue
+            // Merge FHE clues (one per output index, or one legacy first-empty).
             if let Some(stored_bytes) = self.omr_clue_hints.get(tx_hash.as_slice())? {
-                let (output_index, clue) = parse_stored_omr_clue_hint(&stored_bytes);
-                if clue.is_empty() {
+                let clues = decode_omr_clue_hints(&stored_bytes);
+                if clues.is_empty() || clues.iter().all(|(_, c)| c.is_empty()) {
                     self.omr_clue_hints.remove(tx_hash.as_slice())?;
                     self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
-                } else if tx.outputs.iter().all(|o| o.omr_clue != clue) {
-                    let target = match output_index {
-                        Some(idx) => tx.outputs.get_mut(idx as usize),
-                        None => tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty()),
-                    };
-                    if let Some(output) = target {
-                        if output.omr_clue.is_empty() {
-                            output.omr_clue = clue;
+                } else {
+                    for (output_index, clue) in clues {
+                        if clue.is_empty() || tx.outputs.iter().any(|o| o.omr_clue == clue) {
+                            continue;
+                        }
+                        let target = match output_index {
+                            Some(idx) => tx.outputs.get_mut(idx as usize),
+                            None => tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty()),
+                        };
+                        if let Some(output) = target {
+                            if output.omr_clue.is_empty() {
+                                output.omr_clue = clue;
+                            }
                         }
                     }
                 }
@@ -1093,6 +1114,47 @@ impl Cache {
 ///
 /// New format: 4-byte LE index (`u32::MAX` = first empty) + clue.
 /// Fallback format: raw clue bytes (treated as first-empty).
+const OMR_CLUE_LIST_MAGIC: &[u8; 4] = b"MCL1";
+
+/// Length-prefixed list of `(output_index, clue)`. `u32::MAX` means first empty.
+fn encode_omr_clue_hints(clues: &[(Option<u32>, Vec<u8>)]) -> Vec<u8> {
+    let mut out = OMR_CLUE_LIST_MAGIC.to_vec();
+    for (idx, clue) in clues {
+        let i = idx.unwrap_or(u32::MAX);
+        let len = u32::try_from(clue.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&i.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        let n = len as usize;
+        out.extend_from_slice(&clue[..n.min(clue.len())]);
+    }
+    out
+}
+
+fn decode_omr_clue_hints(stored: &[u8]) -> Vec<(Option<u32>, Vec<u8>)> {
+    if stored.starts_with(OMR_CLUE_LIST_MAGIC) {
+        let mut rest = &stored[4..];
+        let mut out = Vec::new();
+        while rest.len() >= 8 {
+            let idx = u32::from_le_bytes(rest[0..4].try_into().unwrap_or([0; 4]));
+            let len = u32::from_le_bytes(rest[4..8].try_into().unwrap_or([0; 4])) as usize;
+            if rest.len() < 8 + len {
+                break;
+            }
+            let clue = rest[8..8 + len].to_vec();
+            rest = &rest[8 + len..];
+            let index = if idx == u32::MAX { None } else { Some(idx) };
+            out.push((index, clue));
+        }
+        return out;
+    }
+    let (idx, clue) = parse_stored_omr_clue_hint(stored);
+    if clue.is_empty() {
+        Vec::new()
+    } else {
+        vec![(idx, clue)]
+    }
+}
+
 fn parse_stored_omr_clue_hint(stored: &[u8]) -> (Option<u32>, Vec<u8>) {
     if stored.len() >= 4 {
         let mut idx_buf = [0u8; 4];

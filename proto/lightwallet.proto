@@ -232,6 +232,15 @@ message RawTransaction {
   // Recipient-encrypted OMR metadata (scheme + clue seed + user memo).
   // LWD stores opaquely and merges into CompactOutput.omr_metadata_enc on confirm.
   bytes omr_metadata_enc = 4;
+  // Clues for the sender's own outputs (transfer change, fee change).
+  // Index 0 stays on omr_clue above. One clue per output index.
+  repeated OutputOmrClue extra_omr_clues = 5;
+}
+
+// A UnifOMR clue bound to one compact-block output of the transaction.
+message OutputOmrClue {
+  uint32 output_index = 1;
+  bytes omr_clue = 2;
 }
 
 message OmrClueRegistration {

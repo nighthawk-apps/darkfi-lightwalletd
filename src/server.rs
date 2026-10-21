@@ -476,10 +476,14 @@ impl LightWalletService {
     ///
     /// S3: first-writer-wins — an existing hint is never overwritten.
     fn store_send_clue_hint(&self, hash: &[u8; 32], clue: Vec<u8>, output_index: u32) -> bool {
-        if self.cache.has_omr_clue_hint(hash).unwrap_or(false) {
+        if self
+            .cache
+            .omr_clue_index_taken(hash, output_index)
+            .unwrap_or(false)
+        {
             tracing::info!(
                 target: "lightwalletd::server",
-                "OMR clue already present for tx; first-writer-wins, not overwriting"
+                "OMR clue already present for tx output {output_index}; first-writer-wins, not overwriting"
             );
             return false;
         }
@@ -769,6 +773,7 @@ impl DarkFiLightWallet for LightWalletService {
                 omr_clue: vec![],
                 omr_clue_output_index: 0,
                 omr_metadata_enc: vec![],
+                extra_omr_clues: vec![],
             })),
             Err(e) if e.is_connection() => Err(backend_unavailable()),
             Err(_) => Err(Status::not_found("transaction not found")),
@@ -831,6 +836,23 @@ impl DarkFiLightWallet for LightWalletService {
                     std::mem::take(&mut omr_clue),
                     req.omr_clue_output_index,
                 );
+                for extra in &req.extra_omr_clues {
+                    if extra.omr_clue.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = Self::validate_omr_clue(&extra.omr_clue) {
+                        tracing::warn!(
+                            target: "lightwalletd::server",
+                            "Rejecting extra OMR clue on SendTransaction: {e}"
+                        );
+                        continue;
+                    }
+                    let _ = self.store_send_clue_hint(
+                        &hash,
+                        extra.omr_clue.clone(),
+                        extra.output_index,
+                    );
+                }
             }
         }
 
@@ -867,10 +889,23 @@ impl DarkFiLightWallet for LightWalletService {
                 }
 
                 // Validated clue whose hash only darkfid could tell us.
-                if !omr_clue.is_empty() {
-                    if let Some(hash) = hash {
+                if let Some(hash) = hash {
+                    if !omr_clue.is_empty() {
                         clue_accepted =
                             self.store_send_clue_hint(&hash, omr_clue, req.omr_clue_output_index);
+                    }
+                    for extra in &req.extra_omr_clues {
+                        if extra.omr_clue.is_empty() {
+                            continue;
+                        }
+                        if Self::validate_omr_clue(&extra.omr_clue).is_err() {
+                            continue;
+                        }
+                        let _ = self.store_send_clue_hint(
+                            &hash,
+                            extra.omr_clue.clone(),
+                            extra.output_index,
+                        );
                     }
                 }
 
@@ -1304,11 +1339,16 @@ impl DarkFiLightWallet for LightWalletService {
             ));
         }
 
-        if self.cache.has_omr_clue_hint(&hash).unwrap_or(false) {
-            // S3: first-writer-wins — already have a clue; do not overwrite.
+        if self
+            .cache
+            .omr_clue_index_taken(&hash, req.omr_clue_output_index)
+            .unwrap_or(false)
+        {
+            // S3: first-writer-wins per output index — do not overwrite.
             tracing::info!(
                 target: "lightwalletd::server",
-                "OMR clue already present for RegisterOmrClue; first-writer-wins, not overwriting"
+                "OMR clue already present for RegisterOmrClue output {}; first-writer-wins",
+                req.omr_clue_output_index
             );
             return Ok(Response::new(proto::Empty {}));
         }
