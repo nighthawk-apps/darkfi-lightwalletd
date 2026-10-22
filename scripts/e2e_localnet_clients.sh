@@ -11,6 +11,9 @@
 #   COUNT=100 ./scripts/e2e_localnet_clients.sh
 set -euo pipefail
 
+# Wallet SQLCipher passphrase. The binary no longer writes a .pass file.
+export MOONSHINE_WALLET_PASS="${MOONSHINE_WALLET_PASS:-e2e-localnet}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GH="$(cd "$ROOT/.." && pwd)"
 PIN="$GH/darkfi-nighthawk-testnet"
@@ -87,7 +90,7 @@ if [[ ! -x "$WORK/android-desktop-tx" ]]; then
   echo "building android/desktop localnet_tx"
   build_named "$AND_FFI" "$WORK/android-desktop-tx" --features localnet
 fi
-if [[ ! -x "$WORK/ios-tx" ]]; then
+if [[ "${SKIP_IOS:-0}" != 1 && ! -x "$WORK/ios-tx" ]]; then
   echo "building ios localnet_tx"
   build_named "$IOS_FFI" "$WORK/ios-tx"
 fi
@@ -128,6 +131,12 @@ if [[ ! -f "$WORK/drk/wallet.db" ]]; then
 fi
 FAUCET="$("$DRK" --config "$DRK_CFG" wallet address | awk 'NF{print $NF; exit}')"
 echo "faucet=$FAUCET"
+
+# Block rewards are the only faucet income. The miner has to be running
+# before the balance wait, then it is stopped once the faucet is funded.
+echo "starting xmrig for faucet rewards"
+"$XMRIG" -r 1000 -R 20 -o 127.0.0.1:48347 -t 1 -u "$FAUCET" >"$WORK/xmrig.log" 2>&1 &
+echo $! >"$WORK/xmrig.pid"
 
 echo "waiting for faucet rewards"
 for _ in $(seq 1 180); do
@@ -193,10 +202,14 @@ if ! "$MOON" -w e2e_moon address default >/dev/null 2>&1; then
 fi
 MOON_ADDR="$("$MOON" -w e2e_moon address default | awk '/Default address:/ {print $NF; exit} /^f/{print; exit}')"
 echo "moonshine=$MOON_ADDR"
-AND_ADDR="$(init_ffi android-desktop "$WORK/android-desktop-tx")"
-IOS_ADDR="$(init_ffi ios "$WORK/ios-tx")"
-echo "android-desktop=$AND_ADDR"
-echo "ios=$IOS_ADDR"
+AND_ADDR="$(init_ffi android "$WORK/android-desktop-tx")"
+DESK_ADDR="$(init_ffi desktop "$WORK/android-desktop-tx")"
+echo "android=$AND_ADDR"
+echo "desktop=$DESK_ADDR"
+if [[ "${SKIP_IOS:-0}" != 1 ]]; then
+  IOS_ADDR="$(init_ffi ios "$WORK/ios-tx")"
+  echo "ios=$IOS_ADDR"
+fi
 
 # darkfid/drk encode localnet addresses with the mainnet prefix. Moonshine
 # and the mobile wallets use the testnet prefix. The payment is to the public
@@ -228,9 +241,12 @@ for _ in $(seq 1 40); do
 done
 "$MOON" -w e2e_moon balance | tee "$WORK/moon-balance.txt"
 
-echo "register android and ios clue keys"
-E2E_WALLET_DIR="$WORK/wallets/android-desktop" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/android-desktop/sync.out"
-E2E_WALLET_DIR="$WORK/wallets/ios" "$WORK/ios-tx" sync | tee "$WORK/wallets/ios/sync.out"
+echo "register android and desktop clue keys"
+E2E_WALLET_DIR="$WORK/wallets/android" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/android/sync.out"
+E2E_WALLET_DIR="$WORK/wallets/desktop" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/desktop/sync.out"
+if [[ "${SKIP_IOS:-0}" != 1 ]]; then
+  E2E_WALLET_DIR="$WORK/wallets/ios" "$WORK/ios-tx" sync | tee "$WORK/wallets/ios/sync.out"
+fi
 
 fund_light() {
   local name="$1" addr="$2"
@@ -241,23 +257,29 @@ fund_light() {
     "$MOON" -w e2e_moon -s "$LWD_URL" tx send --to "$addr" --amount 8 --fee "$FEE" --memo "stake-$name" \
       >"$WORK/stake-$name.log" 2>&1 || true
     cat "$WORK/stake-$name.log"
-    if ! grep -q "Insufficient funds" "$WORK/stake-$name.log"; then
+    if grep -q "TX hash:" "$WORK/stake-$name.log"; then
       return 0
     fi
-    echo "stake $name waiting for a confirmed change output ($i)"
+    echo "stake $name waiting for a confirmed input ($i)"
     sleep 5
   done
   echo "stake $name failed"
   return 1
 }
 
-fund_light android-desktop "$AND_ADDR"
-fund_light ios "$IOS_ADDR"
+fund_light android "$AND_ADDR"
+fund_light desktop "$DESK_ADDR"
+if [[ "${SKIP_IOS:-0}" != 1 ]]; then
+  fund_light ios "$IOS_ADDR"
+fi
 
 echo "wait for stake confirms"
 sleep 20
-E2E_WALLET_DIR="$WORK/wallets/android-desktop" "$WORK/android-desktop-tx" sync | tee -a "$WORK/wallets/android-desktop/sync.out"
-E2E_WALLET_DIR="$WORK/wallets/ios" "$WORK/ios-tx" sync | tee -a "$WORK/wallets/ios/sync.out"
+E2E_WALLET_DIR="$WORK/wallets/android" "$WORK/android-desktop-tx" sync | tee -a "$WORK/wallets/android/sync.out"
+E2E_WALLET_DIR="$WORK/wallets/desktop" "$WORK/android-desktop-tx" sync | tee -a "$WORK/wallets/desktop/sync.out"
+if [[ "${SKIP_IOS:-0}" != 1 ]]; then
+  E2E_WALLET_DIR="$WORK/wallets/ios" "$WORK/ios-tx" sync | tee -a "$WORK/wallets/ios/sync.out"
+fi
 "$MOON" -w e2e_moon -s "$LWD_URL" sync --force-trial | tee -a "$WORK/moon-sync.log" | tail -8
 
 send_pair() {
@@ -283,8 +305,8 @@ send_pair() {
       done
       echo "PAIR $src->$dst ok=$ok fail=$fail"
       ;;
-    android-desktop)
-      E2E_WALLET_DIR="$WORK/wallets/android-desktop" "$WORK/android-desktop-tx" send --to "$dst_addr" --count "$COUNT" --amount "$AMOUNT"
+    android|desktop)
+      E2E_WALLET_DIR="$WORK/wallets/$src" "$WORK/android-desktop-tx" send --to "$dst_addr" --count "$COUNT" --amount "$AMOUNT"
       ;;
     ios)
       E2E_WALLET_DIR="$WORK/wallets/ios" "$WORK/ios-tx" send --to "$dst_addr" --count "$COUNT" --amount "$AMOUNT"
@@ -292,11 +314,49 @@ send_pair() {
   esac
 }
 
-send_pair moonshine android-desktop "$AND_ADDR" || echo "PAIR_FAIL moonshine->android-desktop"
-send_pair moonshine ios "$IOS_ADDR" || echo "PAIR_FAIL moonshine->ios"
-send_pair android-desktop moonshine "$MOON_ADDR" || echo "PAIR_FAIL android-desktop->moonshine"
-send_pair android-desktop ios "$IOS_ADDR" || echo "PAIR_FAIL android-desktop->ios"
-send_pair ios moonshine "$MOON_ADDR" || echo "PAIR_FAIL ios->moonshine"
-send_pair ios android-desktop "$AND_ADDR" || echo "PAIR_FAIL ios->android-desktop"
+send_pair moonshine android "$AND_ADDR" || echo "PAIR_FAIL moonshine->android"
+send_pair moonshine desktop "$DESK_ADDR" || echo "PAIR_FAIL moonshine->desktop"
+send_pair android moonshine "$MOON_ADDR" || echo "PAIR_FAIL android->moonshine"
+send_pair android desktop "$DESK_ADDR" || echo "PAIR_FAIL android->desktop"
+send_pair desktop moonshine "$MOON_ADDR" || echo "PAIR_FAIL desktop->moonshine"
+send_pair desktop android "$AND_ADDR" || echo "PAIR_FAIL desktop->android"
+if [[ "${SKIP_IOS:-0}" != 1 ]]; then
+  send_pair moonshine ios "$IOS_ADDR" || echo "PAIR_FAIL moonshine->ios"
+  send_pair android ios "$IOS_ADDR" || echo "PAIR_FAIL android->ios"
+  send_pair ios moonshine "$MOON_ADDR" || echo "PAIR_FAIL ios->moonshine"
+  send_pair ios android "$AND_ADDR" || echo "PAIR_FAIL ios->android"
+fi
+
+# Notes with no UnifOMR clue are invisible to strict OMR. Moonshine --no-omr
+# sends them; Android and desktop sync with strict_omr_only false.
+FALLBACK_COUNT="${FALLBACK_COUNT:-10}"
+echo "=== trial fallback --no-omr moonshine -> android, desktop x$FALLBACK_COUNT ==="
+no_omr_send() {
+  local dst="$1" dst_addr="$2"
+  local ok=0 fail=0 i out
+  for ((i=0; i<FALLBACK_COUNT; i++)); do
+    "$MOON" -w e2e_moon -s "$LWD_URL" sync --force-trial >/dev/null 2>&1 || true
+    if out="$("$MOON" -w e2e_moon -s "$LWD_URL" tx send --no-omr --to "$dst_addr" --amount "$AMOUNT" --fee "$FEE" --memo "nomr-$dst-$i" 2>&1)"; then
+      echo "$out" | awk '/TX hash:/{print}'
+      ok=$((ok+1))
+    else
+      echo "$out" | tail -5
+      fail=$((fail+1))
+      if (( fail >= 5 )); then
+        break
+      fi
+    fi
+  done
+  echo "NOOMR moonshine->$dst ok=$ok fail=$fail"
+}
+no_omr_send android "$AND_ADDR" || echo "NOOMR_FAIL android"
+no_omr_send desktop "$DESK_ADDR" || echo "NOOMR_FAIL desktop"
+
+echo "=== final sync and history $(date -Is) ==="
+E2E_WALLET_DIR="$WORK/wallets/android" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/android/final-sync.out"
+E2E_WALLET_DIR="$WORK/wallets/desktop" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/desktop/final-sync.out"
+"$MOON" -w e2e_moon -s "$LWD_URL" sync --force-trial | tee "$WORK/moon-final-sync.log" | tail -8
+"$MOON" -w e2e_moon balance | tee "$WORK/moon-final-balance.txt"
+"$MOON" -w e2e_moon tx list | tee "$WORK/moon-tx-list.txt" | tail -20
 
 echo "=== done $(date -Is) log=$LOG ==="
