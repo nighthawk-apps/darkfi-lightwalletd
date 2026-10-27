@@ -42,6 +42,7 @@ pub mod clue_ownership;
 pub mod compact_block;
 pub mod config;
 pub mod continuity;
+mod detection_pool;
 pub mod error;
 pub mod limited_incoming;
 pub mod omr_detector;

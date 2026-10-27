@@ -2,6 +2,8 @@
 
 Privacy-preserving light wallet server for the DarkFi network. Serves compact blocks, UnifOMR digests, and transaction relay to mobile and desktop light wallets over gRPC.
 
+**0.3.0.** Proto **2.0.0**, with no 1.x compatibility path: historical tree snapshots for checkpoints, padded-range enforcement on `GetNoteCommitments`, `GetNullifiers`, and `GetCompactOutputBodies` (a power-of-two bucket of at least 1024, or one cut short within 64 blocks of the tip), a UnifOMR detection-key pool (`RegisterDetectionKey`, `GetUnifOmrDigestFromPool`; 24 h handles, 4096 handles and 8 GiB total), a `SubscribeBlocks` ChainTip stream, and `GetCompactOutputBodies`.
+
 **0.2.4.** `SendTransaction` accepts `extra_omr_clues`, one UniFOMR clue per sender output (transfer change and fee change) in addition to the recipient clue. Each clue is stored against its output index. A repeat registration for an index that already has a clue is left as first-writer-wins.
 
 ## Contents
@@ -255,6 +257,7 @@ Defined in `proto/lightwallet.proto`.
 - Clients default to `http://127.0.0.1:9067`; `network` / `chain_name` must match wallets
 - Clue hints from `SendTransaction` live **24h** until the confirming block is indexed
 - Limits: [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md)
+- Sync speed (snapshots, padded ranges, detection-key pool, tip subscribe): [`docs/wallet-sync-speed-plan.md`](docs/wallet-sync-speed-plan.md)
 
 | Item | Status |
 |------|--------|

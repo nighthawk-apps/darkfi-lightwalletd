@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
+use crate::detection_pool::{self, DetectionKeyPool, PoolReject, PooledDetectionKey};
+
 use crate::{
     cache::Cache,
     compact_block::CompactBlock,
@@ -36,6 +38,38 @@ use crate::{
     rate_limit::PeerRateLimiter,
     rpc_client::DarkfidRpcClient,
 };
+
+fn block_hash_vec(cache: &Cache, height: u32) -> Vec<u8> {
+    cache
+        .get_block_hash(height)
+        .ok()
+        .flatten()
+        .map(|h| h.to_vec())
+        .unwrap_or_default()
+}
+
+/// Retained snapshot row. `state_root` is blake3(tree_data): the compact cache
+/// has no header money-tree root to check against.
+fn persisted_tree_state(height: u32, tree_data: Vec<u8>, block_hash: Vec<u8>) -> proto::TreeState {
+    let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
+    proto::TreeState {
+        height,
+        tree_data,
+        block_hash,
+        state_root,
+        is_checkpoint: true,
+    }
+}
+
+fn snapshot_miss_status(height: u32, tip: u32, lower: Option<u32>) -> Status {
+    let detail = match lower {
+        Some(snap) => format!("greatest snapshot <= {height} is {snap}"),
+        None => format!("no snapshot at or below {height}"),
+    };
+    Status::failed_precondition(format!(
+        "GetTreeState height {height} is not a retained snapshot (tip {tip}); {detail}"
+    ))
+}
 
 /// blake3(height LE || tree_data || nullifier_index) — lockstep with mobile FFI.
 fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
@@ -72,10 +106,21 @@ const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// Compact-block wire version reported by GetLightInfo.
 /// Bump when the compact format or RPC contract changes.
-const LIGHTWALLET_PROTO_VERSION: &str = "1.0.0";
+/// 2.0.0: historical snapshots, padded ranges, detection-key pool,
+/// ChainTip subscribe, compact output bodies. No 1.0.0 compatibility path.
+const LIGHTWALLET_PROTO_VERSION: &str = "2.0.0";
 
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
 const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
+/// Minimum span for GetNoteCommitments, GetNullifiers, and GetCompactOutputBodies.
+/// Matches the client pad rule: span is a power of two of at least this size.
+const MIN_PADDED_RANGE_SPAN: u32 = 1024;
+/// A client pads against the tip it saw at the start of its sync cycle. A
+/// bucket it cut short at that tip may end this many blocks below ours. Kept
+/// well under one bucket so a raw cursor range is not mistaken for a cut bucket.
+const MAX_PADDED_TIP_LAG: u32 = 64;
+/// SubscribeBlocks keeps one unsent ChainTip. Further tips are skipped, not dropped.
+const SUBSCRIBE_TIP_BUFFER: usize = 1;
 /// Max characters in LookupZkas contract id (base58 + headroom).
 const MAX_CONTRACT_ID_CHARS: usize = 128;
 
@@ -142,6 +187,40 @@ fn digest_evaluable_end(
     Ok((Some(last), tip >= end))
 }
 
+/// Expand `[start, end]` into a padded bucket the server will accept.
+///
+/// Span is at least 1024 and a power of two, and at most 8192 (the largest
+/// power of two that fits in the 10_000 block cap). The window ends at
+/// `end.min(tip)` and grows backward. A tip below block 1023 has no full
+/// bucket; the whole chain `0..=end` is returned instead.
+pub fn pad_block_range(start: u32, end: u32, tip: u32) -> (u32, u32) {
+    let end = end.min(tip);
+    let start = start.min(end);
+    let raw = (end as u64).saturating_sub(start as u64).saturating_add(1);
+    let mut span = raw.max(MIN_PADDED_RANGE_SPAN as u64);
+    if !span.is_power_of_two() {
+        span = span.next_power_of_two();
+    }
+    // 16384 exceeds MAX_BLOCKS_PER_REQUEST (10_000).
+    const MAX_BUCKET: u64 = 8192;
+    if span > MAX_BUCKET {
+        span = MAX_BUCKET;
+    }
+    let room = (tip as u64).saturating_add(1);
+    while span > room && span > 1 {
+        span >>= 1;
+    }
+    if span < MIN_PADDED_RANGE_SPAN as u64 {
+        return (0, end);
+    }
+    let span_u = span as u32;
+    if (end as u64).saturating_add(1) >= span {
+        let padded_start = end.saturating_add(1).saturating_sub(span_u);
+        return (padded_start, end);
+    }
+    (0, span_u.saturating_sub(1))
+}
+
 fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
     let span = height_span(start, end)?;
     if span > MAX_BLOCKS_PER_REQUEST as u64 {
@@ -150,6 +229,62 @@ fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
         )));
     }
     Ok(span)
+}
+
+/// Why `start..=end` is not a padded bucket, or `None` when it is valid.
+///
+/// Valid ranges are what the client `pad_block_range` emits. `end` is at or
+/// before the tip and `span = end - start + 1` is at most `max_range`. Either
+/// the span is a power of two of at least [`MIN_PADDED_RANGE_SPAN`], or the
+/// bucket was cut short at the client's tip: `start` sits on a bucket
+/// boundary and `end` is within [`MAX_PADDED_TIP_LAG`] of our tip. A short
+/// unpadded cursor range is rejected.
+fn padded_range_rejection(start: u32, end: u32, tip: u32, max_range: u32) -> Option<String> {
+    if start > end {
+        return Some(format!("Invalid height range: start={start} > end={end}"));
+    }
+    if end > tip {
+        return Some(format!("range end {end} is past tip {tip}"));
+    }
+    let span = (end as u64) - (start as u64) + 1;
+    if span > max_range as u64 {
+        return Some(format!(
+            "Range too large: {span} blocks requested, max is {max_range}"
+        ));
+    }
+    if span >= MIN_PADDED_RANGE_SPAN as u64 && span.is_power_of_two() {
+        return None;
+    }
+    // Cut short at the tip: one bucket of size B >= span aligned to B, or two
+    // buckets of size B aligned to B. Both put `start` on a multiple of
+    // max(B_full / 2, MIN) where B_full is the full span rounded up.
+    let full = span.max(MIN_PADDED_RANGE_SPAN as u64).next_power_of_two();
+    let align = (full / 2).max(MIN_PADDED_RANGE_SPAN as u64);
+    if (start as u64) % align != 0 {
+        return Some(format!(
+            "range span {span} must be a power of two of at least {MIN_PADDED_RANGE_SPAN}, \
+             or a bucket aligned to {align} that ends at the tip"
+        ));
+    }
+    if (end as u64) + (MAX_PADDED_TIP_LAG as u64) < tip as u64 {
+        return Some(format!(
+            "range {start}..={end} is a partial bucket that does not end at the tip {tip}"
+        ));
+    }
+    None
+}
+
+#[allow(clippy::result_large_err)]
+fn require_padded_block_range(cache: &Cache, start: u32, end: u32) -> Result<(u32, u32), Status> {
+    let tip = match cache.get_tip() {
+        Ok(Some((tip, _))) => tip,
+        Ok(None) => return Err(Status::unavailable("No blocks cached yet")),
+        Err(e) => return Err(cache_status(e)),
+    };
+    match padded_range_rejection(start, end, tip, MAX_BLOCKS_PER_REQUEST) {
+        None => Ok((start, end)),
+        Some(reason) => Err(Status::invalid_argument(reason)),
+    }
 }
 
 fn cache_status(e: impl std::fmt::Display) -> Status {
@@ -210,6 +345,63 @@ where
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// One [`proto::CompactOutputBody`] per Money output. Nullifiers are omitted.
+fn spawn_output_bodies(
+    cache: Arc<Cache>,
+    start: u32,
+    end: u32,
+) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        let mut prev: Option<CompactBlock> = None;
+        for height in start..=end {
+            if tx.is_closed() {
+                return;
+            }
+            let block = match cache.get_compact_block(height) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    let _ = tx.send(Err(discontinuity_status())).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(cache_status(e))).await;
+                    return;
+                }
+            };
+            if let Some(ref p) = prev {
+                if let Err(st) = check_successor(p, &block) {
+                    let _ = tx.send(Err(st)).await;
+                    return;
+                }
+            } else if block.height != start {
+                let _ = tx.send(Err(discontinuity_status())).await;
+                return;
+            }
+            for tx_body in &block.txs {
+                for output in &tx_body.outputs {
+                    let body = proto::CompactOutputBody {
+                        height: block.height,
+                        hash: block.hash.to_vec(),
+                        prev_hash: block.prev_hash.to_vec(),
+                        coin: output.coin.to_vec(),
+                        encrypted_note: output.encrypted_note.clone(),
+                        omr_clue: output.omr_clue.clone(),
+                        omr_metadata_enc: output.omr_metadata_enc.clone(),
+                        tx_hash: tx_body.tx_hash.to_vec(),
+                    };
+                    if tx.send(Ok(body)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            prev = Some(block);
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
 /// True if `ip` matches an allow-list entry (`1.2.3.4` or IPv4 CIDR).
 fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     let entry = entry.trim();
@@ -253,6 +445,70 @@ fn client_ip_from_forwarded(header: &str, trusted: &[String]) -> Option<IpAddr> 
     None
 }
 
+/// In-memory clue/note list for one `(start, end)` window.
+///
+/// A second digest for the same window skips the sled compact-block scan.
+/// Digest ciphertexts are not stored — they differ per handle and per range.
+#[cfg(feature = "fhe-omr")]
+struct ClueWindowEntry {
+    end_hash: [u8; 32],
+    notes: Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>,
+}
+
+#[cfg(feature = "fhe-omr")]
+struct ClueWindowCache {
+    map: HashMap<(u32, u32), ClueWindowEntry>,
+    order: std::collections::VecDeque<(u32, u32)>,
+}
+
+#[cfg(feature = "fhe-omr")]
+impl ClueWindowCache {
+    const CAP: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        start: u32,
+        end: u32,
+        end_hash: [u8; 32],
+    ) -> Option<Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>> {
+        let hit = self.map.get(&(start, end))?;
+        if hit.end_hash != end_hash {
+            return None;
+        }
+        Some(hit.notes.clone())
+    }
+
+    fn insert(
+        &mut self,
+        start: u32,
+        end: u32,
+        end_hash: [u8; 32],
+        notes: Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>,
+    ) {
+        let key = (start, end);
+        if self.map.contains_key(&key) {
+            self.map.insert(key, ClueWindowEntry { end_hash, notes });
+            return;
+        }
+        while self.order.len() >= Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, ClueWindowEntry { end_hash, notes });
+    }
+}
+
 /// Server state shared across all gRPC handlers.
 pub struct LightWalletService {
     /// Local compact block cache
@@ -287,6 +543,13 @@ pub struct LightWalletService {
     max_detection_key_bytes: usize,
     max_detection_keys_total_bytes: usize,
     max_send_peer_entries: usize,
+    /// In-memory detection keys. Not persisted. Handles are never logged.
+    detection_pool: Arc<Mutex<DetectionKeyPool>>,
+    /// Wakes tests observing SubscribeBlocks enqueue attempts.
+    tip_notice: Arc<tokio::sync::Notify>,
+    /// Flattened clue/note lists keyed by evaluated `(start, end)`. Not digests.
+    #[cfg(feature = "fhe-omr")]
+    clue_windows: Arc<Mutex<ClueWindowCache>>,
 }
 
 impl LightWalletService {
@@ -352,6 +615,10 @@ impl LightWalletService {
             max_detection_key_bytes: MAX_DETECTION_KEY_BYTES,
             max_detection_keys_total_bytes: MAX_DETECTION_KEYS_TOTAL_BYTES,
             max_send_peer_entries: MAX_SEND_PEER_ENTRIES,
+            detection_pool: Arc::new(Mutex::new(DetectionKeyPool::new())),
+            tip_notice: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "fhe-omr")]
+            clue_windows: Arc::new(Mutex::new(ClueWindowCache::new())),
         }
     }
 
@@ -514,12 +781,238 @@ impl LightWalletService {
             Err("UnifOMR clue validation requires the fhe-omr feature".into())
         }
     }
+
+    fn pool_lock(&self) -> Result<std::sync::MutexGuard<'_, DetectionKeyPool>, Status> {
+        self.detection_pool
+            .lock()
+            .map_err(|_| Status::internal("detection key pool unavailable"))
+    }
+
+    #[cfg(feature = "fhe-omr")]
+    fn cached_encrypted_notes(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>, Status> {
+        let end_hash = self
+            .cache
+            .get_block_hash(end)
+            .map_err(cache_status)?
+            .unwrap_or([0u8; 32]);
+        if let Ok(guard) = self.clue_windows.lock() {
+            if let Some(hit) = guard.get(start, end, end_hash) {
+                return Ok(hit);
+            }
+        }
+        let notes = self
+            .cache
+            .get_encrypted_notes_range(start, end)
+            .map_err(cache_status)?;
+        if let Ok(mut guard) = self.clue_windows.lock() {
+            guard.insert(start, end, end_hash, notes.clone());
+        }
+        Ok(notes)
+    }
+
+    /// Same digest evaluator `GetUnifOmrDigest` uses after the key is in hand.
+    ///
+    /// Does not cache the ciphertext. The clue/note list for `(start, eval_end)`
+    /// may be reused across handles.
+    #[cfg(feature = "fhe-omr")]
+    async fn evaluate_detection_keys(
+        &self,
+        keys: Vec<Arc<Vec<u8>>>,
+        start: u32,
+        end: u32,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<proto::OmrDigestResponse, Status> {
+        reject_oversized_window(start, end)?;
+        let (eval_end, range_complete) = digest_evaluable_end(&self.cache, start, end)?;
+        let block_notes = match eval_end {
+            Some(eval_end) => self.cached_encrypted_notes(start, eval_end)?,
+            None => Vec::new(),
+        };
+        let network_byte = self.network_byte;
+        let (encrypted_digest, slot_heights_wire, truncated) =
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
+                let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
+                let (mut messages, mut slot_heights) =
+                    crate::unifomr::flatten_messages(&clue_notes);
+                let truncated =
+                    crate::unifomr::cap_messages_to_whole_heights(&mut messages, &mut slot_heights);
+                let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
+                let digest = if keys.len() == 1 {
+                    crate::unifomr::encode_messages_padded(&detector, &keys[0], &messages)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    let mut out = Vec::new();
+                    for key in &keys {
+                        let d = crate::unifomr::encode_messages_padded(&detector, key, &messages)
+                            .map_err(|e| e.to_string())?;
+                        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                        out.extend_from_slice(&d);
+                    }
+                    out
+                };
+                Ok::<(Vec<u8>, Vec<u8>, bool), String>((digest, slot_heights_wire, truncated))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
+            .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
+
+        Ok(proto::OmrDigestResponse {
+            encrypted_digest,
+            complete: range_complete && !truncated,
+            slot_heights: slot_heights_wire,
+        })
+    }
+
+    /// Read a detection-key upload. `enforce_range` is false for registration,
+    /// which ignores start/end; the digest window is `PoolDigestRequest`.
+    #[cfg(feature = "fhe-omr")]
+    async fn read_detection_key_upload(
+        &self,
+        mut stream: tonic::Streaming<proto::DetectionKeyChunk>,
+        peer: IpAddr,
+        enforce_range: bool,
+    ) -> Result<DetectionKeyUpload, Status> {
+        use tokio_stream::StreamExt;
+
+        let mut start = 0;
+        let mut end = 0;
+        let mut num_keys = 0;
+        let mut header_received = false;
+        let mut fhe_permit = None;
+        let mut current_key = Vec::new();
+        let mut keys = Vec::new();
+
+        loop {
+            let next = tokio::time::timeout(DETECTION_KEY_CHUNK_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| Status::deadline_exceeded("UnifOMR detection-key upload stalled"))?;
+            let Some(chunk_res) = next else { break };
+            let chunk = chunk_res?;
+
+            if !header_received {
+                start = chunk.start_height;
+                end = chunk.end_height;
+                num_keys = chunk.num_keys;
+                header_received = true;
+
+                if num_keys == 0 {
+                    return Err(Status::invalid_argument("num_keys must be > 0"));
+                }
+                if num_keys > 16 {
+                    return Err(Status::invalid_argument(
+                        "Too many UnifOMR detection_keys (max 16)",
+                    ));
+                }
+                if enforce_range {
+                    reject_oversized_window(start, end)?;
+                }
+                self.check_omr_rate_limit(peer, num_keys)?;
+                fhe_permit = Some(
+                    Arc::clone(&self.fhe_permits)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?,
+                );
+            }
+
+            current_key.extend_from_slice(&chunk.data);
+
+            if current_key.len() > self.max_detection_key_bytes {
+                return Err(Status::invalid_argument(format!(
+                    "UnifOMR detection key[{}] too large: {} bytes",
+                    keys.len(),
+                    current_key.len()
+                )));
+            }
+
+            if chunk.key_done {
+                keys.push(std::mem::take(&mut current_key));
+            }
+
+            let total_key_bytes: usize =
+                keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
+            if total_key_bytes > self.max_detection_keys_total_bytes {
+                return Err(Status::invalid_argument(format!(
+                    "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
+                     (max {})",
+                    self.max_detection_keys_total_bytes
+                )));
+            }
+        }
+
+        if !header_received {
+            return Err(Status::invalid_argument("Empty stream"));
+        }
+        if !current_key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Stream ended before key_done = true for the last key",
+            ));
+        }
+        if keys.len() != num_keys as usize {
+            return Err(Status::invalid_argument(format!(
+                "Expected {} keys, but received {}",
+                num_keys,
+                keys.len()
+            )));
+        }
+        if keys.iter().any(|k| k.is_empty()) {
+            return Err(Status::invalid_argument("empty detection key not allowed"));
+        }
+        if let Some(max_len) = keys.iter().map(|k| k.len()).max() {
+            if keys.len().saturating_mul(max_len) > self.max_detection_keys_total_bytes {
+                return Err(Status::invalid_argument(
+                    "UnifOMR detection_keys count×size exceeds total size budget",
+                ));
+            }
+        }
+
+        let permit = fhe_permit.ok_or_else(|| Status::invalid_argument("Empty stream"))?;
+        Ok(DetectionKeyUpload {
+            start,
+            end,
+            keys,
+            permit,
+        })
+    }
+}
+
+#[cfg(feature = "fhe-omr")]
+struct DetectionKeyUpload {
+    start: u32,
+    end: u32,
+    keys: Vec<Vec<u8>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[tonic::async_trait]
 impl DarkFiLightWallet for LightWalletService {
     type GetBlockRangeStream =
         tokio_stream::wrappers::ReceiverStream<Result<proto::CompactBlock, Status>>;
+
+    type GetCompactOutputBodiesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>>;
+
+    /// Stream one compact output body per Money output in a padded range.
+    async fn get_compact_output_bodies(
+        &self,
+        request: Request<proto::BlockRange>,
+    ) -> Result<Response<Self::GetCompactOutputBodiesStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
+        let range = request.into_inner();
+        let (start, end) =
+            require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        Ok(Response::new(spawn_output_bodies(
+            Arc::clone(&self.cache),
+            start,
+            end,
+        )))
+    }
 
     /// Stream compact blocks in a height range.
     async fn get_block_range(
@@ -625,12 +1118,9 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<proto::ChainTip>, Status> {
         match self.cache.get_tip() {
             Ok(Some((height, hash))) => {
-                let timestamp = self
-                    .cache
-                    .get_compact_block(height)
-                    .map_err(cache_status)?
-                    .map(|b| b.timestamp)
-                    .unwrap_or(0);
+                let block = self.cache.get_compact_block(height).map_err(cache_status)?;
+                let timestamp = block.as_ref().map(|b| b.timestamp).unwrap_or(0);
+                let prev_hash = block.map(|b| b.prev_hash.to_vec()).unwrap_or_default();
 
                 let block_target = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -646,6 +1136,7 @@ impl DarkFiLightWallet for LightWalletService {
                     hash: hash.to_vec(),
                     timestamp,
                     block_target,
+                    prev_hash,
                 }))
             }
             Ok(None) => Err(Status::unavailable("No blocks cached yet")),
@@ -654,23 +1145,24 @@ impl DarkFiLightWallet for LightWalletService {
     }
 
     type SubscribeBlocksStream =
-        tokio_stream::wrappers::ReceiverStream<Result<proto::CompactBlock, Status>>;
+        tokio_stream::wrappers::ReceiverStream<Result<proto::ChainTip, Status>>;
 
-    /// Subscribe to new blocks. Wakes when the chain poller advances the tip
-    /// (poller interval latency), instead of a fixed 5s sleep.
+    /// Stream [`proto::ChainTip`] when the poller watch fires.
+    ///
+    /// A slow client is not disconnected. If the one-slot buffer is full the
+    /// notice is skipped; the next tip the client reads covers the gap.
     async fn subscribe_blocks(
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<Self::SubscribeBlocksStream>, Status> {
         let cache = Arc::clone(&self.cache);
+        let rpc = Arc::clone(&self.rpc_client);
         let mut tip_rx = self.tip_notify.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let notice = Arc::clone(&self.tip_notice);
+        let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_TIP_BUFFER);
 
         tokio::spawn(async move {
-            let mut last_height = cache.get_tip().unwrap_or(None).map(|(h, _)| h).unwrap_or(0);
-
             loop {
-                // Stop when the client hangs up, without waiting for the next tip.
                 tokio::select! {
                     biased;
                     _ = tx.closed() => return,
@@ -680,70 +1172,56 @@ impl DarkFiLightWallet for LightWalletService {
                         }
                     }
                 }
-                let current_height = *tip_rx.borrow_and_update();
+                // Wakeup only. The payload is the cache tip, so a rewind is visible.
+                let _watched = *tip_rx.borrow_and_update();
 
-                if current_height > last_height {
-                    let mut prev: Option<crate::compact_block::CompactBlock> = None;
-                    let mut disconnected = false;
-                    for height in (last_height + 1)..=current_height {
-                        let block = match cache.get_compact_block(height) {
-                            Ok(Some(b)) => b,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    target: "lightwalletd::server",
-                                    "SubscribeBlocks chain discontinuity"
-                                );
-                                disconnected = true;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    target: "lightwalletd::server",
-                                    "SubscribeBlocks cache error: {e}"
-                                );
-                                disconnected = true;
-                                break;
-                            }
-                        };
-                        if let Some(ref p) = prev {
-                            if check_successor(p, &block).is_err() {
-                                tracing::warn!(
-                                    target: "lightwalletd::server",
-                                    "SubscribeBlocks chain discontinuity"
-                                );
-                                disconnected = true;
-                                break;
-                            }
-                        }
-                        let proto_block = block.to_proto();
-                        match tokio::time::timeout(
-                            Duration::from_secs(30),
-                            tx.send(Ok(proto_block)),
-                        )
+                let Some((height, hash)) = cache.get_tip().unwrap_or(None) else {
+                    notice.notify_one();
+                    continue;
+                };
+                let block = match cache.get_compact_block(height) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "lightwalletd::server",
+                            "SubscribeBlocks tip has no compact block"
+                        );
+                        notice.notify_one();
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "lightwalletd::server",
+                            "SubscribeBlocks cache error: {e}"
+                        );
+                        notice.notify_one();
+                        continue;
+                    }
+                };
+                let block_target =
+                    tokio::time::timeout(Duration::from_millis(200), rpc.get_block_target())
                         .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => return,
-                            Err(_) => {
-                                tracing::warn!(
-                                    target: "lightwalletd::server",
-                                    "SubscribeBlocks client too slow; dropping subscription"
-                                );
-                                return;
-                            }
-                        }
-                        prev = Some(block);
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(0);
+                let chain_tip = proto::ChainTip {
+                    height,
+                    hash: hash.to_vec(),
+                    timestamp: block.timestamp,
+                    block_target,
+                    prev_hash: block.prev_hash.to_vec(),
+                };
+                match tx.try_send(Ok(chain_tip)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!(
+                            target: "lightwalletd::server",
+                            "SubscribeBlocks client is behind; skipping this tip notice"
+                        );
                     }
-                    if !disconnected {
-                        last_height = current_height;
-                    } else {
-                        // Wait for poller rewind; do not advance the cursor over a mixed fork.
-                        last_height = current_height.min(last_height);
-                    }
-                } else if current_height < last_height {
-                    // Reorg / rewind: reset cursor; next advance streams from new tip path.
-                    last_height = current_height;
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
                 }
+                notice.notify_one();
             }
         });
 
@@ -986,7 +1464,8 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetNoteCommitmentsStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
-        let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
+        let (start, end) =
+            require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
@@ -1013,7 +1492,8 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetNullifiersStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
-        let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
+        let (start, end) =
+            require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
@@ -1030,10 +1510,10 @@ impl DarkFiLightWallet for LightWalletService {
         )))
     }
 
-    /// Get Merkle tree state at a given height.
+    /// Merkle tree at the tip or a retained snapshot.
     ///
-    /// Tip-only: historical / pruned heights return FAILED_PRECONDITION.
-    /// Checkpoints are not retained on disk (GetCheckpointSnapshot is also tip-only).
+    /// Other heights are `FAILED_PRECONDITION`. The status text includes the
+    /// greatest stored snapshot `<=` the request.
     async fn get_tree_state(
         &self,
         request: Request<proto::BlockHeight>,
@@ -1046,128 +1526,105 @@ impl DarkFiLightWallet for LightWalletService {
             .map(|(h, _)| h)
             .unwrap_or(0);
 
-        if height != tip {
-            return Err(Status::failed_precondition(format!(
-                "GetTreeState is tip-only (requested {height}, tip {tip}); \
-                 historical snapshots are not retained"
+        if height == tip {
+            return match self.cache.get_tip_tree_state().map_err(cache_status)? {
+                Some((tree_height, tree_data)) if tree_height == tip => {
+                    let block_hash = block_hash_vec(&self.cache, tree_height);
+                    Ok(Response::new(persisted_tree_state(
+                        tree_height,
+                        tree_data,
+                        block_hash,
+                    )))
+                }
+                Some((tree_height, _)) => Err(Status::failed_precondition(format!(
+                    "Tip Merkle tree height {tree_height} does not match tip {tip}; resync required"
+                ))),
+                None => {
+                    if tip == 0 {
+                        // Nothing indexed yet: not a retained snapshot row.
+                        let tree = darkfi_sdk::crypto::MerkleTree::new(100);
+                        let tree_data = darkfi_serial::serialize(&tree);
+                        let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
+                        Ok(Response::new(proto::TreeState {
+                            height: 0,
+                            tree_data,
+                            block_hash: vec![],
+                            state_root,
+                            is_checkpoint: false,
+                        }))
+                    } else {
+                        Err(Status::not_found(
+                            "Tip Merkle tree not available yet; wait for chain poller to index blocks",
+                        ))
+                    }
+                }
+            };
+        }
+
+        if let Some(tree_data) = self.cache.merkle_snapshot(height).map_err(cache_status)? {
+            let block_hash = block_hash_vec(&self.cache, height);
+            return Ok(Response::new(persisted_tree_state(
+                height, tree_data, block_hash,
             )));
         }
 
-        match self.cache.get_tip_tree_state().map_err(cache_status)? {
-            Some((tree_height, tree_data)) if tree_height == tip => {
-                let block_hash = self
-                    .cache
-                    .get_block_hash(tree_height)
-                    .ok()
-                    .flatten()
-                    .map(|h| h.to_vec())
-                    .unwrap_or_default();
-                let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
-                Ok(Response::new(proto::TreeState {
-                    height: tree_height,
-                    tree_data,
-                    block_hash,
-                    state_root,
-                    is_checkpoint: false,
-                }))
-            }
-            Some((tree_height, _)) => Err(Status::failed_precondition(format!(
-                "Tip Merkle tree height {tree_height} does not match tip {tip}; resync required"
-            ))),
-            None => {
-                if tip == 0 {
-                    // Empty chain: return empty tree.
-                    let tree = darkfi_sdk::crypto::MerkleTree::new(100);
-                    let tree_data = darkfi_serial::serialize(&tree);
-                    let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
-                    Ok(Response::new(proto::TreeState {
-                        height: 0,
-                        tree_data,
-                        block_hash: vec![],
-                        state_root,
-                        is_checkpoint: false,
-                    }))
-                } else {
-                    Err(Status::not_found(
-                        "Tip Merkle tree not available yet; wait for chain poller to index blocks",
-                    ))
-                }
-            }
-        }
+        let lower = self
+            .cache
+            .greatest_snapshot_at_or_below(height)
+            .map_err(cache_status)?
+            .map(|(h, _)| h);
+        Err(snapshot_miss_status(height, tip, lower))
     }
 
     type GetCheckpointSnapshotStream =
         tokio_stream::wrappers::ReceiverStream<Result<proto::CheckpointSnapshot, Status>>;
 
-    /// Stream checkpoint snapshot chunks for instant wallet restore.
+    /// Stream a retained snapshot in 1 MiB `tree_data` chunks.
+    ///
+    /// `preferred_height == 0` is the latest snapshot. Otherwise the greatest
+    /// snapshot at or below that height. `NOT_FOUND` when none exist.
     async fn get_checkpoint_snapshot(
         &self,
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<Self::GetCheckpointSnapshotStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
-        let req = request.into_inner();
-        let cache = Arc::clone(&self.cache);
+        let preferred = request.into_inner().preferred_height;
+        let found = if preferred == 0 {
+            self.cache.latest_snapshot().map_err(cache_status)?
+        } else {
+            self.cache
+                .greatest_snapshot_at_or_below(preferred)
+                .map_err(cache_status)?
+        };
+        let Some((tree_height, tree_data)) = found else {
+            return Err(Status::not_found(
+                "no checkpoint snapshot at or below the requested height",
+            ));
+        };
+
+        let block_hash = block_hash_vec(&self.cache, tree_height);
+        // CompactBlock does not store the header money-tree root. state_root
+        // stays blake3(tree_data); see the snapshot unit test.
+        let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
+        let snapshot_hash = snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         tokio::spawn(async move {
-            let tip = match cache.get_tip() {
-                Ok(Some((h, _))) => h,
-                Ok(None) => 0,
-                Err(e) => {
-                    let _ = tx.send(Err(cache_status(e))).await;
-                    return;
-                }
-            };
-            if req.preferred_height > 0 && req.preferred_height != tip {
-                let _ = tx
-                    .send(Err(Status::failed_precondition(
-                        "GetCheckpointSnapshot is tip-only; historical checkpoints are not retained",
-                    )))
-                    .await;
-                return;
-            }
-
-            let (tree_height, tree_data) = match cache.get_tip_tree_state() {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
-                    let _ = tx
-                        .send(Err(Status::not_found(
-                            "Checkpoint tree state not available",
-                        )))
-                        .await;
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(cache_status(e))).await;
-                    return;
-                }
-            };
-
-            let block_hash = cache
-                .get_block_hash(tree_height)
-                .ok()
-                .flatten()
-                .map(|h| h.to_vec())
-                .unwrap_or_default();
-            let snapshot_hash = snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
-            let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
-
             const CHUNK_SIZE: usize = 1024 * 1024;
             let total_chunks = if tree_data.is_empty() {
                 1
             } else {
                 (tree_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE
-            } as u32;
+            };
 
             for i in 0..total_chunks {
-                let start = (i as usize) * CHUNK_SIZE;
+                let start = i * CHUNK_SIZE;
                 let end = std::cmp::min(start + CHUNK_SIZE, tree_data.len());
                 let chunk_data = if tree_data.is_empty() {
                     vec![]
                 } else {
                     tree_data[start..end].to_vec()
                 };
-
                 let snapshot = proto::CheckpointSnapshot {
                     height: tree_height,
                     block_hash: block_hash.clone(),
@@ -1177,7 +1634,6 @@ impl DarkFiLightWallet for LightWalletService {
                     scan_cursor: tree_height,
                     snapshot_hash: snapshot_hash.clone(),
                 };
-
                 if tx.send(Ok(snapshot)).await.is_err() {
                     break;
                 }
@@ -1373,164 +1829,136 @@ impl DarkFiLightWallet for LightWalletService {
         }
         #[cfg(feature = "fhe-omr")]
         {
-            use tokio_stream::StreamExt;
             let peer = self.peer_ip(&request);
-            let mut stream = request.into_inner();
+            let upload = self
+                .read_detection_key_upload(request.into_inner(), peer, true)
+                .await?;
+            let keys = upload.keys.into_iter().map(Arc::new).collect();
+            let response = self
+                .evaluate_detection_keys(keys, upload.start, upload.end, upload.permit)
+                .await?;
+            return Ok(Response::new(response));
+        }
+    }
 
-            let mut start = 0;
-            let mut end = 0;
-            let mut num_keys = 0;
-            let mut header_received = false;
-            let mut fhe_permit = None;
-
-            let mut current_key = Vec::new();
-            let mut keys = Vec::new();
-
-            loop {
-                let next = tokio::time::timeout(DETECTION_KEY_CHUNK_IDLE_TIMEOUT, stream.next())
-                    .await
-                    .map_err(|_| {
-                        Status::deadline_exceeded("UnifOMR detection-key upload stalled")
-                    })?;
-                let Some(chunk_res) = next else { break };
-                let chunk = chunk_res?;
-
-                if !header_received {
-                    start = chunk.start_height;
-                    end = chunk.end_height;
-                    num_keys = chunk.num_keys;
-                    header_received = true;
-
-                    if num_keys == 0 {
-                        return Err(Status::invalid_argument("num_keys must be > 0"));
-                    }
-                    if num_keys > 16 {
-                        return Err(Status::invalid_argument(
-                            "Too many UnifOMR detection_keys (max 16)",
-                        ));
-                    }
-                    reject_oversized_window(start, end)?;
-                    // Rate-limit and take an FHE slot before accepting the
-                    // ~120 MiB detection-key body so waiters cannot park
-                    // 160 MiB each on the semaphore.
-                    self.check_omr_rate_limit(peer, num_keys)?;
-                    fhe_permit = Some(
-                        Arc::clone(&self.fhe_permits)
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?,
-                    );
-                }
-
-                current_key.extend_from_slice(&chunk.data);
-
-                if current_key.len() > self.max_detection_key_bytes {
-                    return Err(Status::invalid_argument(format!(
-                        "UnifOMR detection key[{}] too large: {} bytes",
-                        keys.len(),
-                        current_key.len()
-                    )));
-                }
-
-                if chunk.key_done {
-                    keys.push(std::mem::take(&mut current_key));
-                }
-
-                let total_key_bytes: usize =
-                    keys.iter().map(|k| k.len()).sum::<usize>() + current_key.len();
-                if total_key_bytes > self.max_detection_keys_total_bytes {
-                    return Err(Status::invalid_argument(format!(
-                        "UnifOMR detection_keys total size too large: {total_key_bytes} bytes \
-                         (max {})",
-                        self.max_detection_keys_total_bytes
-                    )));
-                }
-            }
-
-            if !header_received {
-                return Err(Status::invalid_argument("Empty stream"));
-            }
-            if !current_key.is_empty() {
-                return Err(Status::invalid_argument(
-                    "Stream ended before key_done = true for the last key",
-                ));
-            }
-            if keys.len() != num_keys as usize {
-                return Err(Status::invalid_argument(format!(
-                    "Expected {} keys, but received {}",
-                    num_keys,
-                    keys.len()
-                )));
-            }
-            if keys.iter().any(|k| k.is_empty()) {
-                return Err(Status::invalid_argument("empty detection key not allowed"));
-            }
-
-            // Reject oversized multi-key payloads even when individual keys pass
-            if let Some(max_len) = keys.iter().map(|k| k.len()).max() {
-                if keys.len().saturating_mul(max_len) > self.max_detection_keys_total_bytes {
-                    return Err(Status::invalid_argument(
-                        "UnifOMR detection_keys count×size exceeds total size budget",
-                    ));
-                }
-            }
-
-            let permit = fhe_permit.ok_or_else(|| Status::invalid_argument("Empty stream"))?;
-
-            let (eval_end, range_complete) = digest_evaluable_end(&self.cache, start, end)?;
-            let block_notes = match eval_end {
-                Some(eval_end) => self
-                    .cache
-                    .get_encrypted_notes_range(start, eval_end)
-                    .map_err(cache_status)?,
-                None => Vec::new(),
-            };
-
+    async fn register_detection_key(
+        &self,
+        request: Request<tonic::Streaming<proto::DetectionKeyChunk>>,
+    ) -> Result<Response<proto::DetectionKeyHandle>, Status> {
+        #[cfg(not(feature = "fhe-omr"))]
+        {
+            let _ = request;
+            return Err(Status::unimplemented(
+                "UnifOMR requires the fhe-omr feature",
+            ));
+        }
+        #[cfg(feature = "fhe-omr")]
+        {
+            let peer = self.peer_ip(&request);
+            let upload = self
+                .read_detection_key_upload(request.into_inner(), peer, false)
+                .await?;
             let network_byte = self.network_byte;
-            // Paper-faithful per-message packing: flatten the window once
-            // (key-independent) into per-message order + the slot → height map,
-            // then encode a digest frame per detection key over the same
-            // messages. A window whose flattened message count exceeds
-            // MAX_OMR_MESSAGES is truncated at a whole-height boundary and
-            // reported via `complete = false`.
-            let (encrypted_digest, slot_heights_wire, truncated) =
-                tokio::task::spawn_blocking(move || {
-                    // Held for the computation even if the handler is cancelled.
-                    let _permit = permit;
-                    let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
-                    let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
-                    let (mut messages, mut slot_heights) =
-                        crate::unifomr::flatten_messages(&clue_notes);
-                    let truncated = crate::unifomr::cap_messages_to_whole_heights(
-                        &mut messages,
-                        &mut slot_heights,
-                    );
-                    let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
-                    let digest = if keys.len() == 1 {
-                        crate::unifomr::encode_messages_padded(&detector, &keys[0], &messages)
-                            .map_err(|e| e.to_string())?
-                    } else {
-                        let mut out = Vec::new();
-                        for key in &keys {
-                            let d =
-                                crate::unifomr::encode_messages_padded(&detector, key, &messages)
-                                    .map_err(|e| e.to_string())?;
-                            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-                            out.extend_from_slice(&d);
-                        }
-                        out
-                    };
-                    Ok::<(Vec<u8>, Vec<u8>, bool), String>((digest, slot_heights_wire, truncated))
-                })
-                .await
-                .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
-                .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
+            let max_key_bytes = self.max_detection_key_bytes;
+            let permit = upload.permit;
+            let keys = upload.keys;
+            // Parse off the runtime. Ciphertexts are dropped; the wire bytes go
+            // back through encode_messages_padded on digest so there is one
+            // partial-decrypt path. Do not log the key.
+            let (keys, byte_length) = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
+                let mut byte_length = 0usize;
+                for key in &keys {
+                    let (net, _parsed) =
+                        crate::unifomr::parse_detection_key(key, &detector.params)?;
+                    if net != network_byte {
+                        return Err("detection key network does not match this server".to_string());
+                    }
+                    byte_length += key.len();
+                }
+                Ok::<_, String>((keys, byte_length))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
+            .map_err(|e| Status::invalid_argument(format!("detection key: {e}")))?;
 
-            Ok(Response::new(proto::OmrDigestResponse {
-                encrypted_digest,
-                complete: range_complete && !truncated,
-                slot_heights: slot_heights_wire,
+            let now = detection_pool::unix_now();
+            let expires_unix = detection_pool::expiry_from(now);
+            let pooled = PooledDetectionKey {
+                keys: keys.into_iter().map(Arc::new).collect(),
+                network_byte,
+                expires_unix,
+                byte_length,
+            };
+            let handle = self
+                .pool_lock()?
+                .insert(pooled, max_key_bytes, now)
+                .map_err(|e| match e {
+                    PoolReject::Full => Status::resource_exhausted("detection key pool is full"),
+                    PoolReject::TooLarge => {
+                        Status::invalid_argument("detection key exceeds the size cap")
+                    }
+                    PoolReject::Empty => Status::invalid_argument("empty detection key"),
+                })?;
+            Ok(Response::new(proto::DetectionKeyHandle {
+                handle: handle.to_vec(),
+                expires_unix,
             }))
+        }
+    }
+
+    async fn get_unif_omr_digest_from_pool(
+        &self,
+        request: Request<proto::PoolDigestRequest>,
+    ) -> Result<Response<proto::OmrDigestResponse>, Status> {
+        let peer = self.peer_ip(&request);
+        let req = request.into_inner();
+        if req.handle.len() != 32 {
+            return Err(Status::invalid_argument(
+                "detection key handle must be 32 bytes",
+            ));
+        }
+        let mut handle = [0u8; 32];
+        handle.copy_from_slice(&req.handle);
+        // Same OMR limiter as GetUnifOmrDigest. A miss still costs one credit
+        // so handle scanning cannot skip the limiter. Do not log the handle.
+        self.check_omr_rate_limit(peer, 1)?;
+        let pooled = {
+            let mut pool = self.pool_lock()?;
+            pool.lookup(&handle, detection_pool::unix_now())
+        };
+        let Some(pooled) = pooled else {
+            return Err(Status::not_found(
+                "detection key handle not found or expired",
+            ));
+        };
+        if pooled.network_byte != self.network_byte {
+            return Err(Status::invalid_argument(
+                "detection key network does not match this server",
+            ));
+        }
+        let extra = (pooled.keys.len() as u32).saturating_sub(1);
+        if extra > 0 {
+            self.check_omr_rate_limit(peer, extra)?;
+        }
+        #[cfg(not(feature = "fhe-omr"))]
+        {
+            let _ = (pooled, req);
+            return Err(Status::unimplemented(
+                "UnifOMR requires the fhe-omr feature",
+            ));
+        }
+        #[cfg(feature = "fhe-omr")]
+        {
+            let permit = Arc::clone(&self.fhe_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| Status::resource_exhausted("FHE workers unavailable"))?;
+            let response = self
+                .evaluate_detection_keys(pooled.keys, req.start_height, req.end_height, permit)
+                .await?;
+            Ok(Response::new(response))
         }
     }
 
@@ -1899,5 +2327,447 @@ mod tests {
             client_ip_from_forwarded("203.0.113.9", &trusted),
             "203.0.113.9".parse::<IpAddr>().ok()
         );
+    }
+
+    fn test_block(height: u32, prev: u8) -> crate::compact_block::CompactBlock {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&height.to_be_bytes());
+        crate::compact_block::CompactBlock {
+            height,
+            hash,
+            prev_hash: [prev; 32],
+            timestamp: 1_000 + height as u64,
+            txs: vec![],
+        }
+    }
+
+    fn test_service(cache: Arc<Cache>) -> (LightWalletService, tokio::sync::watch::Sender<u32>) {
+        let (tx, rx) = tokio::sync::watch::channel(0u32);
+        let endpoint = url::Url::parse("http://127.0.0.1:9").unwrap();
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(endpoint));
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10_000,
+            10_000,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+        (svc, tx)
+    }
+
+    #[test]
+    fn padded_range_accepts_power_of_two_bucket_and_rejects_short() {
+        // Exactly 1024, ending at the tip.
+        assert!(padded_range_rejection(0, 1023, 1023, MAX_BLOCKS_PER_REQUEST).is_none());
+        // Power of two, not aligned to zero, ending before the tip.
+        assert!(padded_range_rejection(100, 1123, 5_000, MAX_BLOCKS_PER_REQUEST).is_none());
+        assert!(padded_range_rejection(0, 8191, 8191, MAX_BLOCKS_PER_REQUEST).is_none());
+        // Short unpadded range.
+        assert!(padded_range_rejection(0, 100, 10_000, MAX_BLOCKS_PER_REQUEST).is_some());
+        // 512 is a power of two but below the 1024 minimum.
+        assert!(padded_range_rejection(0, 511, 10_000, MAX_BLOCKS_PER_REQUEST).is_some());
+        // 1025 is not a power of two.
+        assert!(padded_range_rejection(0, 1024, 10_000, MAX_BLOCKS_PER_REQUEST).is_some());
+        // 16384 is a power of two but above max_range (10_000).
+        assert!(padded_range_rejection(0, 16_383, 100_000, MAX_BLOCKS_PER_REQUEST).is_some());
+        // Ends past the tip.
+        assert!(padded_range_rejection(0, 1023, 100, MAX_BLOCKS_PER_REQUEST).is_some());
+        assert!(padded_range_rejection(5, 4, 10, MAX_BLOCKS_PER_REQUEST).is_some());
+
+        // A short cursor near a high tip pads to a bucket the server accepts.
+        let (padded_start, padded_end) = pad_block_range(4990, 5000, 5000);
+        assert!(padded_start <= 4990 && padded_end == 5000);
+        assert!(
+            padded_range_rejection(padded_start, padded_end, 5000, MAX_BLOCKS_PER_REQUEST)
+                .is_none()
+        );
+        let span = padded_end - padded_start + 1;
+        assert!(span >= MIN_PADDED_RANGE_SPAN && span.is_power_of_two());
+        // The unpadded cursor itself is still rejected.
+        assert!(padded_range_rejection(4990, 5000, 5000, MAX_BLOCKS_PER_REQUEST).is_some());
+        // A chain shorter than one bucket is served whole, from genesis only.
+        let (short_start, short_end) = pad_block_range(0, 10, 10);
+        assert_eq!((short_start, short_end), (0, 10));
+        assert!(
+            padded_range_rejection(short_start, short_end, 10, MAX_BLOCKS_PER_REQUEST).is_none()
+        );
+        assert!(padded_range_rejection(5, 10, 10, MAX_BLOCKS_PER_REQUEST).is_some());
+    }
+
+    #[test]
+    fn padded_range_accepts_client_buckets_cut_at_the_tip() {
+        // Client pad_block_range(4990, 5000, 5000): bucket 4096..=5119 cut at the tip.
+        assert!(padded_range_rejection(4096, 5000, 5000, MAX_BLOCKS_PER_REQUEST).is_none());
+        // The client's tip trails ours by a few blocks.
+        assert!(padded_range_rejection(4096, 5000, 5003, MAX_BLOCKS_PER_REQUEST).is_none());
+        // Two 1024 buckets cut at the tip (client pad of 1500..=2500).
+        assert!(padded_range_rejection(1024, 2600, 2600, MAX_BLOCKS_PER_REQUEST).is_none());
+        // Two full 1024 buckets.
+        assert!(padded_range_rejection(1024, 3071, 50_000, MAX_BLOCKS_PER_REQUEST).is_none());
+        // A partial bucket far below the tip publishes the cursor.
+        assert!(padded_range_rejection(4096, 4990, 50_000, MAX_BLOCKS_PER_REQUEST).is_some());
+        assert!(padded_range_rejection(4096, 5000, 5065, MAX_BLOCKS_PER_REQUEST).is_some());
+        assert!(padded_range_rejection(4096, 5000, 5064, MAX_BLOCKS_PER_REQUEST).is_none());
+        // A partial bucket must start on its boundary.
+        assert!(padded_range_rejection(4097, 5000, 5000, MAX_BLOCKS_PER_REQUEST).is_some());
+        assert!(padded_range_rejection(1536, 2600, 2600, MAX_BLOCKS_PER_REQUEST).is_some());
+    }
+
+    #[test]
+    fn require_padded_block_range_rejects_unpadded_against_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        assert!(require_padded_block_range(&cache, 0, 1023).is_err());
+
+        cache.insert_compact_block(&test_block(3000, 0)).unwrap();
+        assert_eq!(
+            require_padded_block_range(&cache, 0, 1023).unwrap(),
+            (0, 1023)
+        );
+        assert!(require_padded_block_range(&cache, 0, 100).is_err());
+        // span = 3000 - 1977 + 1 = 1024, end == tip.
+        assert!(require_padded_block_range(&cache, 1977, 3000).is_ok());
+        assert!(require_padded_block_range(&cache, 1976, 3000).is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_snapshot_at_or_below_birthday_and_tree_state_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        cache.insert_compact_block(&test_block(0, 0)).unwrap();
+        cache.insert_compact_block(&test_block(1, 1)).unwrap();
+        cache.insert_compact_block(&test_block(2, 2)).unwrap();
+        let (svc, _) = test_service(Arc::clone(&cache));
+
+        let miss =
+            DarkFiLightWallet::get_tree_state(&svc, Request::new(proto::BlockHeight { height: 1 }))
+                .await
+                .unwrap_err();
+        assert_eq!(miss.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            miss.message().contains("greatest snapshot <= 1 is 0"),
+            "status text: {}",
+            miss.message()
+        );
+
+        let tip_state =
+            DarkFiLightWallet::get_tree_state(&svc, Request::new(proto::BlockHeight { height: 2 }))
+                .await
+                .unwrap()
+                .into_inner();
+        assert!(tip_state.is_checkpoint);
+        assert_eq!(tip_state.height, 2);
+
+        let snap0 =
+            DarkFiLightWallet::get_tree_state(&svc, Request::new(proto::BlockHeight { height: 0 }))
+                .await
+                .unwrap()
+                .into_inner();
+        assert!(snap0.is_checkpoint);
+        assert_eq!(snap0.height, 0);
+
+        use tokio_stream::StreamExt;
+        let mut stream = DarkFiLightWallet::get_checkpoint_snapshot(
+            &svc,
+            Request::new(proto::CheckpointRequest {
+                preferred_height: 1,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut tree_data = Vec::new();
+        let mut height = None;
+        let mut state_root = Vec::new();
+        let mut snapshot_hash = Vec::new();
+        let mut scan_cursor = 0u32;
+        while let Some(chunk) = stream.next().await {
+            let snap = chunk.unwrap();
+            if height.is_none() {
+                height = Some(snap.height);
+                state_root = snap.state_root.clone();
+                snapshot_hash = snap.snapshot_hash.clone();
+                scan_cursor = snap.scan_cursor;
+            }
+            assert!(snap.nullifier_index.is_empty());
+            assert_eq!(snap.scan_cursor, snap.height);
+            tree_data.extend_from_slice(&snap.tree_data);
+        }
+        let height = height.unwrap();
+        assert!(height <= 1, "birthday 1 must not receive a later snapshot");
+        assert_eq!(height, 0);
+        assert_eq!(scan_cursor, height);
+        assert_eq!(
+            snapshot_hash,
+            snapshot_integrity_hash(height, &tree_data, &[]).to_vec()
+        );
+        // Gap: CompactBlock has no block-header money-tree / coin root.
+        // state_root stays blake3(tree_data). Do not invent a second root
+        // until darkfid exposes that field on the cached compact block.
+        assert_eq!(state_root, blake3::hash(&tree_data).as_bytes().to_vec());
+
+        let mut latest = DarkFiLightWallet::get_checkpoint_snapshot(
+            &svc,
+            Request::new(proto::CheckpointRequest {
+                preferred_height: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let first = latest.next().await.unwrap().unwrap();
+        assert_eq!(
+            first.height, 2,
+            "preferred 0 is the latest snapshot, the tip"
+        );
+        assert_eq!(first.scan_cursor, 2);
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = Arc::new(Cache::new(empty_dir.path().to_str().unwrap()).unwrap());
+        let (empty_svc, _) = test_service(empty);
+        let missing = DarkFiLightWallet::get_checkpoint_snapshot(
+            &empty_svc,
+            Request::new(proto::CheckpointRequest {
+                preferred_height: 5,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn pool_digest_missing_and_expired_handles_are_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (svc, _) = test_service(cache);
+
+        let missing = DarkFiLightWallet::get_unif_omr_digest_from_pool(
+            &svc,
+            Request::new(proto::PoolDigestRequest {
+                handle: vec![9u8; 32],
+                start_height: 0,
+                end_height: 10,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        let bad_len = DarkFiLightWallet::get_unif_omr_digest_from_pool(
+            &svc,
+            Request::new(proto::PoolDigestRequest {
+                handle: vec![1, 2, 3],
+                start_height: 0,
+                end_height: 10,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad_len.code(), tonic::Code::InvalidArgument);
+
+        let handle = {
+            let mut pool = svc.detection_pool.lock().unwrap();
+            pool.insert(
+                PooledDetectionKey {
+                    keys: vec![Arc::new(vec![1, 2, 3])],
+                    network_byte: 1,
+                    expires_unix: 10,
+                    byte_length: 3,
+                },
+                svc.max_detection_key_bytes,
+                0,
+            )
+            .unwrap()
+        };
+        let expired = DarkFiLightWallet::get_unif_omr_digest_from_pool(
+            &svc,
+            Request::new(proto::PoolDigestRequest {
+                handle: handle.to_vec(),
+                start_height: 0,
+                end_height: 10,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(expired.code(), tonic::Code::NotFound);
+        assert!(
+            expired.message().contains("expired") || expired.message().contains("not found"),
+            "{}",
+            expired.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_blocks_skips_unsent_tip_instead_of_dropping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (svc, tip_tx) = test_service(Arc::clone(&cache));
+        let notice = Arc::clone(&svc.tip_notice);
+
+        let mut stream = DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        cache.insert_compact_block(&test_block(1, 0x11)).unwrap();
+        tip_tx.send(1).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notice.notified())
+            .await
+            .expect("first tip notice blocked");
+
+        // Client has not read. The one-slot buffer is full; this must not
+        // wait 30s or close the subscription.
+        cache.insert_compact_block(&test_block(2, 0x22)).unwrap();
+        tip_tx.send(2).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notice.notified())
+            .await
+            .expect("slow client caused a 30s drop or a blocked send");
+
+        use tokio_stream::StreamExt;
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("subscription closed")
+            .expect("subscription ended")
+            .unwrap();
+        assert_eq!(first.height, 1);
+        assert_eq!(first.prev_hash, vec![0x11; 32]);
+        assert_eq!(first.hash, test_block(1, 0x11).hash.to_vec());
+
+        cache.insert_compact_block(&test_block(3, 0x33)).unwrap();
+        tip_tx.send(3).unwrap();
+        let third = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("subscription dropped after a skipped tip")
+            .expect("subscription ended")
+            .unwrap();
+        assert_eq!(third.height, 3);
+        assert_eq!(third.prev_hash, vec![0x33; 32]);
+        assert_eq!(third.hash, test_block(3, 0x33).hash.to_vec());
+    }
+
+    #[tokio::test]
+    async fn compact_output_bodies_are_one_per_output_in_a_padded_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let mut prev_hash = [0u8; 32];
+        for height in 0u32..1023 {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&height.to_be_bytes());
+            cache
+                .insert_compact_block(&crate::compact_block::CompactBlock {
+                    height,
+                    hash,
+                    prev_hash,
+                    timestamp: height as u64,
+                    txs: vec![],
+                })
+                .unwrap();
+            prev_hash = hash;
+        }
+        let coin_a = [0x11u8; 32];
+        let coin_b = [0x22u8; 32];
+        let mut tip_hash = [0u8; 32];
+        tip_hash[..4].copy_from_slice(&1023u32.to_be_bytes());
+        cache
+            .insert_compact_block(&crate::compact_block::CompactBlock {
+                height: 1023,
+                hash: tip_hash,
+                prev_hash,
+                timestamp: 1023,
+                txs: vec![crate::compact_block::CompactTx {
+                    tx_hash: [0x44; 32],
+                    outputs: vec![
+                        crate::compact_block::CompactOutput {
+                            coin: coin_a,
+                            encrypted_note: vec![1, 2],
+                            value_commit: vec![3],
+                            token_commit: [4; 32],
+                            omr_clue: vec![5],
+                            omr_metadata_enc: vec![6],
+                        },
+                        crate::compact_block::CompactOutput {
+                            coin: coin_b,
+                            encrypted_note: vec![7],
+                            value_commit: vec![],
+                            token_commit: [8; 32],
+                            omr_clue: vec![],
+                            omr_metadata_enc: vec![9, 9],
+                        },
+                    ],
+                    nullifiers: vec![[0xAB; 32]],
+                    fee: 7,
+                }],
+            })
+            .unwrap();
+        let (svc, _) = test_service(Arc::clone(&cache));
+
+        let rejected = DarkFiLightWallet::get_compact_output_bodies(
+            &svc,
+            Request::new(proto::BlockRange {
+                start_height: 0,
+                end_height: 10,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+
+        use tokio_stream::StreamExt;
+        let mut stream = DarkFiLightWallet::get_compact_output_bodies(
+            &svc,
+            Request::new(proto::BlockRange {
+                start_height: 0,
+                end_height: 1023,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut bodies = Vec::new();
+        while let Some(item) = stream.next().await {
+            bodies.push(item.expect("connected padded range"));
+        }
+        assert_eq!(
+            bodies.len(),
+            2,
+            "one message per output, nullifiers not included"
+        );
+        assert_eq!(bodies[0].height, 1023);
+        assert_eq!(bodies[0].hash, tip_hash.to_vec());
+        assert_eq!(bodies[0].prev_hash, prev_hash.to_vec());
+        assert_eq!(bodies[0].coin, coin_a.to_vec());
+        assert_eq!(bodies[0].encrypted_note, vec![1, 2]);
+        assert_eq!(bodies[0].omr_clue, vec![5]);
+        assert_eq!(bodies[0].omr_metadata_enc, vec![6]);
+        assert_eq!(bodies[0].tx_hash, vec![0x44; 32]);
+        assert_eq!(bodies[1].coin, coin_b.to_vec());
+        assert_eq!(bodies[1].hash, tip_hash.to_vec());
+        assert!(bodies[1].omr_clue.is_empty());
+    }
+
+    #[cfg(feature = "fhe-omr")]
+    #[test]
+    fn clue_window_cache_keeps_notes_not_digest_bytes() {
+        let mut cache = ClueWindowCache::new();
+        let notes = vec![(
+            4u32,
+            vec![crate::omr_detector::NoteForDetection {
+                encrypted_note: vec![1, 2, 3],
+                omr_clue: vec![9],
+            }],
+        )];
+        let hash = [7u8; 32];
+        cache.insert(0, 1023, hash, notes.clone());
+        let hit = cache.get(0, 1023, hash).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].0, 4);
+        assert_eq!(hit[0].1[0].encrypted_note, notes[0].1[0].encrypted_note);
+        assert_eq!(hit[0].1[0].omr_clue, notes[0].1[0].omr_clue);
+        assert!(cache.get(0, 1023, [8u8; 32]).is_none());
     }
 }

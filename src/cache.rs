@@ -21,6 +21,8 @@
 //! Uses sled 0.34 to store:
 //! - Compact blocks indexed by height
 //! - Block hash ↔ height bidirectional index
+//! - Money-tree snapshots (`merkle_snapshots`): one serialized tree every
+//!   1024 blocks, plus the current tip. Prune does not delete these.
 //! - Server metadata (chain tip, version)
 //!
 //! All data in this cache is derived from the darkfid full node and can
@@ -47,6 +49,11 @@ const BLOCK_HASHES_TREE: &str = "lightwalletd_block_hashes";
 const HASH_TO_HEIGHT_TREE: &str = "lightwalletd_hash_to_height";
 const NULLIFIERS_TREE: &str = "lightwalletd_nullifiers";
 const COINS_TREE: &str = "lightwalletd_coins";
+/// Height (u32 big-endian) → serialized `MerkleTree`.
+///
+/// Disk: one tree per [`MERKLE_SNAPSHOT_INTERVAL`] blocks, plus the current
+/// tip. A non-aligned previous tip is replaced when the chain advances.
+const MERKLE_SNAPSHOTS_TREE: &str = "lightwalletd_merkle_snapshots";
 const OMR_CLUE_HINTS_TREE: &str = "lightwalletd_omr_clue_hints";
 const OMR_CLUE_HINT_META_TREE: &str = "lightwalletd_omr_clue_hint_meta";
 // v2: values are `[key_version u64 LE || clue_pk]` (monotonic anti-replay).
@@ -78,6 +85,13 @@ const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor_v1";
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
 
+/// Write a Money-tree snapshot every this many blocks, and always at the tip.
+///
+/// Matches the client's minimum padded bucket. Disk cost is one serialized
+/// `MerkleTree` per 1024 blocks, plus the current tip (replaced in place when
+/// the tip is not itself a 1024 boundary).
+pub const MERKLE_SNAPSHOT_INTERVAL: u32 = 1024;
+
 /// Cache layer backed by sled, storing compact blocks and indices.
 pub struct Cache {
     /// The sled database
@@ -92,6 +106,9 @@ pub struct Cache {
     nullifiers: sled::Tree,
     /// Coin commitments per height: height (u32 big-endian) → serialized Vec<[u8; 32]>
     coins: sled::Tree,
+    /// Money-tree snapshots: height (u32 big-endian) → serialized MerkleTree.
+    /// Not deleted by [`Cache::prune_below_height`].
+    merkle_snapshots: sled::Tree,
     /// Pending OMR clues keyed by tx hash (32 bytes) → clue bytes
     omr_clue_hints: sled::Tree,
     /// Parallel tree: tx_hash → u64 LE unix timestamp when the hint was stored (S21).
@@ -118,6 +135,7 @@ impl Cache {
         let hash_to_height = db.open_tree(HASH_TO_HEIGHT_TREE)?;
         let nullifiers = db.open_tree(NULLIFIERS_TREE)?;
         let coins = db.open_tree(COINS_TREE)?;
+        let merkle_snapshots = db.open_tree(MERKLE_SNAPSHOTS_TREE)?;
         let omr_clue_hints = db.open_tree(OMR_CLUE_HINTS_TREE)?;
         let omr_clue_hint_meta = db.open_tree(OMR_CLUE_HINT_META_TREE)?;
         let omr_clue_pubkeys = db.open_tree(OMR_CLUE_PUBKEYS_TREE)?;
@@ -131,6 +149,7 @@ impl Cache {
             hash_to_height,
             nullifiers,
             coins,
+            merkle_snapshots,
             omr_clue_hints,
             omr_clue_hint_meta,
             omr_clue_pubkeys,
@@ -139,6 +158,10 @@ impl Cache {
         };
         cache.ensure_cache_format()?;
         cache.verify_tip_readable()?;
+        // Old caches have the tip tree only in META. Index it so checkpoint
+        // reads see a snapshot before the next block arrives. Missing interval
+        // rows appear as later heights are appended or the tip is rebuilt.
+        cache.index_existing_tip_snapshot()?;
         // Best-effort prune of orphan hints left from previous runs (S21).
         let _ = cache.prune_expired_omr_clue_hints();
         Ok(cache)
@@ -862,7 +885,9 @@ impl Cache {
             self.meta.remove(META_TIP_HASH)?;
         }
 
-        // Rebuild tip Merkle tree through the new tip (honest tip-only snapshot).
+        // Drop snapshots above the rewind point, then rebuild the tip tree
+        // (and any interval snapshots still covered) from the coins that remain.
+        self.delete_snapshots_above(height)?;
         self.rebuild_tip_merkle_tree(height)?;
 
         // Flush to disk
@@ -879,7 +904,8 @@ impl Cache {
 
     /// Serialized tip Money Merkle tree + height it corresponds to.
     ///
-    /// Historical heights are not retained; callers should only request tip.
+    /// This is the latest snapshot (`META_TIP_MERKLE_*`). Interval history lives
+    /// in [`Self::merkle_snapshot`].
     pub fn get_tip_tree_state(&self) -> Result<Option<(u32, Vec<u8>)>> {
         let Some(height_bytes) = self.meta.get(META_TIP_MERKLE_HEIGHT)? else {
             return Ok(None);
@@ -936,7 +962,125 @@ impl Cache {
             .insert(META_TIP_MERKLE_TREE, tree_data.as_slice())?;
         self.meta
             .insert(META_TIP_MERKLE_HEIGHT, &height.to_be_bytes())?;
+        // The tip keys are the latest snapshot. Also index the row so checkpoint
+        // scans and interval history share one tree.
+        self.record_tree_snapshot(height, &tree_data, true)
+    }
+
+    /// Persist `tree_data` when `height` is a 1024-block boundary or the tip.
+    ///
+    /// A previous tip that is not on an interval boundary is removed so disk
+    /// stays one serialized tree per 1024 blocks, plus the current tip.
+    fn record_tree_snapshot(&self, height: u32, tree_data: &[u8], is_tip: bool) -> Result<()> {
+        if height % MERKLE_SNAPSHOT_INTERVAL == 0 || is_tip {
+            self.merkle_snapshots
+                .insert(&height.to_be_bytes(), tree_data)?;
+        }
+        if is_tip {
+            self.drop_non_interval_snapshots_except(height)?;
+        }
         Ok(())
+    }
+
+    fn drop_non_interval_snapshots_except(&self, keep: u32) -> Result<()> {
+        let stale: Vec<sled::IVec> = self
+            .merkle_snapshots
+            .iter()
+            .filter_map(|item| item.ok())
+            .filter_map(|(key, _)| {
+                let height = height_from_snapshot_key(key.as_ref())?;
+                if height != keep && height % MERKLE_SNAPSHOT_INTERVAL != 0 {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in stale {
+            self.merkle_snapshots.remove(key)?;
+        }
+        Ok(())
+    }
+
+    fn delete_snapshots_above(&self, height: u32) -> Result<()> {
+        let Some(start) = height.checked_add(1) else {
+            return Ok(());
+        };
+        let keys: Vec<sled::IVec> = self
+            .merkle_snapshots
+            .range(start.to_be_bytes()..)
+            .filter_map(|item| item.ok().map(|(key, _)| key))
+            .collect();
+        for key in keys {
+            self.merkle_snapshots.remove(key)?;
+        }
+        Ok(())
+    }
+
+    fn clear_merkle_snapshots(&self) -> Result<()> {
+        let keys: Vec<sled::IVec> = self
+            .merkle_snapshots
+            .iter()
+            .filter_map(|item| item.ok().map(|(key, _)| key))
+            .collect();
+        for key in keys {
+            self.merkle_snapshots.remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// If META already holds a tip tree (pre-snapshot cache), index that one row.
+    fn index_existing_tip_snapshot(&self) -> Result<()> {
+        let Some((height, data)) = self.get_tip_tree_state()? else {
+            return Ok(());
+        };
+        if self.merkle_snapshots.get(height.to_be_bytes())?.is_none() {
+            self.merkle_snapshots
+                .insert(&height.to_be_bytes(), data.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot bytes at `height`, if that row was retained.
+    pub fn merkle_snapshot(&self, height: u32) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .merkle_snapshots
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    /// Greatest retained snapshot with height <= `height`.
+    pub fn greatest_snapshot_at_or_below(&self, height: u32) -> Result<Option<(u32, Vec<u8>)>> {
+        let mut range = self.merkle_snapshots.range(..=height.to_be_bytes());
+        let Some(item) = range.next_back() else {
+            return Ok(None);
+        };
+        let (key, value) = item?;
+        let Some(found) = height_from_snapshot_key(key.as_ref()) else {
+            return Ok(None);
+        };
+        if found > height {
+            return Ok(None);
+        }
+        Ok(Some((found, value.to_vec())))
+    }
+
+    /// Latest retained snapshot. Once blocks are indexed this is the tip.
+    pub fn latest_snapshot(&self) -> Result<Option<(u32, Vec<u8>)>> {
+        self.greatest_snapshot_at_or_below(u32::MAX)
+    }
+
+    #[cfg(test)]
+    fn snapshot_heights(&self) -> Result<Vec<u32>> {
+        let mut heights = Vec::new();
+        for item in self.merkle_snapshots.iter() {
+            let (key, _) = item?;
+            if let Some(height) = height_from_snapshot_key(key.as_ref()) {
+                heights.push(height);
+            }
+        }
+        heights.sort_unstable();
+        Ok(heights)
     }
 
     fn append_coins_to_tip_tree(&self, height: u32, coins: &[[u8; 32]]) -> Result<()> {
@@ -944,21 +1088,49 @@ impl Cache {
         for coin in coins {
             tree.append(Self::coin_to_merkle_node(coin)?);
         }
+        // `height` is the new tip on this path (historical backfill rebuilds).
+        // Interval rows (height % 1024 == 0) stay; the previous non-aligned tip
+        // is replaced inside `store_tip_tree`.
         self.store_tip_tree(height, &tree)
     }
 
     fn rebuild_tip_merkle_tree(&self, tip_height: u32) -> Result<()> {
-        let mut tree = Self::empty_tip_tree();
         if tip_height == 0 && self.get_compact_block(0)?.is_none() {
             self.meta.remove(META_TIP_MERKLE_TREE)?;
             self.meta.remove(META_TIP_MERKLE_HEIGHT)?;
+            self.clear_merkle_snapshots()?;
             return Ok(());
         }
+
+        self.delete_snapshots_above(tip_height)?;
+
         let ranges = self.get_coins_range(0, tip_height)?;
-        for (_h, coins) in ranges {
-            for coin in coins {
-                tree.append(Self::coin_to_merkle_node(&coin)?);
+        let mut tree = Self::empty_tip_tree();
+        let mut idx = 0usize;
+        let mut boundary = 0u32;
+        loop {
+            while idx < ranges.len() && ranges[idx].0 <= boundary {
+                for coin in &ranges[idx].1 {
+                    tree.append(Self::coin_to_merkle_node(coin)?);
+                }
+                idx += 1;
             }
+            if boundary % MERKLE_SNAPSHOT_INTERVAL == 0 {
+                let tree_data = darkfi_serial::serialize(&tree);
+                self.merkle_snapshots
+                    .insert(&boundary.to_be_bytes(), tree_data.as_slice())?;
+            }
+            if boundary >= tip_height {
+                break;
+            }
+            let next = boundary.saturating_add(MERKLE_SNAPSHOT_INTERVAL);
+            boundary = if next > tip_height { tip_height } else { next };
+        }
+        while idx < ranges.len() {
+            for coin in &ranges[idx].1 {
+                tree.append(Self::coin_to_merkle_node(coin)?);
+            }
+            idx += 1;
         }
         self.store_tip_tree(tip_height, &tree)
     }
@@ -1036,14 +1208,14 @@ impl Cache {
         Ok(result)
     }
 
-    /// Prune all cached data below the given height.
+    /// Prune compact blocks, hashes, nullifiers, and coins below `min_height`.
     ///
-    /// Removes compact blocks, block hashes, nullifiers, and coins for all
-    /// heights strictly below `min_height`. Used to prevent unbounded disk
-    /// growth on long-running servers.
+    /// Does **not** delete Money-tree snapshots. A pruned server can still hand
+    /// a wallet a tree. Disk cost of the rows that remain: one serialized
+    /// `MerkleTree` per 1024 blocks, plus the current tip.
     ///
-    /// The tip metadata is NOT modified — only historical data is removed.
-    /// Clients requesting pruned heights will receive empty responses.
+    /// The tip metadata is NOT modified — only historical block data is removed.
+    /// Clients requesting pruned heights will receive empty block responses.
     pub fn prune_below_height(&self, min_height: u32) -> Result<()> {
         if min_height == 0 {
             return Ok(());
@@ -1108,6 +1280,11 @@ impl Cache {
         self.db.flush()?;
         Ok(())
     }
+}
+
+fn height_from_snapshot_key(key: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = key.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
 }
 
 /// Parse stored hint bytes into `(explicit_output_index, clue)`.
@@ -1519,6 +1696,52 @@ mod tests {
         assert!(cache.get_compact_block(49).unwrap().is_some());
         // Block 99 should still exist
         assert!(cache.get_compact_block(99).unwrap().is_some());
+    }
+
+    #[test]
+    fn snapshot_retained_on_interval_and_tip_rewind_drops_higher_prune_keeps() {
+        // CompactBlock does not carry the block header's money-tree root, so
+        // snapshot state_root stays blake3(tree_data). See the server snapshot
+        // test — do not invent a second root here.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+
+        for h in 0..=(MERKLE_SNAPSHOT_INTERVAL + 1) {
+            cache.insert_compact_block(&make_empty_block(h)).unwrap();
+        }
+        let tip = MERKLE_SNAPSHOT_INTERVAL + 1;
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, tip);
+        assert_eq!(
+            cache.snapshot_heights().unwrap(),
+            vec![0, MERKLE_SNAPSHOT_INTERVAL, tip],
+            "interval boundary and the current tip, not every height"
+        );
+        let (meta_h, meta_tree) = cache.get_tip_tree_state().unwrap().unwrap();
+        assert_eq!(meta_h, tip);
+        assert_eq!(cache.merkle_snapshot(tip).unwrap().unwrap(), meta_tree);
+
+        cache.rewind_to_height(1000).unwrap();
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, 1000);
+        assert!(cache.get_compact_block(tip).unwrap().is_none());
+        assert!(cache
+            .merkle_snapshot(MERKLE_SNAPSHOT_INTERVAL)
+            .unwrap()
+            .is_none());
+        assert!(cache.merkle_snapshot(tip).unwrap().is_none());
+        assert_eq!(cache.snapshot_heights().unwrap(), vec![0, 1000]);
+        assert!(cache.merkle_snapshot(0).unwrap().is_some());
+
+        cache.prune_below_height(10).unwrap();
+        assert!(
+            cache.get_compact_block(0).unwrap().is_none(),
+            "prune drops the compact block"
+        );
+        assert!(
+            cache.merkle_snapshot(0).unwrap().is_some(),
+            "prune keeps the snapshot"
+        );
+        assert!(cache.merkle_snapshot(1000).unwrap().is_some());
+        assert_eq!(cache.snapshot_heights().unwrap(), vec![0, 1000]);
     }
 
     #[test]

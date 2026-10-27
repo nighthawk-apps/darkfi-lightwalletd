@@ -311,12 +311,13 @@ async fn testnet_nullifiers_and_commitments() {
         .into_inner();
     let tip = info.block_height;
     let start = tip.saturating_sub(10);
+    let (start, end) = darkfi_lightwalletd::server::pad_block_range(start, tip, tip);
 
     // GetNullifiers
     let mut null_stream = client
         .get_nullifiers(proto::BlockRange {
             start_height: start,
-            end_height: tip,
+            end_height: end,
         })
         .await
         .expect("GetNullifiers failed")
@@ -327,14 +328,14 @@ async fn testnet_nullifiers_and_commitments() {
     }
     println!(
         "✅ GetNullifiers [{}, {}]: {} messages",
-        start, tip, null_count
+        start, end, null_count
     );
 
     // GetNoteCommitments
     let mut commit_stream = client
         .get_note_commitments(proto::BlockRange {
             start_height: start,
-            end_height: tip,
+            end_height: end,
         })
         .await
         .expect("GetNoteCommitments failed")
@@ -345,6 +346,6 @@ async fn testnet_nullifiers_and_commitments() {
     }
     println!(
         "✅ GetNoteCommitments [{}, {}]: {} messages",
-        start, tip, commit_count
+        start, end, commit_count
     );
 }
