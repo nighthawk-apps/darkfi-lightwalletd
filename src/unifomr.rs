@@ -566,20 +566,12 @@ pub fn decoy_clue_public_key(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> Ve
     serialize_public_key(&pk)
 }
 
-/// Deterministic plausible `key_version` for a decoy directory entry.
+/// `key_version` returned for a decoy directory entry.
 ///
-/// Real registrations use unix timestamps and never change between lookups,
-/// so a decoy must be constant per (pk, pepper) as well. `anchor` is the
-/// pepper's creation time (see `Cache::get_or_create_clue_dir_pepper_anchor`);
-/// the decoy is drawn from the 180 days before it.
-pub fn decoy_key_version(payment_pubkey: &[u8; 32], pepper: &[u8; 32], anchor: u64) -> u64 {
-    const SPAN_SECS: u64 = 180 * 86_400;
-    let mut h = blake3::Hasher::new_keyed(pepper);
-    h.update(UNIFOMR_CLUE_DIR_DECOY);
-    h.update(b"-key-version");
-    h.update(payment_pubkey);
-    let n = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
-    anchor.saturating_sub(n % SPAN_SECS)
+/// Wallets register with the constant 1. A timestamp here would separate
+/// real rows from decoys.
+pub fn decoy_key_version() -> u64 {
+    1
 }
 
 /// Public clue key derived from wallet (sender needs this — typically from address metadata).
@@ -1580,29 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn decoy_key_version_is_plausible_and_stable() {
-        let pk = [0x11u8; 32];
-        let pepper = [0x22u8; 32];
-        let dir = tempfile::tempdir().unwrap();
-        let cache = crate::cache::Cache::new(dir.path().to_str().unwrap()).unwrap();
-        let created = 1_780_000_000u64;
-        let anchor = cache
-            .get_or_create_clue_dir_pepper_anchor_at(created)
-            .unwrap();
-        assert_eq!(anchor, created);
-        let v1 = decoy_key_version(&pk, &pepper, anchor);
-        assert_ne!(v1, 0);
-        assert!(v1 <= anchor);
-        assert!(anchor - v1 <= 180 * 86_400);
-        // Later lookups (one second, one day, one year on) see the same value.
-        for later in [created + 1, created + 86_400, created + 365 * 86_400] {
-            let a = cache
-                .get_or_create_clue_dir_pepper_anchor_at(later)
-                .unwrap();
-            assert_eq!(a, anchor, "anchor must not move with now");
-            assert_eq!(decoy_key_version(&pk, &pepper, a), v1);
-        }
-        let other = decoy_key_version(&[0x33u8; 32], &pepper, anchor);
-        assert_ne!(v1, other);
+    fn decoy_key_version_matches_wallet_constant() {
+        assert_eq!(decoy_key_version(), 1);
     }
 }

@@ -107,6 +107,14 @@ pub struct Config {
     /// Max bytes for a single UnifOMR detection key (default 160 MiB).
     #[serde(default = "default_max_detection_key_bytes")]
     pub max_detection_key_bytes: usize,
+
+    /// Total in-flight detection-key upload budget, in MiB (default 512).
+    #[serde(default = "default_upload_budget_mib")]
+    pub upload_budget_mib: usize,
+
+    /// Concurrent detection-key uploads accepted from one IP (default 2).
+    #[serde(default = "default_max_uploads_per_ip")]
+    pub max_uploads_per_ip: usize,
 }
 
 fn default_darkfid_endpoint() -> String {
@@ -190,6 +198,14 @@ fn default_max_detection_key_bytes() -> usize {
     160 * 1024 * 1024
 }
 
+fn default_upload_budget_mib() -> usize {
+    512
+}
+
+fn default_max_uploads_per_ip() -> usize {
+    2
+}
+
 /// Expand a leading `~/` to the user home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -250,6 +266,8 @@ impl Default for Config {
             rate_limit_gc_threshold: default_rate_limit_gc_threshold(),
             max_send_peer_entries: default_max_send_peer_entries(),
             max_detection_key_bytes: default_max_detection_key_bytes(),
+            upload_budget_mib: default_upload_budget_mib(),
+            max_uploads_per_ip: default_max_uploads_per_ip(),
         }
     }
 }
@@ -332,6 +350,12 @@ impl Config {
         }
         if self.max_detection_key_bytes == 0 {
             return Err("max_detection_key_bytes must be >= 1".into());
+        }
+        if self.upload_budget_mib == 0 {
+            return Err("upload_budget_mib must be >= 1".into());
+        }
+        if self.max_uploads_per_ip == 0 {
+            return Err("max_uploads_per_ip must be >= 1".into());
         }
 
         let raw_cache = self.cache_path.clone();

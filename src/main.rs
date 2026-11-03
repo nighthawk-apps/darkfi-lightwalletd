@@ -221,6 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_detection_key_bytes,
         config.max_send_peer_entries,
         config.rate_limit_gc_threshold,
+        config.upload_budget_mib,
+        config.max_uploads_per_ip,
     );
 
     // Start chain poller in background
@@ -328,10 +330,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = async {
             #[cfg(unix)]
             {
-                let mut sigterm = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                )
-                .expect("Failed to install SIGTERM handler");
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("Failed to install SIGTERM handler");
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = sigterm.recv() => {}

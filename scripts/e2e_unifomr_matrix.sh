@@ -17,13 +17,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LWD_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 IOS_FFI="$(cd "$LWD_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi" && pwd)"
-AND_FFI="$(cd "$LWD_DIR/../new-nighthawk-android-wallet/rust/darkfi-mobile-ffi" && pwd)"
+AND_FFI="$(cd "$LWD_DIR/../nighthawk-android-wallet/rust/darkfi-mobile-ffi" && pwd)"
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
 NETWORK="${NETWORK:-testnet}"
 
-# This MacBook Pro e2e must hit loopback LWD, not Studio/ngrok.
+# ngrok and the Studio hostname are refused. Loopback is the only URL whose
+# listen socket is probed. Any other URL is used as given and is not probed.
 if [[ "$LWD_URL" == *ngrok* || "$LWD_URL" == *epidermis* ]]; then
-  echo "refusing Studio/ngrok LWD_URL=$LWD_URL — use http://127.0.0.1:9067"
+  echo "refusing ngrok LWD_URL=$LWD_URL — pass http://127.0.0.1:9067 or another non-ngrok URL"
   exit 1
 fi
 
@@ -48,38 +49,53 @@ report() {
 
 echo -e "${CYAN}UnifOMR registration matrix → ${LWD_URL}${NC}"
 
-# Local default requires :9067; remote HTTPS (e.g. Studio ngrok) skips that check.
+listening_on() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt | awk -v p=":${port}$" '$4 ~ p { found=1 } END { exit found ? 0 : 1 }'
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    echo "need ss or lsof to see whether port $port is listening" >&2
+    return 1
+  fi
+}
+
+# Only the local default is checked for a listen socket.
 case "$LWD_URL" in
   http://127.0.0.1:9067|http://localhost:9067|http://[::1]:9067)
-    if ! lsof -nP -iTCP:9067 -sTCP:LISTEN >/dev/null 2>&1; then
+    if ! listening_on 9067; then
       echo "lightwalletd not listening on :9067 — start it first"
       exit 1
     fi
     ;;
 esac
 
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
 cd "$LWD_DIR"
 cargo build -q --release --bin e2e_unifomr_matrix --features fhe-omr
 
 E2E_LWD_URL="$LWD_URL" E2E_NETWORK="$NETWORK" \
-  ./target/release/e2e_unifomr_matrix | tee /tmp/e2e_unifomr_matrix.log
+  ./target/release/e2e_unifomr_matrix | tee "$WORK/e2e_unifomr_matrix.log"
 
 while IFS= read -r line; do
   case "$line" in
     MATRIX_PASS:*) report PASS "${line#MATRIX_PASS:}" ;;
     MATRIX_FAIL:*) report FAIL "${line#MATRIX_FAIL:}" ;;
   esac
-done < /tmp/e2e_unifomr_matrix.log
+done < "$WORK/e2e_unifomr_matrix.log"
 
 echo -e "\n${CYAN}Mobile FFI UnifOMR unit parity${NC}"
 for label_dir in "ios:$IOS_FFI" "android:$AND_FFI"; do
   label="${label_dir%%:*}"
   dir="${label_dir#*:}"
-  if (cd "$dir" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >/tmp/e2e_${label}_unifomr.log 2>&1); then
+  if (cd "$dir" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >"$WORK/e2e_${label}_unifomr.log" 2>&1); then
     report PASS "${label} per-message multi-clue unit"
   else
     report FAIL "${label} any-match unit"
-    tail -20 "/tmp/e2e_${label}_unifomr.log" || true
+    tail -20 "$WORK/e2e_${label}_unifomr.log" || true
   fi
 done
 

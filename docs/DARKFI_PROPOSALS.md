@@ -56,7 +56,7 @@ recoverable by resync if lost.
 ## P5 — Address / payment-key ownership proofs as a reusable primitive
 
 **Problem.** Nighthawk LWD now requires Schnorr ownership proofs for UnifOMR
-clue-PK directory registration (`DarkFi-UnifOMR-CluePK-v2`). Similar patterns
+clue-PK directory registration (`DarkFi-UnifOMR-CluePK`). Similar patterns
 will recur for any off-chain directory keyed by payment pubkey.
 
 **Recommended fix.** Export a small SDK helper:

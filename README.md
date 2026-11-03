@@ -2,7 +2,9 @@
 
 Privacy-preserving light wallet server for the DarkFi network. Serves compact blocks, UnifOMR digests, and transaction relay to mobile and desktop light wallets over gRPC.
 
-**0.3.0.** Proto **2.0.0**, with no 1.x compatibility path: historical tree snapshots for checkpoints, padded-range enforcement on `GetNoteCommitments`, `GetNullifiers`, and `GetCompactOutputBodies` (a power-of-two bucket of at least 1024, or one cut short within 64 blocks of the tip), a UnifOMR detection-key pool (`RegisterDetectionKey`, `GetUnifOmrDigestFromPool`; 24 h handles, 4096 handles and 8 GiB total), a `SubscribeBlocks` ChainTip stream, and `GetCompactOutputBodies`.
+**0.3.1.** Clue registration accepts monotonic `key_version` values, including the wallet constant `1`. A lower version is rejected, and the same version is accepted only for the same clue key. Same DarkFi pin as the 3.00.027 wallets.
+
+**0.3.0.** DarkFi pin `8af61b3f0` (`nighthawk-testnet`), the same checkout as the 3.00.026 wallets. That pin pays a fee from tx-local change when the change output covers it. Proto **2.0.0**, with no 1.x compatibility path: historical tree snapshots for checkpoints, padded-range enforcement on `GetNoteCommitments`, `GetNullifiers`, and `GetCompactOutputBodies` (a power-of-two bucket of at least 1024, or one cut short within 64 blocks of the tip), a UnifOMR detection-key pool (`RegisterDetectionKey`, `GetUnifOmrDigestFromPool`; 24 h handles, 4096 handles and 8 GiB total), a `SubscribeBlocks` ChainTip stream, and `GetCompactOutputBodies`.
 
 **0.2.4.** `SendTransaction` accepts `extra_omr_clues`, one UniFOMR clue per sender output (transfer change and fee change) in addition to the recipient clue. Each clue is stored against its output index. A repeat registration for an index that already has a clue is left as first-writer-wins.
 
@@ -48,7 +50,7 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `8af61b3f0` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` (or `new-nighthawk-android-wallet/…`) with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `8af61b3f0` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
@@ -58,13 +60,13 @@ Recommended layout after `./scripts/build.sh`:
   darkfi-nighthawk-testnet/   # pin 8af61b3f0 — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
-  new-nighthawk-android-wallet/
+  nighthawk-android-wallet/
   nighthawk-ios-wallet/
 ```
 
 ```bash
 # Reuse the Android pin instead of a second clone:
-ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
+ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
 ```bash
@@ -297,7 +299,7 @@ Defined in `proto/lightwallet.proto`.
 | Project | Role |
 |---------|------|
 | [moonshine](../moonshine) | CLI light wallet |
-| [new-nighthawk-android-wallet](../new-nighthawk-android-wallet) | Android |
+| [nighthawk-android-wallet](../nighthawk-android-wallet) | Android |
 | [nighthawk-ios-wallet](../nighthawk-ios-wallet) | iOS |
 
 ---

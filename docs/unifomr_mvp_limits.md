@@ -41,12 +41,14 @@ discrete Gaussian σ=0.5, `‖u‖₀ = h/2 = 40`, `‖s‖₀ = h = 80` ⇒ σ_
   `[u8 version][u32 chunk_count] ( [u32 len][ct] × ℓ )…` — `ceil(M / D)` chunks
   for `M` flattened messages. The slot → height map is returned once, out-of-band,
   in `OmrDigestResponse.slot_heights` (packed little-endian `u32`).
-- **Ownership-proof replay fix (v2)** — `RegisterCluePublicKey` proofs sign
-  `b"DarkFi-UnifOMR-CluePK-v2" || network_byte || key_version (u64 LE) ||
+- **Ownership-proof replay fix** — `RegisterCluePublicKey` proofs sign
+  `b"DarkFi-UnifOMR-CluePK" || network_byte || key_version (u64 LE) ||
   payment_pubkey || clue_public_key`. The network byte kills cross-network
-  replay; `key_version` (unix seconds) is monotonic — the server only replaces
-  a registration when the new version is strictly greater (signed rotation),
-  and rejects lower/equal-version conflicts.
+  replay. `key_version` is monotonic and wallets send the constant `1` (the
+  clue key does not rotate; a timestamp would mark real directory rows).
+  The server rejects `0` and any lower version. An equal version is accepted
+  only when the clue public key is unchanged, because Schnorr proofs are
+  randomized. A higher version replaces the row. Decoy entries use `1`.
 - **Per-message SIMD packing (paper-faithful, 2026-08)** — the window's validated
   clues are flattened in canonical order (height ascending, then output order) and
   packed **one clue per SIMD slot** (paper §detector), replacing the earlier
@@ -118,7 +120,7 @@ must stay within that budget (practical cap is one full Param2 key per request).
 |-----------|-----|-----------|---------|-------------|---------|
 | Param2 `unifomr` constants (σ=0.5, r′=149, ℓ=2, mod-switch) | ✓ | via LWD | ✓ (synced copy) | ✓ (synced copy) | via Android FFI |
 | Per-message SIMD packing + `slot_heights` map + `complete=false` clamp | ✓ | via LWD | ✓ (synced copy) | ✓ (synced copy) | via Android FFI |
-| Ownership proof v2 (network + key_version) | ✓ | ✓ | ✓ | ✓ | via FFI |
+| Ownership proof (network + key_version = 1) | ✓ | ✓ | ✓ | ✓ | via FFI |
 | Length-prefixed PIR limbs | ✓ | via LWD | ✓ | ✓ | via FFI |
 | Ops hardening above | ✓ | ✓ | ✓ | ✓ | ✓ (TLS pin via prefs) |
 | Supplemental trial on empty OMR | — | ✓ | ✓ | ✓ | via FFI |

@@ -35,6 +35,9 @@
 
 // Using bincode for compact block serialization (serde-based) to avoid
 // lifetime issues with darkfi_serial's async derive macros.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -56,8 +59,7 @@ const COINS_TREE: &str = "lightwalletd_coins";
 const MERKLE_SNAPSHOTS_TREE: &str = "lightwalletd_merkle_snapshots";
 const OMR_CLUE_HINTS_TREE: &str = "lightwalletd_omr_clue_hints";
 const OMR_CLUE_HINT_META_TREE: &str = "lightwalletd_omr_clue_hint_meta";
-// v2: values are `[key_version u64 LE || clue_pk]` (monotonic anti-replay).
-const OMR_CLUE_PUBKEYS_TREE: &str = "lightwalletd_omr_clue_pubkeys_v2";
+const OMR_CLUE_PUBKEYS_TREE: &str = "lightwalletd_omr_clue_pubkeys";
 const OMR_METADATA_ENC_TREE: &str = "lightwalletd_omr_metadata_enc";
 
 /// On-disk cache layout version. Bump when compact-block bincode or tree
@@ -70,6 +72,8 @@ const CACHE_FORMAT_VERSION: u32 = 1;
 /// Hints are not consumed on merge, so this bounds both slow confirms and the
 /// reorg window in which a rewound block can get its clue re-merged.
 pub const OMR_CLUE_HINT_TTL_SECS: u64 = 86_400;
+/// Full hint-meta scan period. A single expired key is still dropped on read.
+const OMR_CLUE_HINT_SWEEP_SECS: u64 = 60;
 /// Max opaque recipient OMR metadata size (DoS / cache bloat).
 pub const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 
@@ -79,8 +83,8 @@ const META_TIP_HASH: &[u8] = b"tip_hash";
 const META_TIP_MERKLE_TREE: &[u8] = b"tip_merkle_tree";
 const META_TIP_MERKLE_HEIGHT: &[u8] = b"tip_merkle_height";
 const META_CACHE_FORMAT: &[u8] = b"cache_format";
-const META_CLUE_DIR_PEPPER: &[u8] = b"unifomr_clue_dir_pepper_v1";
-const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor_v1";
+const META_CLUE_DIR_PEPPER: &[u8] = b"unifomr_clue_dir_pepper";
+const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor";
 
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
@@ -91,6 +95,14 @@ const TIP_TREE_CHECKPOINTS: usize = 100;
 /// `MerkleTree` per 1024 blocks, plus the current tip (replaced in place when
 /// the tip is not itself a 1024 boundary).
 pub const MERKLE_SNAPSHOT_INTERVAL: u32 = 1024;
+
+/// In-memory tip Money tree. `height` is the block this tree already includes.
+struct LiveTipTree {
+    height: Option<u32>,
+    tree: darkfi_sdk::crypto::MerkleTree,
+    /// Persisted bytes did not deserialize. The next append rebuilds from coins.
+    load_failed: bool,
+}
 
 /// Cache layer backed by sled, storing compact blocks and indices.
 pub struct Cache {
@@ -119,6 +131,11 @@ pub struct Cache {
     omr_metadata_enc: sled::Tree,
     /// Server metadata
     meta: sled::Tree,
+    /// Live tip Money tree. Loaded from sled on open; appends mutate this
+    /// instead of deserializing the tip on every block.
+    tip_tree: Mutex<LiveTipTree>,
+    /// Unix seconds of the last full OMR clue-hint meta scan.
+    omr_hint_sweep_unix: AtomicU64,
 }
 
 impl Cache {
@@ -155,16 +172,90 @@ impl Cache {
             omr_clue_pubkeys,
             omr_metadata_enc,
             meta,
+            tip_tree: Mutex::new(LiveTipTree {
+                height: None,
+                tree: Self::empty_tip_tree(),
+                load_failed: false,
+            }),
+            omr_hint_sweep_unix: AtomicU64::new(0),
         };
+        cache.retire_obsolete_names()?;
         cache.ensure_cache_format()?;
         cache.verify_tip_readable()?;
         // Old caches have the tip tree only in META. Index it so checkpoint
         // reads see a snapshot before the next block arrives. Missing interval
         // rows appear as later heights are appended or the tip is rebuilt.
         cache.index_existing_tip_snapshot()?;
+        // Restart must append to the persisted tip, not an empty sentinel.
+        cache.load_live_tip_from_disk()?;
         // Best-effort prune of orphan hints left from previous runs (S21).
         let _ = cache.prune_expired_omr_clue_hints();
         Ok(cache)
+    }
+
+    /// Drop sled names left behind when trees and meta keys lost their
+    /// `_v1` / `_v2` suffixes. The weak Pcg32 attestation key is deleted.
+    /// The CSPRNG attestation key and the decoy pepper are copied forward
+    /// once, then the old rows are removed. Safe to run on every open.
+    fn retire_obsolete_names(&self) -> Result<()> {
+        const OLD_ATTEST_V1: &[u8] = b"unifomr_dir_attest_sk_v1";
+        const OLD_ATTEST_V2: &[u8] = b"unifomr_dir_attest_sk_v2";
+        const ATTEST: &[u8] = b"unifomr_dir_attest_sk";
+        const OLD_PEPPER: &[u8] = b"unifomr_clue_dir_pepper_v1";
+        const OLD_CLUE_TREE: &str = "lightwalletd_omr_clue_pubkeys_v2";
+        const OLD_CLUE_TREE_V1: &str = "lightwalletd_omr_clue_pubkeys_v1";
+
+        let attest_missing = match self.meta.get(ATTEST)? {
+            Some(bytes) if bytes.len() == 32 => false,
+            _ => true,
+        };
+        if attest_missing {
+            if let Some(old) = self.meta.get(OLD_ATTEST_V2)? {
+                if old.len() == 32 {
+                    self.meta.insert(ATTEST, old.as_ref())?;
+                }
+            }
+        }
+        self.meta.remove(OLD_ATTEST_V1)?;
+        self.meta.remove(OLD_ATTEST_V2)?;
+
+        let pepper_missing = match self.meta.get(META_CLUE_DIR_PEPPER)? {
+            Some(bytes) if bytes.len() == 32 => false,
+            _ => true,
+        };
+        if pepper_missing {
+            if let Some(old) = self.meta.get(OLD_PEPPER)? {
+                if old.len() == 32 {
+                    self.meta.insert(META_CLUE_DIR_PEPPER, old.as_ref())?;
+                }
+            }
+        }
+        self.meta.remove(OLD_PEPPER)?;
+        self.meta.remove(META_CLUE_DIR_PEPPER_ANCHOR)?;
+        self.meta.remove(b"unifomr_clue_dir_pepper_anchor_v1")?;
+
+        if self.tree_exists(OLD_CLUE_TREE) {
+            let old = self.db.open_tree(OLD_CLUE_TREE)?;
+            for item in old.iter() {
+                let (key, value) = item?;
+                if self.omr_clue_pubkeys.get(key.as_ref())?.is_none() {
+                    self.omr_clue_pubkeys.insert(key, value)?;
+                }
+            }
+            drop(old);
+            self.db.drop_tree(OLD_CLUE_TREE)?;
+        }
+        if self.tree_exists(OLD_CLUE_TREE_V1) {
+            self.db.drop_tree(OLD_CLUE_TREE_V1)?;
+        }
+        Ok(())
+    }
+
+    fn tree_exists(&self, name: &str) -> bool {
+        self.db
+            .tree_names()
+            .iter()
+            .any(|existing| existing.as_ref() == name.as_bytes())
     }
 
     fn ensure_cache_format(&self) -> Result<()> {
@@ -289,6 +380,8 @@ impl Cache {
                     "Cached historical compact block at height {} (tip stays {tip_h})",
                     block.height
                 );
+                // Snapshots at or above this height were built without these coins.
+                self.delete_snapshots_at_or_above(block.height)?;
                 self.rebuild_tip_merkle_tree(tip_h)?;
                 return Ok(());
             }
@@ -328,6 +421,7 @@ impl Cache {
             return Ok(());
         }
         self.prune_expired_omr_clue_hints()?;
+        self.drop_omr_clue_hint_if_expired(tx_hash)?;
 
         let mut clues = match self.omr_clue_hints.get(tx_hash.as_slice())? {
             Some(bytes) => decode_omr_clue_hints(&bytes),
@@ -342,10 +436,7 @@ impl Cache {
         let stored = encode_omr_clue_hints(&clues);
         self.omr_clue_hints
             .insert(tx_hash.as_slice(), stored.as_slice())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = omr_hint_unix_now();
         self.omr_clue_hint_meta
             .insert(tx_hash.as_slice(), &now.to_le_bytes())?;
         // Avoid per-hint sled.flush (P8); callers / insert_compact_block flush.
@@ -401,15 +492,21 @@ impl Cache {
 
     /// True if a clue hint is already stored for this tx (e.g. from SendTransaction).
     ///
-    /// Prunes expired hints first so TTL is observed (S21).
+    /// The full meta scan is throttled. This key is still dropped if it is expired.
     pub fn has_omr_clue_hint(&self, tx_hash: &[u8; 32]) -> Result<bool> {
         self.prune_expired_omr_clue_hints()?;
+        if self.drop_omr_clue_hint_if_expired(tx_hash)? {
+            return Ok(false);
+        }
         Ok(self.omr_clue_hints.contains_key(tx_hash.as_slice())?)
     }
 
     /// True when a clue is already stored for this tx and output index.
     pub fn omr_clue_index_taken(&self, tx_hash: &[u8; 32], output_index: u32) -> Result<bool> {
         self.prune_expired_omr_clue_hints()?;
+        if self.drop_omr_clue_hint_if_expired(tx_hash)? {
+            return Ok(false);
+        }
         let Some(bytes) = self.omr_clue_hints.get(tx_hash.as_slice())? else {
             return Ok(false);
         };
@@ -427,11 +524,12 @@ impl Cache {
 
     /// Store UnifOMR clue public key + ownership proof for a payment pubkey.
     ///
-    /// Wire value (v3): `b"v3" || key_version u64 LE || proof_len u32 LE
-    /// || ownership_proof || clue_pk`.
+    /// Value: `key_version u64 LE || proof_len u32 LE || ownership_proof || clue_pk`.
     ///
-    /// Monotonic anti-replay: an existing registration is only replaced when
-    /// `key_version` is strictly greater (signed key rotation).
+    /// Monotonic anti-replay: a lower `key_version` is rejected. An equal
+    /// version replaces the proof only when the clue public key is unchanged
+    /// (Schnorr proofs are randomized). A different clue key at the same
+    /// version is rejected. A higher version replaces the row. `0` is rejected.
     pub fn store_clue_public_key(
         &self,
         payment_pubkey: &[u8; 32],
@@ -450,20 +548,13 @@ impl Cache {
                 "invalid ownership proof size".into(),
             ));
         }
-        // Keep registered versions in the same unix-timestamp shape as decoys
-        // so `key_version=1` or a far-future value cannot prove registration.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        const MIN_PLAUSIBLE: u64 = 1_600_000_000; // ~2020-09
-        if key_version < MIN_PLAUSIBLE || key_version > now.saturating_add(86_400) {
-            return Err(LightWalletError::CacheError(format!(
-                "clue key_version {key_version} is outside the plausible unix-timestamp window"
-            )));
+        if key_version == 0 {
+            return Err(LightWalletError::CacheError(
+                "clue key_version 0 is rejected".into(),
+            ));
         }
         if let Some(existing) = self.omr_clue_pubkeys.get(payment_pubkey.as_slice())? {
-            if let Some((stored_version, stored_proof, stored_clue)) =
+            if let Some((stored_version, _stored_proof, stored_clue)) =
                 Self::parse_clue_pubkey_value(&existing)
             {
                 if key_version < stored_version {
@@ -471,18 +562,14 @@ impl Cache {
                         "stale clue registration: key_version {key_version} < registered {stored_version}"
                     )));
                 }
-                if key_version == stored_version {
-                    if stored_clue == clue_pk && stored_proof == ownership_proof {
-                        return Ok(());
-                    }
+                if key_version == stored_version && stored_clue.as_slice() != clue_pk {
                     return Err(LightWalletError::CacheError(
                         "clue public key already registered at this key_version".into(),
                     ));
                 }
             }
         }
-        let mut value = Vec::with_capacity(2 + 8 + 4 + ownership_proof.len() + clue_pk.len());
-        value.extend_from_slice(b"v3");
+        let mut value = Vec::with_capacity(8 + 4 + ownership_proof.len() + clue_pk.len());
         value.extend_from_slice(&key_version.to_le_bytes());
         value.extend_from_slice(&(ownership_proof.len() as u32).to_le_bytes());
         value.extend_from_slice(ownership_proof);
@@ -494,18 +581,24 @@ impl Cache {
 
     /// Parse stored clue-directory value → `(key_version, ownership_proof, clue_pk)`.
     ///
-    /// Format: `b"v3" || key_version u64 LE || proof_len u32 LE || proof || clue_pk`.
+    /// Format: `key_version u64 LE || proof_len u32 LE || proof || clue_pk`.
+    /// Older rows may start with the `b"v3"` tag; those bytes are skipped.
     fn parse_clue_pubkey_value(v: &[u8]) -> Option<(u64, Vec<u8>, Vec<u8>)> {
-        if v.len() < 2 + 8 + 4 || &v[..2] != b"v3" {
+        let v = if v.len() >= 2 && &v[..2] == b"v3" {
+            &v[2..]
+        } else {
+            v
+        };
+        if v.len() < 8 + 4 {
             return None;
         }
-        let key_version = u64::from_le_bytes(v[2..10].try_into().ok()?);
-        let proof_len = u32::from_le_bytes(v[10..14].try_into().ok()?) as usize;
-        if 14 + proof_len > v.len() {
+        let key_version = u64::from_le_bytes(v[0..8].try_into().ok()?);
+        let proof_len = u32::from_le_bytes(v[8..12].try_into().ok()?) as usize;
+        if 12 + proof_len > v.len() {
             return None;
         }
-        let proof = v[14..14 + proof_len].to_vec();
-        let clue = v[14 + proof_len..].to_vec();
+        let proof = v[12..12 + proof_len].to_vec();
+        let clue = v[12 + proof_len..].to_vec();
         if clue.is_empty() || proof.is_empty() {
             return None;
         }
@@ -547,54 +640,21 @@ impl Cache {
             .meta
             .compare_and_swap(META_CLUE_DIR_PEPPER, current, Some(pepper.as_slice()))?
         {
-            Ok(()) => {
-                self.get_or_create_clue_dir_pepper_anchor()?;
-                Ok(pepper)
-            }
+            Ok(()) => Ok(pepper),
             // A concurrent first lookup won; use its pepper.
             Err(_) => self.get_or_create_clue_dir_pepper(),
         }
     }
 
-    /// Unix time the clue-directory pepper was first used (decoy `key_version` anchor).
-    pub fn get_or_create_clue_dir_pepper_anchor(&self) -> Result<u64> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.get_or_create_clue_dir_pepper_anchor_at(now)
-    }
-
-    pub(crate) fn get_or_create_clue_dir_pepper_anchor_at(&self, now: u64) -> Result<u64> {
-        let parse = |v: &[u8]| -> Option<u64> { Some(u64::from_le_bytes(v.try_into().ok()?)) };
-        if let Some(existing) = self.meta.get(META_CLUE_DIR_PEPPER_ANCHOR)? {
-            if let Some(anchor) = parse(&existing) {
-                return Ok(anchor);
-            }
-        }
-        let current = self.meta.get(META_CLUE_DIR_PEPPER_ANCHOR)?;
-        match self.meta.compare_and_swap(
-            META_CLUE_DIR_PEPPER_ANCHOR,
-            current,
-            Some(now.to_le_bytes().as_slice()),
-        )? {
-            Ok(()) => Ok(now),
-            Err(_) => self.get_or_create_clue_dir_pepper_anchor_at(now),
-        }
-    }
-
     /// Stable lightwalletd SecretKey used to attest `GetCluePublicKey` entries.
     ///
-    /// Persisted in sled meta (`unifomr_dir_attest_sk_v2`) so a restart does not
-    /// rotate the advertised `GetLightInfo.directory_attest_pubkey`.
-    /// Real and decoy lookups are signed with the same key so Schnorr-verify
-    /// no longer leaks the registration bit.
+    /// Persisted in sled meta so a restart does not rotate the advertised
+    /// `GetLightInfo.directory_attest_pubkey`. Real and decoy lookups are
+    /// signed with the same key so Schnorr-verify does not leak registration.
     pub fn get_or_create_directory_attest_secret(&self) -> Result<darkfi_sdk::crypto::SecretKey> {
         use darkfi_sdk::crypto::SecretKey;
         use darkfi_sdk::pasta::group::ff::PrimeField;
-        // v2: 256-bit CSPRNG key. v1 used Pcg32 seeded from 8 OS bytes (64-bit
-        // key space) and is discarded so directory_attest_pubkey rotates once.
-        const KEY: &[u8] = b"unifomr_dir_attest_sk_v2";
+        const KEY: &[u8] = b"unifomr_dir_attest_sk";
         if let Some(existing) = self.meta.get(KEY)? {
             if existing.len() == 32 {
                 let mut out = [0u8; 32];
@@ -622,22 +682,39 @@ impl Cache {
     }
 
     /// Drop orphan OMR clue hints older than [`OMR_CLUE_HINT_TTL_SECS`] (S21).
+    ///
+    /// The full meta-tree scan runs at most once per 60s. A read of one tx
+    /// hash still drops that entry when it is expired.
     pub fn prune_expired_omr_clue_hints(&self) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = omr_hint_unix_now();
+        let prev = self.omr_hint_sweep_unix.load(Ordering::Relaxed);
+        if prev != 0 && now.saturating_sub(prev) < OMR_CLUE_HINT_SWEEP_SECS {
+            return Ok(());
+        }
+        if self
+            .omr_hint_sweep_unix
+            .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(e) = self.sweep_expired_omr_clue_hints_at(now) {
+            let _ = self.omr_hint_sweep_unix.compare_exchange(
+                now,
+                prev,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn sweep_expired_omr_clue_hints_at(&self, now: u64) -> Result<()> {
         let mut expired = Vec::new();
         for item in self.omr_clue_hint_meta.iter() {
             let (key, value) = item?;
-            if value.len() < 8 {
-                expired.push(key.to_vec());
-                continue;
-            }
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(&value[..8]);
-            let stored_at = u64::from_le_bytes(buf);
-            if now.saturating_sub(stored_at) > OMR_CLUE_HINT_TTL_SECS {
+            if omr_hint_meta_expired(value.as_ref(), now) {
                 expired.push(key.to_vec());
             }
         }
@@ -648,10 +725,22 @@ impl Cache {
         Ok(())
     }
 
+    /// Drop this tx's hint when its meta row is expired. Does not scan the tree.
+    fn drop_omr_clue_hint_if_expired(&self, tx_hash: &[u8; 32]) -> Result<bool> {
+        let Some(value) = self.omr_clue_hint_meta.get(tx_hash.as_slice())? else {
+            return Ok(false);
+        };
+        if !omr_hint_meta_expired(value.as_ref(), omr_hint_unix_now()) {
+            return Ok(false);
+        }
+        self.omr_clue_hints.remove(tx_hash.as_slice())?;
+        self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
+        Ok(true)
+    }
+
     /// Merge pending OMR clues into compact block outputs.
     ///
-    /// S20: apply to a single output — either the stored index, or the first
-    /// empty output when the index is `u32::MAX` / raw clue bytes.
+    /// S20: apply each stored clue to the output index it names.
     ///
     /// Hints are kept until [`OMR_CLUE_HINT_TTL_SECS`] expiry rather than
     /// consumed: a reorg rewinds the block and darkfid re-serves it with empty
@@ -661,24 +750,27 @@ impl Cache {
         for tx in &mut block.txs {
             let tx_hash: [u8; 32] = tx.tx_hash;
 
-            // Merge FHE clues (one per output index, or one legacy first-empty).
-            if let Some(stored_bytes) = self.omr_clue_hints.get(tx_hash.as_slice())? {
-                let clues = decode_omr_clue_hints(&stored_bytes);
-                if clues.is_empty() || clues.iter().all(|(_, c)| c.is_empty()) {
-                    self.omr_clue_hints.remove(tx_hash.as_slice())?;
-                    self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
-                } else {
-                    for (output_index, clue) in clues {
-                        if clue.is_empty() || tx.outputs.iter().any(|o| o.omr_clue == clue) {
-                            continue;
-                        }
-                        let target = match output_index {
-                            Some(idx) => tx.outputs.get_mut(idx as usize),
-                            None => tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty()),
-                        };
-                        if let Some(output) = target {
-                            if output.omr_clue.is_empty() {
-                                output.omr_clue = clue;
+            // Merge FHE clues, one per output index. An expired hint for this
+            // tx is dropped here without scanning the rest of the meta tree.
+            if !self.drop_omr_clue_hint_if_expired(&tx_hash)? {
+                if let Some(stored_bytes) = self.omr_clue_hints.get(tx_hash.as_slice())? {
+                    let clues = decode_omr_clue_hints(&stored_bytes);
+                    if clues.is_empty() || clues.iter().all(|(_, c)| c.is_empty()) {
+                        self.omr_clue_hints.remove(tx_hash.as_slice())?;
+                        self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
+                    } else {
+                        for (output_index, clue) in clues {
+                            if clue.is_empty() || tx.outputs.iter().any(|o| o.omr_clue == clue) {
+                                continue;
+                            }
+                            let target = match output_index {
+                                Some(idx) => tx.outputs.get_mut(idx as usize),
+                                None => tx.outputs.iter_mut().find(|o| o.omr_clue.is_empty()),
+                            };
+                            if let Some(output) = target {
+                                if output.omr_clue.is_empty() {
+                                    output.omr_clue = clue;
+                                }
                             }
                         }
                     }
@@ -941,22 +1033,43 @@ impl Cache {
         })
     }
 
-    fn load_or_empty_tip_tree(&self) -> Result<darkfi_sdk::crypto::MerkleTree> {
-        if let Some(bytes) = self.meta.get(META_TIP_MERKLE_TREE)? {
-            match darkfi_serial::deserialize(&bytes) {
-                Ok(tree) => return Ok(tree),
-                Err(e) => {
-                    warn!(
-                        target: "lightwalletd::cache",
-                        "Failed to deserialize tip Merkle tree ({e}); rebuilding"
-                    );
-                }
-            }
-        }
-        Ok(Self::empty_tip_tree())
+    fn lock_tip_tree(&self) -> std::sync::MutexGuard<'_, LiveTipTree> {
+        self.tip_tree.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn store_tip_tree(&self, height: u32, tree: &darkfi_sdk::crypto::MerkleTree) -> Result<()> {
+    /// Copy `META_TIP_MERKLE_*` into the in-memory tree. Missing meta keeps
+    /// the empty sentinel created in [`Cache::new`].
+    fn load_live_tip_from_disk(&self) -> Result<()> {
+        let Some((height, bytes)) = self.get_tip_tree_state()? else {
+            return Ok(());
+        };
+        match darkfi_serial::deserialize(&bytes) {
+            Ok(tree) => {
+                let mut live = self.lock_tip_tree();
+                live.height = Some(height);
+                live.tree = tree;
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    target: "lightwalletd::cache",
+                    "Failed to deserialize tip Merkle tree ({e}); rebuilding before the next append"
+                );
+                let mut live = self.lock_tip_tree();
+                live.height = None;
+                live.tree = Self::empty_tip_tree();
+                live.load_failed = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn store_tip_tree(
+        &self,
+        prev_height: Option<u32>,
+        height: u32,
+        tree: &darkfi_sdk::crypto::MerkleTree,
+    ) -> Result<()> {
         let tree_data = darkfi_serial::serialize(tree);
         self.meta
             .insert(META_TIP_MERKLE_TREE, tree_data.as_slice())?;
@@ -964,40 +1077,39 @@ impl Cache {
             .insert(META_TIP_MERKLE_HEIGHT, &height.to_be_bytes())?;
         // The tip keys are the latest snapshot. Also index the row so checkpoint
         // scans and interval history share one tree.
-        self.record_tree_snapshot(height, &tree_data, true)
+        self.record_tree_snapshot(prev_height, height, &tree_data, true)
     }
 
     /// Persist `tree_data` when `height` is a 1024-block boundary or the tip.
     ///
     /// A previous tip that is not on an interval boundary is removed so disk
     /// stays one serialized tree per 1024 blocks, plus the current tip.
-    fn record_tree_snapshot(&self, height: u32, tree_data: &[u8], is_tip: bool) -> Result<()> {
+    fn record_tree_snapshot(
+        &self,
+        prev_height: Option<u32>,
+        height: u32,
+        tree_data: &[u8],
+        is_tip: bool,
+    ) -> Result<()> {
         if height % MERKLE_SNAPSHOT_INTERVAL == 0 || is_tip {
             self.merkle_snapshots
                 .insert(&height.to_be_bytes(), tree_data)?;
         }
         if is_tip {
-            self.drop_non_interval_snapshots_except(height)?;
+            self.drop_non_interval_snapshots_except(prev_height, height)?;
         }
         Ok(())
     }
 
-    fn drop_non_interval_snapshots_except(&self, keep: u32) -> Result<()> {
-        let stale: Vec<sled::IVec> = self
-            .merkle_snapshots
-            .iter()
-            .filter_map(|item| item.ok())
-            .filter_map(|(key, _)| {
-                let height = height_from_snapshot_key(key.as_ref())?;
-                if height != keep && height % MERKLE_SNAPSHOT_INTERVAL != 0 {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for key in stale {
-            self.merkle_snapshots.remove(key)?;
+    /// Remove the previous tip row when it is not an interval boundary.
+    ///
+    /// One key delete. Interval snapshots and `keep` stay.
+    fn drop_non_interval_snapshots_except(&self, prev: Option<u32>, keep: u32) -> Result<()> {
+        let Some(prev) = prev else {
+            return Ok(());
+        };
+        if prev != keep && prev % MERKLE_SNAPSHOT_INTERVAL != 0 {
+            self.merkle_snapshots.remove(&prev.to_be_bytes())?;
         }
         Ok(())
     }
@@ -1006,9 +1118,13 @@ impl Cache {
         let Some(start) = height.checked_add(1) else {
             return Ok(());
         };
+        self.delete_snapshots_at_or_above(start)
+    }
+
+    fn delete_snapshots_at_or_above(&self, height: u32) -> Result<()> {
         let keys: Vec<sled::IVec> = self
             .merkle_snapshots
-            .range(start.to_be_bytes()..)
+            .range(height.to_be_bytes()..)
             .filter_map(|item| item.ok().map(|(key, _)| key))
             .collect();
         for key in keys {
@@ -1084,46 +1200,135 @@ impl Cache {
     }
 
     fn append_coins_to_tip_tree(&self, height: u32, coins: &[[u8; 32]]) -> Result<()> {
-        let mut tree = self.load_or_empty_tip_tree()?;
-        for coin in coins {
-            tree.append(Self::coin_to_merkle_node(coin)?);
+        let needs_rebuild = {
+            let live = self.lock_tip_tree();
+            live.load_failed
+                || match live.height {
+                    Some(prev) => height != prev.saturating_add(1),
+                    None => false,
+                }
+        };
+        if needs_rebuild {
+            // Coins for `height` are already in the coins tree. Rebuilding
+            // that height would include them, so rebuild the parent and append.
+            if height == 0 {
+                self.rebuild_tip_merkle_tree(0)?;
+                return Ok(());
+            }
+            self.rebuild_tip_merkle_tree(height - 1)?;
         }
-        // `height` is the new tip on this path (historical backfill rebuilds).
-        // Interval rows (height % 1024 == 0) stay; the previous non-aligned tip
-        // is replaced inside `store_tip_tree`.
-        self.store_tip_tree(height, &tree)
+        let nodes = coins
+            .iter()
+            .map(|coin| Self::coin_to_merkle_node(coin))
+            .collect::<Result<Vec<_>>>()?;
+        let mut live = self.lock_tip_tree();
+        let prev_height = live.height;
+        for node in nodes {
+            live.tree.append(node);
+        }
+        // The poller inserts one block at a time, so the tree is persisted
+        // here. The previous non-interval tip is one key delete, not a scan.
+        if let Err(e) = self.store_tip_tree(prev_height, height, &live.tree) {
+            self.reload_live_tip_locked(&mut live);
+            return Err(e);
+        }
+        live.height = Some(height);
+        live.load_failed = false;
+        Ok(())
+    }
+
+    fn reload_live_tip_locked(&self, live: &mut LiveTipTree) {
+        if let Ok(Some((height, bytes))) = self.get_tip_tree_state() {
+            if let Ok(tree) = darkfi_serial::deserialize(&bytes) {
+                live.height = Some(height);
+                live.tree = tree;
+                live.load_failed = false;
+                return;
+            }
+        }
+        live.height = None;
+        live.tree = Self::empty_tip_tree();
+        live.load_failed = true;
     }
 
     fn rebuild_tip_merkle_tree(&self, tip_height: u32) -> Result<()> {
+        let mut live = self.lock_tip_tree();
         if tip_height == 0 && self.get_compact_block(0)?.is_none() {
             self.meta.remove(META_TIP_MERKLE_TREE)?;
             self.meta.remove(META_TIP_MERKLE_HEIGHT)?;
             self.clear_merkle_snapshots()?;
+            live.height = None;
+            live.tree = Self::empty_tip_tree();
+            live.load_failed = false;
             return Ok(());
         }
 
         self.delete_snapshots_above(tip_height)?;
 
-        let ranges = self.get_coins_range(0, tip_height)?;
-        let mut tree = Self::empty_tip_tree();
-        let mut idx = 0usize;
-        let mut boundary = 0u32;
-        loop {
-            while idx < ranges.len() && ranges[idx].0 <= boundary {
-                for coin in &ranges[idx].1 {
-                    tree.append(Self::coin_to_merkle_node(coin)?);
+        let seeded = match self.greatest_snapshot_at_or_below(tip_height)? {
+            Some((height, bytes)) => match darkfi_serial::deserialize(&bytes) {
+                Ok(tree) => Some((height, tree)),
+                Err(e) => {
+                    warn!(
+                        target: "lightwalletd::cache",
+                        "Snapshot at {height} failed to deserialize ({e}); replaying from the sentinel"
+                    );
+                    None
                 }
-                idx += 1;
+            },
+            None => None,
+        };
+
+        let (seed_height, mut tree) = match seeded {
+            Some((height, tree)) if height >= tip_height => {
+                self.store_tip_tree(Some(height), tip_height, &tree)?;
+                live.height = Some(tip_height);
+                live.tree = tree;
+                live.load_failed = false;
+                return Ok(());
             }
-            if boundary % MERKLE_SNAPSHOT_INTERVAL == 0 {
-                let tree_data = darkfi_serial::serialize(&tree);
-                self.merkle_snapshots
-                    .insert(&boundary.to_be_bytes(), tree_data.as_slice())?;
+            Some((height, tree)) => (Some(height), tree),
+            None => (None, Self::empty_tip_tree()),
+        };
+
+        let coin_from = match seed_height {
+            Some(height) => height.saturating_add(1),
+            None => 0,
+        };
+        let ranges = if coin_from > tip_height {
+            Vec::new()
+        } else {
+            self.get_coins_range(coin_from, tip_height)?
+        };
+
+        let mut idx = 0usize;
+        let mut boundary = seed_height.unwrap_or(0);
+        let mut skipped_seed = seed_height.is_some();
+        loop {
+            if skipped_seed {
+                skipped_seed = false;
+            } else {
+                while idx < ranges.len() && ranges[idx].0 <= boundary {
+                    for coin in &ranges[idx].1 {
+                        tree.append(Self::coin_to_merkle_node(coin)?);
+                    }
+                    idx += 1;
+                }
+                if boundary % MERKLE_SNAPSHOT_INTERVAL == 0 {
+                    let tree_data = darkfi_serial::serialize(&tree);
+                    self.merkle_snapshots
+                        .insert(&boundary.to_be_bytes(), tree_data.as_slice())?;
+                }
             }
             if boundary >= tip_height {
                 break;
             }
-            let next = boundary.saturating_add(MERKLE_SNAPSHOT_INTERVAL);
+            let next = if boundary % MERKLE_SNAPSHOT_INTERVAL == 0 {
+                boundary.saturating_add(MERKLE_SNAPSHOT_INTERVAL)
+            } else {
+                let rem = boundary % MERKLE_SNAPSHOT_INTERVAL;
+                boundary.saturating_add(MERKLE_SNAPSHOT_INTERVAL - rem)
+            };
             boundary = if next > tip_height { tip_height } else { next };
         }
         while idx < ranges.len() {
@@ -1132,7 +1337,11 @@ impl Cache {
             }
             idx += 1;
         }
-        self.store_tip_tree(tip_height, &tree)
+        self.store_tip_tree(seed_height, tip_height, &tree)?;
+        live.height = Some(tip_height);
+        live.tree = tree;
+        live.load_failed = false;
+        Ok(())
     }
 
     /// Get notes for OMR detection in a range of heights [start, end] inclusive.
@@ -1282,15 +1491,29 @@ impl Cache {
     }
 }
 
+fn omr_hint_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn omr_hint_meta_expired(value: &[u8], now: u64) -> bool {
+    if value.len() < 8 {
+        return true;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&value[..8]);
+    let stored_at = u64::from_le_bytes(buf);
+    now.saturating_sub(stored_at) > OMR_CLUE_HINT_TTL_SECS
+}
+
 fn height_from_snapshot_key(key: &[u8]) -> Option<u32> {
     let bytes: [u8; 4] = key.try_into().ok()?;
     Some(u32::from_be_bytes(bytes))
 }
 
-/// Parse stored hint bytes into `(explicit_output_index, clue)`.
-///
-/// New format: 4-byte LE index (`u32::MAX` = first empty) + clue.
-/// Fallback format: raw clue bytes (treated as first-empty).
+/// Stored clue hints are an `MCL1` list of `(output_index, clue)`.
 const OMR_CLUE_LIST_MAGIC: &[u8; 4] = b"MCL1";
 
 /// Length-prefixed list of `(output_index, clue)`. `u32::MAX` means first empty.
@@ -1308,44 +1531,35 @@ fn encode_omr_clue_hints(clues: &[(Option<u32>, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn decode_omr_clue_hints(stored: &[u8]) -> Vec<(Option<u32>, Vec<u8>)> {
-    if stored.starts_with(OMR_CLUE_LIST_MAGIC) {
-        let mut rest = &stored[4..];
-        let mut out = Vec::new();
-        while rest.len() >= 8 {
-            let idx = u32::from_le_bytes(rest[0..4].try_into().unwrap_or([0; 4]));
-            let len = u32::from_le_bytes(rest[4..8].try_into().unwrap_or([0; 4])) as usize;
-            if rest.len() < 8 + len {
-                break;
-            }
-            let clue = rest[8..8 + len].to_vec();
-            rest = &rest[8 + len..];
-            let index = if idx == u32::MAX { None } else { Some(idx) };
-            out.push((index, clue));
+    if !stored.starts_with(OMR_CLUE_LIST_MAGIC) {
+        return Vec::new();
+    }
+    let mut rest = &stored[4..];
+    let mut out = Vec::new();
+    while rest.len() >= 8 {
+        let idx = u32::from_le_bytes(rest[0..4].try_into().unwrap_or([0; 4]));
+        let len = u32::from_le_bytes(rest[4..8].try_into().unwrap_or([0; 4])) as usize;
+        if rest.len() < 8 + len {
+            break;
         }
-        return out;
+        let clue = rest[8..8 + len].to_vec();
+        rest = &rest[8 + len..];
+        let index = if idx == u32::MAX { None } else { Some(idx) };
+        out.push((index, clue));
     }
-    let (idx, clue) = parse_stored_omr_clue_hint(stored);
-    if clue.is_empty() {
-        Vec::new()
-    } else {
-        vec![(idx, clue)]
-    }
+    out
 }
 
 fn parse_stored_omr_clue_hint(stored: &[u8]) -> (Option<u32>, Vec<u8>) {
-    if stored.len() >= 4 {
-        let mut idx_buf = [0u8; 4];
-        idx_buf.copy_from_slice(&stored[..4]);
-        let idx = u32::from_le_bytes(idx_buf);
-        let clue = stored[4..].to_vec();
-        if idx == u32::MAX {
-            (None, clue)
-        } else {
-            (Some(idx), clue)
-        }
+    if stored.len() < 4 {
+        return (None, Vec::new());
+    }
+    let idx = u32::from_le_bytes(stored[..4].try_into().unwrap_or([0; 4]));
+    let clue = stored[4..].to_vec();
+    if idx == u32::MAX {
+        (None, clue)
     } else {
-        // Fallback: entire blob is the clue → first empty output.
-        (None, stored.to_vec())
+        (Some(idx), clue)
     }
 }
 
@@ -1353,6 +1567,27 @@ fn parse_stored_omr_clue_hint(stored: &[u8]) -> (Option<u32>, Vec<u8>) {
 mod tests {
     use super::*;
     use crate::compact_block::{CompactBlock, CompactOutput, CompactTx};
+
+    /// sled's db flock is released when the last tree drops, which can lag
+    /// a few milliseconds behind `drop` while other tests are saturating the
+    /// machine. Retry only that contention.
+    fn reopen_cache(path: &str) -> Cache {
+        let mut last = None;
+        for _ in 0..40 {
+            match Cache::new(path) {
+                Ok(cache) => return cache,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("could not acquire lock") {
+                        panic!("reopen {path}: {e}");
+                    }
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+        panic!("sled lock not released for {path}: {last:?}");
+    }
 
     /// Generate a deterministic 32-byte coin value that is always a valid
     /// canonical `pallas::Base` field element.  We hash the height with
@@ -1643,6 +1878,20 @@ mod tests {
             "backfilling height 0 must not rewind tip"
         );
         assert!(cache.get_compact_block(0).unwrap().is_some());
+        let backfilled = cache.get_tip_tree_state().unwrap().unwrap().1;
+
+        let dir_seq = tempfile::tempdir().unwrap();
+        let sequential = Cache::new(dir_seq.path().to_str().unwrap()).unwrap();
+        for h in 0..3 {
+            sequential
+                .insert_compact_block(&make_test_block(h))
+                .unwrap();
+        }
+        assert_eq!(
+            sequential.get_tip_tree_state().unwrap().unwrap().1,
+            backfilled,
+            "backfill must replay coins after the surviving snapshot"
+        );
     }
 
     #[test]
@@ -1852,6 +2101,53 @@ mod tests {
     }
 
     #[test]
+    fn tip_merkle_reloads_across_restart() {
+        let dir_fresh = tempfile::tempdir().unwrap();
+        let dir_restart = tempfile::tempdir().unwrap();
+        let fresh = Cache::new(dir_fresh.path().to_str().unwrap()).unwrap();
+        for h in 0..6 {
+            fresh.insert_compact_block(&make_test_block(h)).unwrap();
+        }
+        {
+            let cache = Cache::new(dir_restart.path().to_str().unwrap()).unwrap();
+            for h in 0..3 {
+                cache.insert_compact_block(&make_test_block(h)).unwrap();
+            }
+            cache.flush().unwrap();
+        }
+        let restarted = reopen_cache(dir_restart.path().to_str().unwrap());
+        for h in 3..6 {
+            restarted.insert_compact_block(&make_test_block(h)).unwrap();
+        }
+        assert_eq!(
+            fresh.get_tip_tree_state().unwrap(),
+            restarted.get_tip_tree_state().unwrap()
+        );
+    }
+
+    #[test]
+    fn expired_omr_clue_hint_dropped_on_read_without_full_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        let tx_hash = [0x42u8; 32];
+        cache
+            .store_omr_clue_hint(&tx_hash, vec![1, 2, 3], Some(0))
+            .unwrap();
+        assert!(cache.has_omr_clue_hint(&tx_hash).unwrap());
+        cache.omr_hint_sweep_unix.store(u64::MAX, Ordering::Relaxed);
+        cache
+            .omr_clue_hint_meta
+            .insert(tx_hash.as_slice(), &0u64.to_le_bytes())
+            .unwrap();
+        assert!(!cache.has_omr_clue_hint(&tx_hash).unwrap());
+        assert!(!cache
+            .omr_clue_hints
+            .contains_key(tx_hash.as_slice())
+            .unwrap());
+        assert!(!cache.omr_clue_index_taken(&tx_hash, 0).unwrap());
+    }
+
+    #[test]
     fn cache_format_stamped_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -1864,6 +2160,170 @@ mod tests {
         let ver = u32::from_be_bytes(raw.as_ref().try_into().unwrap());
         assert_eq!(ver, CACHE_FORMAT_VERSION);
         drop(cache);
-        let _reopen = Cache::new(path).unwrap();
+        let _reopen = reopen_cache(path);
+    }
+
+    #[test]
+    fn clue_key_version_one_replaces_proof_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        let payment_pk = [0x22u8; 32];
+        let clue = vec![1u8, 2, 3, 4];
+        assert!(cache
+            .store_clue_public_key(&payment_pk, &clue, 0, &[1])
+            .is_err());
+        cache
+            .store_clue_public_key(&payment_pk, &clue, 1, &[9])
+            .unwrap();
+        cache
+            .store_clue_public_key(&payment_pk, &clue, 1, &[8, 8])
+            .unwrap();
+        let (ver, proof, got) = cache
+            .get_clue_public_key_entry(&payment_pk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ver, 1);
+        assert_eq!(proof, vec![8, 8]);
+        assert_eq!(got, clue);
+        assert!(cache
+            .store_clue_public_key(&payment_pk, &[9], 1, &[1])
+            .is_err());
+        cache
+            .store_clue_public_key(&payment_pk, &[7], 2, &[3])
+            .unwrap();
+        let (ver, _, got) = cache
+            .get_clue_public_key_entry(&payment_pk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ver, 2);
+        assert_eq!(got, vec![7]);
+        assert!(cache
+            .store_clue_public_key(&payment_pk, &[7], 1, &[3])
+            .is_err());
+    }
+
+    #[test]
+    fn obsolete_v1_attest_key_is_deleted_and_v2_rows_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        {
+            let db = sled::open(path).unwrap();
+            let meta = db.open_tree(META_TREE).unwrap();
+            meta.insert(b"unifomr_dir_attest_sk_v1", &[9u8; 32])
+                .unwrap();
+            meta.insert(b"unifomr_dir_attest_sk_v2", &[3u8; 32])
+                .unwrap();
+            meta.insert(b"unifomr_clue_dir_pepper_v1", &[4u8; 32])
+                .unwrap();
+            meta.insert(b"unifomr_clue_dir_pepper_anchor_v1", &1u64.to_le_bytes())
+                .unwrap();
+            let old = db.open_tree("lightwalletd_omr_clue_pubkeys_v2").unwrap();
+            let mut value = Vec::new();
+            value.extend_from_slice(b"v3");
+            value.extend_from_slice(&1u64.to_le_bytes());
+            value.extend_from_slice(&1u32.to_le_bytes());
+            value.push(0xAB);
+            value.push(0xCD);
+            old.insert(&[1u8; 32], value).unwrap();
+            db.flush().unwrap();
+        }
+        let cache = reopen_cache(path);
+        assert!(cache
+            .meta
+            .get(b"unifomr_dir_attest_sk_v1")
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .meta
+            .get(b"unifomr_dir_attest_sk_v2")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            cache
+                .meta
+                .get(b"unifomr_dir_attest_sk")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[3u8; 32]
+        );
+        assert_eq!(
+            cache
+                .meta
+                .get(META_CLUE_DIR_PEPPER)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[4u8; 32]
+        );
+        assert!(cache
+            .meta
+            .get(b"unifomr_clue_dir_pepper_anchor_v1")
+            .unwrap()
+            .is_none());
+        assert!(!cache.tree_exists("lightwalletd_omr_clue_pubkeys_v2"));
+        let (ver, proof, clue) = cache
+            .get_clue_public_key_entry(&[1u8; 32])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ver, 1);
+        assert_eq!(proof, vec![0xAB]);
+        assert_eq!(clue, vec![0xCD]);
+        drop(cache);
+        let again = reopen_cache(path);
+        assert_eq!(
+            again
+                .meta
+                .get(b"unifomr_dir_attest_sk")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[3u8; 32]
+        );
+    }
+
+    #[test]
+    fn same_height_overwrite_does_not_duplicate_merkle_leaves() {
+        let once_dir = tempfile::tempdir().unwrap();
+        let twice_dir = tempfile::tempdir().unwrap();
+        let once = Cache::new(once_dir.path().to_str().unwrap()).unwrap();
+        once.insert_compact_block(&make_test_block(0)).unwrap();
+        let twice = Cache::new(twice_dir.path().to_str().unwrap()).unwrap();
+        twice.insert_compact_block(&make_test_block(0)).unwrap();
+        let mut again = make_test_block(0);
+        again.hash = [0xAB; 32];
+        twice.insert_compact_block(&again).unwrap();
+        assert_eq!(
+            once.get_tip_tree_state().unwrap(),
+            twice.get_tip_tree_state().unwrap()
+        );
+    }
+
+    #[test]
+    fn corrupt_tip_tree_is_rebuilt_before_append() {
+        let broken_dir = tempfile::tempdir().unwrap();
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let broken_path = broken_dir.path().to_str().unwrap();
+        {
+            let cache = Cache::new(broken_path).unwrap();
+            for h in 0..4 {
+                cache.insert_compact_block(&make_test_block(h)).unwrap();
+            }
+            cache
+                .meta
+                .insert(META_TIP_MERKLE_TREE, b"not-a-tree")
+                .unwrap();
+            cache.flush().unwrap();
+        }
+        let cache = reopen_cache(broken_path);
+        cache.insert_compact_block(&make_test_block(4)).unwrap();
+        let fresh = Cache::new(fresh_dir.path().to_str().unwrap()).unwrap();
+        for h in 0..5 {
+            fresh.insert_compact_block(&make_test_block(h)).unwrap();
+        }
+        assert_eq!(
+            cache.get_tip_tree_state().unwrap(),
+            fresh.get_tip_tree_state().unwrap()
+        );
     }
 }

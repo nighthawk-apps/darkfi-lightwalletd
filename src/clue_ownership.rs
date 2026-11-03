@@ -4,19 +4,19 @@
  *
  * Clue-PK ownership proofs for RegisterCluePublicKey (Schnorr over payment SK).
  *
- * v2 binds the network byte and a client-chosen monotonic `key_version`
- * (unix seconds) into the signed message, so proofs cannot be replayed
- * across networks and stale registrations cannot overwrite newer ones.
+ * The signed message binds the network byte and a client-chosen monotonic
+ * `key_version`, so proofs cannot be replayed across networks and a
+ * lower version cannot overwrite a newer registration. Wallets send 1.
  */
 
-/// Domain-separated message prefix for clue-PK ownership proofs (v2).
-pub const CLUE_PK_OWNERSHIP_DOMAIN: &[u8] = b"DarkFi-UnifOMR-CluePK-v2";
+/// Domain-separated message prefix for clue-PK ownership proofs.
+pub const CLUE_PK_OWNERSHIP_DOMAIN: &[u8] = b"DarkFi-UnifOMR-CluePK";
 
 /// Domain-separated message prefix for lightwalletd directory attestations.
 ///
 /// `GetCluePublicKey` returns this (not a payment-key Schnorr) so real and
 /// decoy entries both verify. Registration still uses [`CLUE_PK_OWNERSHIP_DOMAIN`].
-pub const DIRECTORY_ATTEST_DOMAIN: &[u8] = b"DarkFi-UnifOMR-DirAttest-v1";
+pub const DIRECTORY_ATTEST_DOMAIN: &[u8] = b"DarkFi-UnifOMR-DirAttest";
 
 /// Fixed wire length for `CluePublicKey.ownership_proof` responses.
 /// Layout: `u16 LE proof_len || proof || random/zero pad`.
@@ -104,16 +104,12 @@ pub fn verify_clue_pk_ownership(
     use darkfi_sdk::crypto::schnorr::SchnorrPublic;
     use darkfi_sdk::crypto::PublicKey;
     use darkfi_serial::deserialize;
-    // Accept fixed wire padding from GetCluePublicKey (u16 LE len || proof || pad).
-    let proof_bytes = if ownership_proof.len() == OWNERSHIP_PROOF_WIRE_LEN {
-        unpad_ownership_proof(ownership_proof)?
-    } else {
-        ownership_proof
-    };
+    // Registration stores the raw Schnorr serialization. Directory responses
+    // use the fixed-length pad and are checked by `verify_directory_attestation`.
     let pk = PublicKey::from_bytes(*payment_pubkey)
         .map_err(|e| format!("invalid payment pubkey: {e}"))?;
-    let sig: darkfi_sdk::crypto::schnorr::Signature =
-        deserialize(proof_bytes).map_err(|e| format!("invalid ownership proof encoding: {e}"))?;
+    let sig: darkfi_sdk::crypto::schnorr::Signature = deserialize(ownership_proof)
+        .map_err(|e| format!("invalid ownership proof encoding: {e}"))?;
     let msg = clue_pk_ownership_message(network, key_version, payment_pubkey, clue_public_key);
     if !pk.verify(&msg, &sig) {
         return Err("clue public key ownership proof verification failed".into());
@@ -173,11 +169,10 @@ pub fn verify_directory_attestation(
     }
     let mut pk_bytes = [0u8; 32];
     pk_bytes.copy_from_slice(server_pk);
-    let proof_bytes = if attestation.len() == OWNERSHIP_PROOF_WIRE_LEN {
-        unpad_ownership_proof(attestation)?
-    } else {
-        attestation
-    };
+    if attestation.len() != OWNERSHIP_PROOF_WIRE_LEN {
+        return Err("directory attestation must be the fixed-length wire proof".into());
+    }
+    let proof_bytes = unpad_ownership_proof(attestation)?;
     let pk = PublicKey::from_bytes(pk_bytes)
         .map_err(|e| format!("invalid directory attest pubkey: {e}"))?;
     let sig: darkfi_sdk::crypto::schnorr::Signature = deserialize(proof_bytes)
@@ -219,6 +214,7 @@ mod tests {
         let pay = [0x33u8; 32];
         let clue = vec![0x44u8; 16];
         let raw = sign_directory_attestation(&server.secret, 0x01, 9, &pay, &clue);
-        assert!(verify_directory_attestation(&other_pk, 0x01, 9, &pay, &clue, &raw).is_err());
+        let wire = pad_ownership_proof(&raw).unwrap();
+        assert!(verify_directory_attestation(&other_pk, 0x01, 9, &pay, &clue, &wire).is_err());
     }
 }
