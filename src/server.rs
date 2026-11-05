@@ -28,6 +28,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
+// PoolReject is named by the fhe-omr handlers. The default build and unit
+// tests still import it with the other pool types.
+#[cfg_attr(not(feature = "fhe-omr"), allow(unused_imports))]
 use crate::detection_pool::{self, DetectionKeyPool, PoolReject, PooledDetectionKey};
 
 use crate::{
@@ -113,10 +116,13 @@ const MAX_PIR_INFLIGHT_PER_IP: usize = 1;
 /// A client that stops reading ends the stream instead of pinning the task.
 const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 const MAX_PIR_STRIPES: usize = 8;
 /// Max bytes per SealPIR query ciphertext (rejects multi-MB garbage).
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 const MAX_PIR_QUERY_CT_BYTES: usize = 4 * 1024 * 1024;
 /// Max protobuf-encoded compact-block bytes materialized for one PIR window.
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 /// One `FetchPirBatch` per limb. Matches `MAX_PIR_LIMBS` (4096) so a peer can
 /// pull every column of one compact block within the minute window.
@@ -810,6 +816,7 @@ fn upload_budget_permits(mib: usize) -> usize {
     mib.saturating_mul(1024 * 1024).max(1)
 }
 
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 struct SlotGuard {
     peer: IpAddr,
     slots: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -954,6 +961,7 @@ pub struct LightWalletService {
     /// Tip height watch from the chain poller (wakes SubscribeBlocks).
     tip_notify: tokio::sync::watch::Receiver<u32>,
     /// Limits concurrent FHE `spawn_blocking` workers (CPU / RAM).
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     fhe_permits: Arc<tokio::sync::Semaphore>,
     /// TCP peers from which `X-Forwarded-For` is trusted (empty = ignore the header).
     trusted_proxies: Vec<String>,
@@ -972,6 +980,7 @@ pub struct LightWalletService {
     pir_windows: Arc<Mutex<PirWindowCache>>,
     /// Byte budget for in-flight detection-key uploads (one permit per byte).
     upload_bytes: Arc<tokio::sync::Semaphore>,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     upload_slots: Arc<Mutex<HashMap<IpAddr, usize>>>,
     max_uploads_per_ip: usize,
     /// In-flight FetchPirBatch count per IP.
@@ -1155,6 +1164,7 @@ impl LightWalletService {
         }
     }
 
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     #[allow(clippy::result_large_err)]
     fn check_pir_rate_limit(&self, peer: IpAddr) -> Result<(), Status> {
         if self.pir_rate_limiter.check_n(peer, 1) {
@@ -1188,6 +1198,7 @@ impl LightWalletService {
         }
     }
 
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     fn try_slot(
         slots: &Arc<Mutex<HashMap<IpAddr, usize>>>,
         peer: IpAddr,

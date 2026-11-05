@@ -27,6 +27,7 @@ pub const MAX_DETECTION_KEY_HANDLES: usize = 4096;
 pub const MAX_DETECTION_POOL_BYTES: u64 = 8 << 30;
 
 /// Same horizon as OMR clue hints.
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 pub const DETECTION_KEY_TTL_SECS: u64 = 86_400;
 
 /// Full-map expiry sweep interval. Lookup also expires the requested handle
@@ -46,10 +47,12 @@ pub struct PooledDetectionKey {
     pub keys: Vec<Arc<Vec<u8>>>,
     pub network_byte: u8,
     pub expires_unix: u64,
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     pub byte_length: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
 pub enum PoolReject {
     Full,
     TooLarge,
@@ -58,7 +61,9 @@ pub enum PoolReject {
 
 pub struct DetectionKeyPool {
     entries: HashMap<[u8; 32], PooledDetectionKey>,
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     max_handles: usize,
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     max_total_bytes: u64,
     total_bytes: u64,
     last_sweep: Instant,
@@ -96,6 +101,7 @@ impl DetectionKeyPool {
     /// Insert a validated key. Sweeps expired rows first.
     ///
     /// The handle is 32 bytes from the OS RNG. It is not derived from the key.
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     pub fn insert(
         &mut self,
         key: PooledDetectionKey,
@@ -175,6 +181,7 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 pub fn expiry_from(now_unix: u64) -> u64 {
     now_unix.saturating_add(DETECTION_KEY_TTL_SECS)
 }
