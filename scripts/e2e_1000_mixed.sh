@@ -184,7 +184,8 @@ fi
 if [[ ! -x "$AND_TX" ]]; then
   echo "building headless ffi localnet_tx (not the emulator or the Tauri app)"
   (cd "$AND_FFI" && cargo build --release --bin localnet_tx --features localnet)
-  built="$(find "$AND_FFI" -path '*/release/localnet_tx' -type f -printf '%T@ %p\n' | sort -nr | awk 'NR==1{print $2}')"
+  # Workspace target is rust/target, not inside the crate directory.
+  built="$(find "$AND_FFI" "$AND_FFI/../target" -path '*/release/localnet_tx' -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}')"
   if [[ -z "$built" ]]; then
     echo "localnet_tx binary was not produced"
     exit 1
@@ -260,6 +261,9 @@ cache_path = "$WORK/lwd/cache"
 poll_interval = 1
 chain_name = "darkfi-testnet"
 network = "localnet"
+# A full trial-decrypt catch-up issues more than the public 120/min cap.
+rpc_rate_limit_per_min = 100000
+omr_rate_limit_per_min = 100000
 EOF
   RUST_LOG=info "$LWD" --config "$WORK/lightwalletd.toml" >"$WORK/lightwalletd.log" 2>&1 &
   lwd_pid=$!

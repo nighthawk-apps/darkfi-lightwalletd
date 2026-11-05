@@ -1,8 +1,8 @@
 [package]
 name = "darkfi-lightwalletd"
-version = "0.3.1"
+version = "0.3.2"
 homepage = "https://nighthawkapps.com"
-description = "DarkFi lightwallet server — compact block serving for shielded wallet sync (UnifOMR)"
+description = "DarkFi lightwallet server — compact blocks for trial-decrypt sync. UnifOMR is optional."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 repository = "https://github.com/nighthawk-apps/darkfi-lightwalletd"
 license = "AGPL-3.0-or-later"
@@ -26,10 +26,11 @@ path = "src/bin/e2e_unifomr_matrix.rs"
 required-features = ["fhe-omr"]
 
 [features]
-# UnifOMR (FHE) is enabled by default. To build without FHE (lighter binary):
-#   cargo build --no-default-features
-default = ["fhe-omr"]
-# Enable UnifOMR (GetUnifOmrDigest + FetchPirBatch).
+# Trial decryption is the default build: compact outputs, nullifiers, and DAO
+# calls. Experimental UnifOMR is opt-in:
+#   cargo build --features fhe-omr
+default = []
+# Enable UnifOMR (GetUnifOmrDigest + FetchPirBatch). Not part of the default binary.
 fhe-omr = ["dep:fhe", "dep:fhe-traits"]
 # Enable live testnet 0.3 integration tests (requires running darkfid + lightwalletd).
 #   cargo test --features testnet-e2e
@@ -39,6 +40,7 @@ testnet-e2e = []
 # DarkFi core
 darkfi = { path = "../darkfi-nighthawk-testnet", features = ["async-daemonize", "bs58", "blockchain", "rpc", "util"] }
 darkfi_money_contract = { path = "../darkfi-nighthawk-testnet/src/contract/money", features = ["client", "no-entrypoint"] }
+darkfi_dao_contract = { path = "../darkfi-nighthawk-testnet/src/contract/dao", features = ["no-entrypoint", "client"] }
 darkfi-sdk = { path = "../darkfi-nighthawk-testnet/src/sdk" }
 darkfi-serial = { path = "../darkfi-nighthawk-testnet/src/serial", features = ["async"] }
 

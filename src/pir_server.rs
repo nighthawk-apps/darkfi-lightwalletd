@@ -500,6 +500,7 @@ mod tests {
             token_commit: vec![0x7F; 32],
             omr_clue: Vec::new(),
             omr_metadata_enc: vec![0xFF; 64],
+            func_code: 0,
         };
         let block = |height: u32| crate::proto::CompactBlock {
             height,

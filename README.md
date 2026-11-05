@@ -1,8 +1,10 @@
 # darkfi-lightwalletd
 
-Privacy-preserving light wallet server for the DarkFi network. Serves compact blocks, UnifOMR digests, and transaction relay to mobile and desktop light wallets over gRPC.
+Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.1.** Clue registration accepts monotonic `key_version` values, including the wallet constant `1`. A lower version is rejected, and the same version is accepted only for the same clue key. Same DarkFi pin as the 3.00.027 wallets.
+**0.3.2.** Default build is trial decrypt: `GetCompactOutputBodies`, `GetNullifiers`, `GetCompactDaoCalls`, and auth-token history. `GetLightInfo.omr_supported` is false unless the binary is built with `fhe-omr`. DarkFi pin `e47d3f5f2` (Arti 0.48). Proto **2.1.0**.
+
+**0.3.1.** Clue registration accepts monotonic `key_version` values, including the wallet constant `1`. A lower version is rejected, and the same version is accepted only for the same clue key.
 
 **0.3.0.** DarkFi pin `8af61b3f0` (`nighthawk-testnet`), the same checkout as the 3.00.026 wallets. That pin pays a fee from tx-local change when the change output covers it. Proto **2.0.0**, with no 1.x compatibility path: historical tree snapshots for checkpoints, padded-range enforcement on `GetNoteCommitments`, `GetNullifiers`, and `GetCompactOutputBodies` (a power-of-two bucket of at least 1024, or one cut short within 64 blocks of the tip), a UnifOMR detection-key pool (`RegisterDetectionKey`, `GetUnifOmrDigestFromPool`; 24 h handles, 4096 handles and 8 GiB total), a `SubscribeBlocks` ChainTip stream, and `GetCompactOutputBodies`.
 
@@ -38,9 +40,9 @@ The server:
 2. Strips ZK proofs, signatures, and PoW data into compact blocks
 3. Caches compact blocks in a local sled database
 4. Serves them to wallets over gRPC
-5. Runs OMR detection — **UnifOMR (scheme `0x05`)** when `fhe-omr` is enabled (default)
+5. Serves those compact records for wallet trial decryption. Experimental UnifOMR detection runs only when the binary is built with `fhe-omr`.
 
-**Production clients use this binary** with `fhe-omr` (default). See [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md), [`docs/verification-checklist.md`](docs/verification-checklist.md), and [`docs/connectivity-triage.md`](docs/connectivity-triage.md).
+**Production clients use the default binary** (no `fhe-omr`). See [`docs/verification-checklist.md`](docs/verification-checklist.md) and [`docs/connectivity-triage.md`](docs/connectivity-triage.md). UnifOMR limits stay in [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md).
 
 ---
 
@@ -90,7 +92,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
-./scripts/build.sh --no-default-features   # without UnifOMR / FHE
+./scripts/build.sh --features fhe-omr      # experimental UnifOMR / FHE
 ```
 
 If `../darkfi-nighthawk-testnet` already exists (symlink to Android `third_party/darkfi` is OK):
@@ -185,7 +187,7 @@ Defined in `proto/lightwallet.proto`.
 | `GetUnifOmrDigest` | UnifOMR Round 1 (scheme `0x05`) |
 | `FetchPirBatch` | UnifOMR Round 2 |
 | `RegisterCluePublicKey` / `GetCluePublicKey` | UnifOMR send-path registry |
-| `GetOmrCapabilities` | Scheme + limits (`unifomr` when `fhe-omr`) |
+| `GetOmrCapabilities` | Disabled in the default build. `unifomr` only with `--features fhe-omr` |
 | `GetNullifiers` / `GetNoteCommitments` | Spend / commitment sync |
 
 `OmrDigestRequest`:
@@ -232,7 +234,7 @@ Defined in `proto/lightwallet.proto`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **UnifOMR (0x05, default w/ `fhe-omr`)** | ✅ | `GetUnifOmrDigest` + RLWE clues |
+| **Trial decrypt compact blocks (default)** | ✅ | `GetCompactOutputBodies`, nullifiers, DAO calls |
 | **FetchPirBatch** | ✅ | Length-prefixed SealPIR-style limbs |
 | **RegisterCluePublicKey / GetCluePublicKey** | ✅ | Decoy directory; **250 ms** timing pad |
 | **FHE any-match (S1)** | ✅ | Per-clue layers, client OR |
@@ -252,7 +254,7 @@ Defined in `proto/lightwallet.proto`.
 
 ### UnifOMR (scheme 0x05)
 
-- Requires this binary with `fhe-omr` (default feature)
+- Experimental. Build with `--features fhe-omr`. The default binary does not serve it.
 - Cross-client crypto parity: RLWE `n=1024`, signed AHE, `CLUE_ERROR_BOUND=2`, length-prefixed SealPIR limbs
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
 - Empty OMR → clients may supplemental trial-decrypt (decoy directory ≠ failure)

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/build.sh
-#   ./scripts/build.sh --no-default-features
+#   ./scripts/build.sh --features fhe-omr
 #   DARKFI_DIR=/path/to/darkfi-nighthawk-testnet ./scripts/build.sh
 #
 set -euo pipefail

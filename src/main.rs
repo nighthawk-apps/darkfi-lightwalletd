@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "fhe-omr"))]
     info!(
         target: "lightwalletd",
-        "UnifOMR disabled (built without fhe-omr feature)"
+        "Trial decrypt is the default path (GetCompactOutputBodies, GetNullifiers, GetCompactDaoCalls). UnifOMR is not in this build."
     );
 
     // Shared tip watch: poller notifies, SubscribeBlocks wakes.

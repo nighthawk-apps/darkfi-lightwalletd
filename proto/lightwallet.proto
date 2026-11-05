@@ -26,6 +26,13 @@ service DarkFiLightWallet {
   // Nullifiers stay on GetNullifiers.
   rpc GetCompactOutputBodies(BlockRange) returns (stream CompactOutputBody);
 
+  // Money outputs whose func_code matches. Used for token mints, which carry
+  // no UnifOMR clue and are otherwise invisible to a strict scan.
+  rpc GetCompactOutputsByFunc(FuncBlockRange) returns (stream CompactOutputBody);
+
+  // DAO mint, propose, vote, exec, and auth-transfer params with proofs removed.
+  rpc GetCompactDaoCalls(BlockRange) returns (stream CompactDaoCall);
+
   // Get a single compact block by height.
   rpc GetBlock(BlockHeight) returns (CompactBlock);
 
@@ -180,6 +187,7 @@ message CompactOutputBody {
   bytes omr_clue = 6;
   bytes omr_metadata_enc = 7;
   bytes tx_hash = 8;
+  uint32 func_code = 9;
 }
 
 // A compact representation of a DarkFi block, stripped of ZK proofs and
@@ -226,6 +234,22 @@ message CompactOutput {
   // Encrypted with recipient's pubkey via DH + ChaCha20Poly1305.
   // LWD stores opaquely; cannot decrypt. Merged on block confirm.
   bytes omr_metadata_enc = 6;
+  // MoneyFunction discriminant. Zero means the server did not record one.
+  uint32 func_code = 7;
+}
+
+message FuncBlockRange {
+  uint32 start_height = 1;
+  uint32 end_height = 2;
+  uint32 func_code = 3;
+}
+
+message CompactDaoCall {
+  uint32 height = 1;
+  bytes tx_hash = 2;
+  uint32 kind = 3;
+  bytes bulla = 4;
+  bytes payload = 5;
 }
 
 message NoteCommitmentUpdate {

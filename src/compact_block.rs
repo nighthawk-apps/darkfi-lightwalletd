@@ -63,6 +63,35 @@ pub struct CompactOutput {
     /// LWD stores and merges opaquely; cannot decrypt.
     #[serde(default)]
     pub omr_metadata_enc: Vec<u8>,
+
+    /// `MoneyFunction` discriminant. Zero means an older cache row did not record one.
+    #[serde(default)]
+    pub func_code: u8,
+}
+
+/// A Money call that has no coin (auth-token mint and freeze).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactFuncEvent {
+    pub tx_hash: [u8; 32],
+    /// `MoneyFunction` discriminant.
+    pub func_code: u8,
+}
+
+/// DAO call kept for the wallet, with proofs and signatures removed.
+///
+/// `kind` is the `DaoFunction` discriminant. `payload` is darkfi-serial of the
+/// fields the phone can use:
+/// - mint: `PublicKey` (notes public key); `bulla` is the DAO bulla
+/// - propose: `(pallas::Base, AeadEncryptedNote)`; `bulla` is the proposal bulla
+/// - vote: `(ElGamalEncryptedNote<4>, Vec<Nullifier>)`; `bulla` is the proposal bulla
+/// - exec: `u8` early-exec flag; `bulla` is the proposal bulla
+/// - auth transfer: `(Vec<ElGamalEncryptedNote<5>>, ElGamalEncryptedNote<3>)`; `bulla` is empty
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactDaoCallRecord {
+    pub tx_hash: [u8; 32],
+    pub kind: u32,
+    pub bulla: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// A compact representation of a single transaction within a block.
@@ -111,6 +140,14 @@ pub struct CompactBlock {
 
     /// Compact transactions in this block
     pub txs: Vec<CompactTx>,
+
+    /// DAO calls in this block. Empty on caches written before this field existed.
+    #[serde(default)]
+    pub dao_calls: Vec<CompactDaoCallRecord>,
+
+    /// Auth-token mint and freeze calls. They have no coin.
+    #[serde(default)]
+    pub func_events: Vec<CompactFuncEvent>,
 }
 
 impl CompactBlock {
@@ -136,6 +173,7 @@ impl CompactBlock {
                             token_commit: o.token_commit.to_vec(),
                             omr_clue: o.omr_clue.clone(),
                             omr_metadata_enc: o.omr_metadata_enc.clone(),
+                            func_code: u32::from(o.func_code),
                         })
                         .collect(),
                     nullifiers: tx.nullifiers.iter().map(|n| n.to_vec()).collect(),

@@ -34,20 +34,29 @@
 //! - AuthTokenMintV1, AuthTokenFreezeV1: no wallet-relevant data
 
 use darkfi::blockchain::block_store::BlockInfo;
+use darkfi_dao_contract::{
+    model::{
+        DaoAuthMoneyTransferParams, DaoExecParams, DaoMintParams, DaoProposeParams, DaoVoteParams,
+    },
+    DaoFunction,
+};
 use darkfi_money_contract::{
     model::{
-        MoneyBurnParamsV1, MoneyFeeParamsV1, MoneyGenesisMintParamsV1, MoneyPoWRewardParamsV1,
-        MoneyTokenMintParamsV1, MoneyTransferParamsV1,
+        MoneyAuthTokenFreezeParamsV1, MoneyAuthTokenMintParamsV1, MoneyBurnParamsV1,
+        MoneyFeeParamsV1, MoneyGenesisMintParamsV1, MoneyPoWRewardParamsV1, MoneyTokenMintParamsV1,
+        MoneyTransferParamsV1,
     },
     MoneyFunction,
 };
 use darkfi_sdk::crypto::pasta_prelude::PrimeField;
-use darkfi_sdk::crypto::MONEY_CONTRACT_ID;
-use darkfi_serial::{deserialize_async, deserialize_async_partial, serialize};
+use darkfi_sdk::crypto::{DAO_CONTRACT_ID, MONEY_CONTRACT_ID};
+use darkfi_serial::{deserialize, deserialize_async, deserialize_async_partial, serialize};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    compact_block::{CompactBlock, CompactOutput, CompactTx},
+    compact_block::{
+        CompactBlock, CompactDaoCallRecord, CompactFuncEvent, CompactOutput, CompactTx,
+    },
     error::{LightWalletError, Result},
 };
 
@@ -85,6 +94,8 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
         )));
     }
     let mut compact_txs = Vec::with_capacity(block.txs.len());
+    let mut dao_calls = Vec::new();
+    let mut func_events = Vec::new();
 
     for tx in &block.txs {
         if tx.calls.len() > MAX_CALLS_PER_TX {
@@ -102,8 +113,24 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
         for call_leaf in &tx.calls {
             let call = &call_leaf.data;
             let contract_id = call.contract_id;
+            let data = &call.data;
 
-            // We only process Money contract calls in v1
+            if contract_id == *DAO_CONTRACT_ID {
+                match compact_dao_call(tx_hash.inner(), data) {
+                    Ok(Some(record)) => dao_calls.push(record),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            target: "lightwalletd::block_processor",
+                            "Skipping DAO call in tx {}: {e}",
+                            tx_hash
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Money outputs, nullifiers, and auth-token history.
             if contract_id != *MONEY_CONTRACT_ID {
                 trace!(
                     target: "lightwalletd::block_processor",
@@ -112,7 +139,6 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
                 continue;
             }
 
-            let data = &call.data;
             if data.is_empty() {
                 warn!(
                     target: "lightwalletd::block_processor",
@@ -149,7 +175,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
                     nullifiers.push(params.input.nullifier.inner().to_repr());
 
                     if !params.output.tx_local {
-                        outputs.push(output_to_compact(&params.output)?);
+                        outputs.push(output_to_compact(&params.output, data[0])?);
                     }
                 }
 
@@ -167,7 +193,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
 
                     for output in &params.outputs {
                         if !output.tx_local {
-                            outputs.push(output_to_compact(output)?);
+                            outputs.push(output_to_compact(output, data[0])?);
                         }
                     }
                 }
@@ -182,7 +208,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
 
                     for output in &params.outputs {
                         if !output.tx_local {
-                            outputs.push(output_to_compact(output)?);
+                            outputs.push(output_to_compact(output, data[0])?);
                         }
                     }
                 }
@@ -196,7 +222,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
                         })?;
 
                     if !params.output.tx_local {
-                        outputs.push(output_to_compact(&params.output)?);
+                        outputs.push(output_to_compact(&params.output, data[0])?);
                     }
                 }
 
@@ -215,6 +241,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
                         token_commit: [0u8; 32],  // TokenMint doesn't have token_commit
                         omr_clue: vec![],         // TokenMint doesn't have OMR clue
                         omr_metadata_enc: vec![],
+                        func_code: data[0],
                     });
                 }
 
@@ -232,13 +259,29 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
                     // BurnV1 has no outputs
                 }
 
-                MoneyFunction::AuthTokenMintV1 | MoneyFunction::AuthTokenFreezeV1 => {
-                    // These don't produce wallet-relevant outputs or nullifiers
-                    trace!(
-                        target: "lightwalletd::block_processor",
-                        "Skipping {:?} call (no wallet-relevant data)",
-                        func
-                    );
+                MoneyFunction::AuthTokenMintV1 => {
+                    let _: MoneyAuthTokenMintParamsV1 =
+                        deserialize_async(&data[1..]).await.map_err(|e| {
+                            LightWalletError::ProcessingError(format!(
+                                "Failed to deserialize AuthTokenMintV1 params: {e}"
+                            ))
+                        })?;
+                    func_events.push(CompactFuncEvent {
+                        tx_hash: *tx_hash.inner(),
+                        func_code: data[0],
+                    });
+                }
+                MoneyFunction::AuthTokenFreezeV1 => {
+                    let _: MoneyAuthTokenFreezeParamsV1 =
+                        deserialize_async(&data[1..]).await.map_err(|e| {
+                            LightWalletError::ProcessingError(format!(
+                                "Failed to deserialize AuthTokenFreezeV1 params: {e}"
+                            ))
+                        })?;
+                    func_events.push(CompactFuncEvent {
+                        tx_hash: *tx_hash.inner(),
+                        func_code: data[0],
+                    });
                 }
             }
         }
@@ -260,6 +303,8 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
         prev_hash: *header.previous.inner(),
         timestamp: header.timestamp.inner(),
         txs: compact_txs,
+        dao_calls,
+        func_events,
     };
 
     debug!(
@@ -279,7 +324,10 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
 /// data server-side from the ephemeral public key embedded in the encrypted
 /// note. This keeps all OMR/OMD logic within `darkfi-lightwalletd` without
 /// requiring modifications to the upstream Money contract.
-fn output_to_compact(output: &darkfi_money_contract::model::Output) -> Result<CompactOutput> {
+fn output_to_compact(
+    output: &darkfi_money_contract::model::Output,
+    func_code: u8,
+) -> Result<CompactOutput> {
     use darkfi_sdk::crypto::pasta_prelude::PrimeField;
 
     Ok(CompactOutput {
@@ -291,7 +339,74 @@ fn output_to_compact(output: &darkfi_money_contract::model::Output) -> Result<Co
         // No upstream contract modification needed.
         omr_clue: vec![],
         omr_metadata_enc: vec![],
+        func_code,
     })
+}
+
+/// Keep the DAO fields a light client can decrypt. Proofs stay on the transaction.
+fn compact_dao_call(tx_hash: &[u8; 32], data: &[u8]) -> Result<Option<CompactDaoCallRecord>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let func = match DaoFunction::try_from(data[0]) {
+        Ok(func) => func,
+        Err(_) => return Ok(None),
+    };
+    let (bulla, payload) = match func {
+        DaoFunction::Mint => {
+            let params: DaoMintParams = deserialize(&data[1..])
+                .map_err(|e| LightWalletError::ProcessingError(format!("DAO mint params: {e}")))?;
+            (
+                params.dao_bulla.to_bytes().to_vec(),
+                serialize(&params.dao_pubkey),
+            )
+        }
+        DaoFunction::Propose => {
+            let params: DaoProposeParams = deserialize(&data[1..]).map_err(|e| {
+                LightWalletError::ProcessingError(format!("DAO propose params: {e}"))
+            })?;
+            (
+                params.proposal_bulla.to_bytes().to_vec(),
+                serialize(&(params.token_commit, params.note)),
+            )
+        }
+        DaoFunction::Vote => {
+            let params: DaoVoteParams = deserialize(&data[1..])
+                .map_err(|e| LightWalletError::ProcessingError(format!("DAO vote params: {e}")))?;
+            let nullifiers: Vec<_> = params
+                .inputs
+                .iter()
+                .map(|input| input.vote_nullifier)
+                .collect();
+            (
+                params.proposal_bulla.to_bytes().to_vec(),
+                serialize(&(params.note, nullifiers)),
+            )
+        }
+        DaoFunction::Exec => {
+            let params: DaoExecParams = deserialize(&data[1..])
+                .map_err(|e| LightWalletError::ProcessingError(format!("DAO exec params: {e}")))?;
+            (
+                params.proposal_bulla.to_bytes().to_vec(),
+                serialize(&(params.early_exec as u8)),
+            )
+        }
+        DaoFunction::AuthMoneyTransfer => {
+            let params: DaoAuthMoneyTransferParams = deserialize(&data[1..]).map_err(|e| {
+                LightWalletError::ProcessingError(format!("DAO auth transfer params: {e}"))
+            })?;
+            (
+                Vec::new(),
+                serialize(&(params.enc_attrs, params.dao_change_attrs)),
+            )
+        }
+    };
+    Ok(Some(CompactDaoCallRecord {
+        tx_hash: *tx_hash,
+        kind: func as u32,
+        bulla,
+        payload,
+    }))
 }
 
 #[cfg(test)]
@@ -434,5 +549,119 @@ mod tests {
 
         let compact = process_block(&block).await.unwrap();
         assert!(compact.txs.is_empty());
+        assert!(compact.dao_calls.is_empty());
+    }
+
+    fn dummy_note() -> darkfi_sdk::crypto::note::AeadEncryptedNote {
+        use darkfi_sdk::crypto::{PublicKey, SecretKey};
+        use darkfi_sdk::pasta::pallas;
+        darkfi_sdk::crypto::note::AeadEncryptedNote {
+            ciphertext: vec![0x11, 0x22, 0x33, 0x44],
+            ephem_public: PublicKey::from_secret(SecretKey::from(pallas::Base::from(4u64))),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_token_mint_keeps_func_code_and_note() {
+        use darkfi_money_contract::model::{Coin, MoneyTokenMintParamsV1};
+        use darkfi_sdk::pasta::pallas;
+
+        let coin = Coin::from(pallas::Base::from(3u64));
+        let enc_note = dummy_note();
+        let params = MoneyTokenMintParamsV1 {
+            coin,
+            enc_note: enc_note.clone(),
+        };
+        let mut data = vec![MoneyFunction::TokenMintV1 as u8];
+        data.extend(serialize(&params));
+        let mut block = make_empty_block(9);
+        block.txs.push(tx_with_call(*MONEY_CONTRACT_ID, data));
+
+        let compact = process_block(&block).await.unwrap();
+        assert_eq!(compact.txs.len(), 1);
+        let output = &compact.txs[0].outputs[0];
+        assert_eq!(output.func_code, MoneyFunction::TokenMintV1 as u8);
+        assert_eq!(output.coin, coin.to_bytes());
+        assert_eq!(output.encrypted_note, serialize(&enc_note));
+        assert!(output.value_commit.is_empty());
+        assert!(compact.txs[0].nullifiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_mint_is_history_without_a_coin() {
+        use darkfi_money_contract::model::MoneyAuthTokenMintParamsV1;
+        use darkfi_money_contract::model::TokenId;
+        use darkfi_sdk::crypto::{PublicKey, SecretKey};
+        use darkfi_sdk::pasta::pallas;
+
+        let params = MoneyAuthTokenMintParamsV1 {
+            token_id: TokenId::from(pallas::Base::from(8u64)),
+            mint_pubkey: PublicKey::from_secret(SecretKey::from(pallas::Base::from(5u64))),
+        };
+        let mut data = vec![MoneyFunction::AuthTokenMintV1 as u8];
+        data.extend(serialize(&params));
+        let mut block = make_empty_block(10);
+        block.txs.push(tx_with_call(*MONEY_CONTRACT_ID, data));
+
+        let compact = process_block(&block).await.unwrap();
+        assert!(compact.txs.is_empty(), "auth mint has no coin to append");
+        assert_eq!(compact.func_events.len(), 1);
+        assert_eq!(
+            compact.func_events[0].func_code,
+            MoneyFunction::AuthTokenMintV1 as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dao_propose_survives_without_proofs_or_inputs() {
+        use darkfi_dao_contract::model::{DaoProposeParams, DaoProposeParamsInput};
+        use darkfi_dao_contract::DaoFunction;
+        use darkfi_money_contract::model::Nullifier;
+        use darkfi_sdk::crypto::{MerkleNode, PublicKey, SecretKey};
+        use darkfi_sdk::pasta::group::Group;
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::deserialize;
+
+        let note = dummy_note();
+        let dropped = Nullifier::from(pallas::Base::from(0xABCDu64));
+        let params = DaoProposeParams {
+            dao_merkle_root: MerkleNode::from(pallas::Base::from(1u64)),
+            merkle_coin_root: MerkleNode::from(pallas::Base::from(2u64)),
+            smt_null_root: pallas::Base::from(3u64),
+            token_commit: pallas::Base::from(7u64),
+            proposal_bulla: darkfi_dao_contract::model::DaoProposalBulla::from(pallas::Base::from(
+                9u64,
+            )),
+            note: note.clone(),
+            inputs: vec![DaoProposeParamsInput {
+                value_commit: pallas::Point::generator(),
+                input_nullifier: dropped,
+                signature_public: PublicKey::from_secret(SecretKey::from(pallas::Base::from(6u64))),
+            }],
+        };
+        let mut data = vec![DaoFunction::Propose as u8];
+        data.extend(serialize(&params));
+        let tx = tx_with_call(*DAO_CONTRACT_ID, data);
+        let mut block = make_empty_block(11);
+        block.txs.push(tx);
+
+        let compact = process_block(&block).await.unwrap();
+        assert!(compact.txs.is_empty());
+        assert_eq!(compact.dao_calls.len(), 1);
+        let call = &compact.dao_calls[0];
+        assert_eq!(call.kind, u32::from(DaoFunction::Propose as u8));
+        assert_eq!(call.bulla, params.proposal_bulla.to_bytes());
+        let (token_commit, kept_note): (pallas::Base, darkfi_sdk::crypto::note::AeadEncryptedNote) =
+            deserialize(&call.payload).unwrap();
+        assert_eq!(token_commit, params.token_commit);
+        assert_eq!(kept_note, note);
+        let raw = serialize(&dropped);
+        assert!(
+            !call
+                .payload
+                .windows(raw.len())
+                .any(|window| window == raw.as_slice()),
+            "proposal inputs are stripped"
+        );
     }
 }

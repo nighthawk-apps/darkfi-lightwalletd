@@ -54,6 +54,8 @@ mod tests {
             prev_hash: [prev; 32],
             timestamp: 0,
             txs: Vec::<CompactTx>::new(),
+            dao_calls: vec![],
+            func_events: vec![],
         }
     }
 

@@ -64,8 +64,11 @@ const OMR_METADATA_ENC_TREE: &str = "lightwalletd_omr_metadata_enc";
 
 /// On-disk cache layout version. Bump when compact-block bincode or tree
 /// names change incompatibly. Missing key is treated as a pre-versioned
-/// store and stamped in place (no wipe).
-const CACHE_FORMAT_VERSION: u32 = 1;
+/// store and stamped in place (no wipe). A mismatch clears derived block
+/// rows so the poller rebuilds them from darkfid; clue keys are kept.
+///
+/// 2: `CompactOutput.func_code`, DAO calls, and auth-token events.
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// OMR clue hints expire this many seconds after they were stored (S21).
 ///
@@ -258,6 +261,33 @@ impl Cache {
             .any(|existing| existing.as_ref() == name.as_bytes())
     }
 
+    /// Drop compact blocks and the indexes rebuilt from them.
+    ///
+    /// Clue registrations and the directory attestation key stay. The poller
+    /// refills blocks from darkfid.
+    fn clear_derived_block_cache(&self) -> Result<()> {
+        use darkfi_sdk::crypto::MerkleTree;
+        fn io(e: sled::Error) -> LightWalletError {
+            LightWalletError::CacheError(format!("clear derived cache: {e}"))
+        }
+        self.compact_blocks.clear().map_err(io)?;
+        self.block_hashes.clear().map_err(io)?;
+        self.hash_to_height.clear().map_err(io)?;
+        self.nullifiers.clear().map_err(io)?;
+        self.coins.clear().map_err(io)?;
+        self.merkle_snapshots.clear().map_err(io)?;
+        self.meta.remove(META_TIP_HEIGHT).map_err(io)?;
+        self.meta.remove(META_TIP_HASH).map_err(io)?;
+        self.meta.remove(META_TIP_MERKLE_TREE).map_err(io)?;
+        self.meta.remove(META_TIP_MERKLE_HEIGHT).map_err(io)?;
+        if let Ok(mut tip) = self.tip_tree.lock() {
+            tip.height = None;
+            tip.tree = MerkleTree::new(TIP_TREE_CHECKPOINTS);
+            tip.load_failed = false;
+        }
+        Ok(())
+    }
+
     fn ensure_cache_format(&self) -> Result<()> {
         match self.meta.get(META_CACHE_FORMAT)? {
             None => {
@@ -272,10 +302,14 @@ impl Cache {
                     0
                 };
                 if found != CACHE_FORMAT_VERSION {
-                    return Err(LightWalletError::CacheFormatMismatch {
-                        found,
-                        expected: CACHE_FORMAT_VERSION,
-                    });
+                    warn!(
+                        target: "lightwalletd::cache",
+                        "Cache format {found} != {CACHE_FORMAT_VERSION}; clearing derived \
+                         compact blocks so they rebuild with DAO calls and func_code"
+                    );
+                    self.clear_derived_block_cache()?;
+                    self.meta
+                        .insert(META_CACHE_FORMAT, &CACHE_FORMAT_VERSION.to_be_bytes())?;
                 }
                 Ok(())
             }
@@ -1614,10 +1648,13 @@ mod tests {
                     token_commit: [0xCC; 32],
                     omr_clue: vec![],
                     omr_metadata_enc: vec![],
+                    func_code: 0,
                 }],
                 nullifiers: vec![[height as u8; 32]],
                 fee: 100,
             }],
+            dao_calls: vec![],
+            func_events: vec![],
         }
     }
 
@@ -1628,6 +1665,8 @@ mod tests {
             prev_hash: [height.wrapping_sub(1) as u8; 32],
             timestamp: 1000 + height as u64,
             txs: vec![],
+            dao_calls: vec![],
+            func_events: vec![],
         }
     }
 
@@ -1640,6 +1679,7 @@ mod tests {
                 token_commit: [0xCC; 32],
                 omr_clue: vec![],
                 omr_metadata_enc: vec![],
+                func_code: 0,
             })
             .collect();
         CompactBlock {
@@ -1653,6 +1693,8 @@ mod tests {
                 nullifiers: vec![],
                 fee: 100,
             }],
+            dao_calls: vec![],
+            func_events: vec![],
         }
     }
 

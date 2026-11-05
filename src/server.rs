@@ -125,9 +125,10 @@ const PIR_RATE_LIMIT_PER_MIN: u32 = 4096;
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// Compact-block wire version reported by GetLightInfo.
 /// Bump when the compact format or RPC contract changes.
+/// 2.1.0: compact DAO calls and Money `func_code` (token mint, auth-token history).
 /// 2.0.0: historical snapshots, padded ranges, detection-key pool,
 /// ChainTip subscribe, compact output bodies. No 1.0.0 compatibility path.
-const LIGHTWALLET_PROTO_VERSION: &str = "2.0.0";
+const LIGHTWALLET_PROTO_VERSION: &str = "2.1.0";
 
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
 const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
@@ -418,10 +419,143 @@ fn spawn_output_bodies(
                         omr_clue: output.omr_clue.clone(),
                         omr_metadata_enc: output.omr_metadata_enc.clone(),
                         tx_hash: tx_body.tx_hash.to_vec(),
+                        func_code: u32::from(output.func_code),
                     };
                     if !send_stream(&tx, Ok(body)).await {
                         return;
                     }
+                }
+            }
+            prev = Some(block);
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// Money outputs whose `func_code` matches, plus auth-token events with no coin.
+fn spawn_outputs_by_func(
+    cache: Arc<Cache>,
+    start: u32,
+    end: u32,
+    func_code: u32,
+) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        let mut prev: Option<CompactBlock> = None;
+        for height in start..=end {
+            if tx.is_closed() {
+                return;
+            }
+            let block = match cache.get_compact_block(height) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    let _ = send_stream(&tx, Err(discontinuity_status())).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = send_stream(&tx, Err(cache_status(e))).await;
+                    return;
+                }
+            };
+            if let Some(ref p) = prev {
+                if let Err(st) = check_successor(p, &block) {
+                    let _ = send_stream(&tx, Err(st)).await;
+                    return;
+                }
+            } else if block.height != start {
+                let _ = send_stream(&tx, Err(discontinuity_status())).await;
+                return;
+            }
+            for tx_body in &block.txs {
+                for output in &tx_body.outputs {
+                    if u32::from(output.func_code) != func_code {
+                        continue;
+                    }
+                    let body = proto::CompactOutputBody {
+                        height: block.height,
+                        hash: block.hash.to_vec(),
+                        prev_hash: block.prev_hash.to_vec(),
+                        coin: output.coin.to_vec(),
+                        encrypted_note: output.encrypted_note.clone(),
+                        omr_clue: output.omr_clue.clone(),
+                        omr_metadata_enc: output.omr_metadata_enc.clone(),
+                        tx_hash: tx_body.tx_hash.to_vec(),
+                        func_code,
+                    };
+                    if !send_stream(&tx, Ok(body)).await {
+                        return;
+                    }
+                }
+            }
+            for event in &block.func_events {
+                if u32::from(event.func_code) != func_code {
+                    continue;
+                }
+                let body = proto::CompactOutputBody {
+                    height: block.height,
+                    hash: block.hash.to_vec(),
+                    prev_hash: block.prev_hash.to_vec(),
+                    coin: vec![0u8; 32],
+                    encrypted_note: Vec::new(),
+                    omr_clue: Vec::new(),
+                    omr_metadata_enc: Vec::new(),
+                    tx_hash: event.tx_hash.to_vec(),
+                    func_code,
+                };
+                if !send_stream(&tx, Ok(body)).await {
+                    return;
+                }
+            }
+            prev = Some(block);
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+fn spawn_dao_calls(
+    cache: Arc<Cache>,
+    start: u32,
+    end: u32,
+) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactDaoCall, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    tokio::spawn(async move {
+        let mut prev: Option<CompactBlock> = None;
+        for height in start..=end {
+            if tx.is_closed() {
+                return;
+            }
+            let block = match cache.get_compact_block(height) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    let _ = send_stream(&tx, Err(discontinuity_status())).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = send_stream(&tx, Err(cache_status(e))).await;
+                    return;
+                }
+            };
+            if let Some(ref p) = prev {
+                if let Err(st) = check_successor(p, &block) {
+                    let _ = send_stream(&tx, Err(st)).await;
+                    return;
+                }
+            } else if block.height != start {
+                let _ = send_stream(&tx, Err(discontinuity_status())).await;
+                return;
+            }
+            for call in &block.dao_calls {
+                let body = proto::CompactDaoCall {
+                    height: block.height,
+                    tx_hash: call.tx_hash.to_vec(),
+                    kind: call.kind,
+                    bulla: call.bulla.clone(),
+                    payload: call.payload.clone(),
+                };
+                if !send_stream(&tx, Ok(body)).await {
+                    return;
                 }
             }
             prev = Some(block);
@@ -1440,6 +1574,45 @@ impl DarkFiLightWallet for LightWalletService {
         )))
     }
 
+    type GetCompactOutputsByFuncStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>>;
+
+    /// Money outputs of one function code, plus auth-token events with an empty note.
+    async fn get_compact_outputs_by_func(
+        &self,
+        request: Request<proto::FuncBlockRange>,
+    ) -> Result<Response<Self::GetCompactOutputsByFuncStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
+        let range = request.into_inner();
+        let (start, end) =
+            require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        Ok(Response::new(spawn_outputs_by_func(
+            Arc::clone(&self.cache),
+            start,
+            end,
+            range.func_code,
+        )))
+    }
+
+    type GetCompactDaoCallsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::CompactDaoCall, Status>>;
+
+    /// DAO mint, propose, vote, exec, and auth-transfer records. Proofs are omitted.
+    async fn get_compact_dao_calls(
+        &self,
+        request: Request<proto::BlockRange>,
+    ) -> Result<Response<Self::GetCompactDaoCallsStream>, Status> {
+        self.check_rpc_rate_limit(&request)?;
+        let range = request.into_inner();
+        let (start, end) =
+            require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        Ok(Response::new(spawn_dao_calls(
+            Arc::clone(&self.cache),
+            start,
+            end,
+        )))
+    }
+
     /// Stream compact blocks in a height range.
     async fn get_block_range(
         &self,
@@ -2135,9 +2308,9 @@ impl DarkFiLightWallet for LightWalletService {
 
     /// Get OMR capabilities.
     ///
-    /// Reports whether UnifOMR is enabled and its configuration.
-    /// Clients use this to decide whether to attempt OMR or fall back
-    /// to trial decryption immediately.
+    /// The default server build reports UnifOMR disabled. Wallets then use
+    /// padded trial decryption. `fhe-omr` is the only build that advertises
+    /// the experimental scheme.
     async fn get_omr_capabilities(
         &self,
         _request: Request<proto::Empty>,
@@ -2622,6 +2795,18 @@ impl DarkFiLightWallet for LightWalletService {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "fhe-omr"))]
+    #[test]
+    fn trial_decrypt_is_the_default_build() {
+        assert!(!cfg!(feature = "fhe-omr"));
+    }
+
+    #[cfg(feature = "fhe-omr")]
+    #[test]
+    fn unifomr_stays_behind_an_explicit_feature() {
+        assert!(cfg!(feature = "fhe-omr"));
+    }
+
     #[test]
     fn end_height_zero_resolves_to_cached_tip() {
         let dir = tempfile::tempdir().unwrap();
@@ -2635,6 +2820,8 @@ mod tests {
                 prev_hash: [0u8; 32],
                 timestamp: 1,
                 txs: vec![],
+                dao_calls: vec![],
+                func_events: vec![],
             })
             .unwrap();
         assert_eq!(resolve_block_range(&cache, 0, 0).unwrap(), (0, 40));
@@ -2649,6 +2836,8 @@ mod tests {
                 prev_hash: [0u8; 32],
                 timestamp: 2,
                 txs: vec![],
+                dao_calls: vec![],
+                func_events: vec![],
             })
             .unwrap();
         assert!(resolve_block_range(&cache, 0, 0).is_err());
@@ -2672,6 +2861,8 @@ mod tests {
                     prev_hash: [h.wrapping_sub(1) as u8; 32],
                     timestamp: h as u64,
                     txs: vec![],
+                    dao_calls: vec![],
+                    func_events: vec![],
                 })
                 .unwrap();
         }
@@ -2746,6 +2937,8 @@ mod tests {
             prev_hash: [prev; 32],
             timestamp: 1_000 + height as u64,
             txs: vec![],
+            dao_calls: vec![],
+            func_events: vec![],
         }
     }
 
@@ -3073,6 +3266,8 @@ mod tests {
                     prev_hash,
                     timestamp: height as u64,
                     txs: vec![],
+                    dao_calls: vec![],
+                    func_events: vec![],
                 })
                 .unwrap();
             prev_hash = hash;
@@ -3097,6 +3292,7 @@ mod tests {
                             token_commit: [4; 32],
                             omr_clue: vec![5],
                             omr_metadata_enc: vec![6],
+                            func_code: 0,
                         },
                         crate::compact_block::CompactOutput {
                             coin: coin_b,
@@ -3105,11 +3301,14 @@ mod tests {
                             token_commit: [8; 32],
                             omr_clue: vec![],
                             omr_metadata_enc: vec![9, 9],
+                            func_code: 0,
                         },
                     ],
                     nullifiers: vec![[0xAB; 32]],
                     fee: 7,
                 }],
+                dao_calls: vec![],
+                func_events: vec![],
             })
             .unwrap();
         let (svc, _) = test_service(Arc::clone(&cache));
@@ -3210,10 +3409,13 @@ mod tests {
                     token_commit: [0x33; 32],
                     omr_clue: clue,
                     omr_metadata_enc: vec![0x44; 16],
+                    func_code: 0,
                 }],
                 nullifiers: vec![[0x55; 32]],
                 fee: 1,
             }],
+            dao_calls: vec![],
+            func_events: vec![],
         };
         let raw = block.to_proto().encode_to_vec();
         assert!(raw.len() > crate::pir_server::MAX_PIR_PAYLOAD_BYTES);
