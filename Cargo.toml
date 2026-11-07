@@ -1,6 +1,6 @@
 [package]
 name = "darkfi-lightwalletd"
-version = "0.3.2"
+version = "0.3.3"
 homepage = "https://nighthawkapps.com"
 description = "DarkFi lightwallet server — compact blocks for trial-decrypt sync. UnifOMR is optional."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]

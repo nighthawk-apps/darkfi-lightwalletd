@@ -2,6 +2,8 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
+**0.3.3.** Same trial-decrypt default as 0.3.2; version bump aligned with Moonshine 3.1.5 / Nighthawk 3.01.05 light-wallet clients.
+
 **0.3.2.** Default build is trial decrypt: `GetCompactOutputBodies`, `GetNullifiers`, `GetCompactDaoCalls`, and auth-token history. `GetLightInfo.omr_supported` is false unless the binary is built with `fhe-omr`. DarkFi pin `e47d3f5f2` (Arti 0.48). Proto **2.1.0**.
 
 **0.3.1.** Clue registration accepts monotonic `key_version` values, including the wallet constant `1`. A lower version is rejected, and the same version is accepted only for the same clue key.
