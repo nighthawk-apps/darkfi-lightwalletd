@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.3.** Same trial-decrypt default as 0.3.2; version bump aligned with Moonshine 3.1.5 / Nighthawk 3.01.05 light-wallet clients.
+**0.3.3.** Same trial-decrypt default as 0.3.2; version bump aligned with Moonshine 3.1.5 / Nighthawk 3.01.05 light-wallet clients. Build pin `44ec78b6e` (`nighthawk-testnet`, includes upstream tx-local fees).
 
 **0.3.2.** Default build is trial decrypt: `GetCompactOutputBodies`, `GetNullifiers`, `GetCompactDaoCalls`, and auth-token history. `GetLightInfo.omr_supported` is false unless the binary is built with `fhe-omr`. DarkFi pin `e47d3f5f2` (Arti 0.48). Proto **2.1.0**.
 
@@ -54,14 +54,14 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `8af61b3f0` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `44ec78b6e` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi-nighthawk-testnet/   # pin 8af61b3f0 — or symlink to Android third_party/darkfi
+  darkfi-nighthawk-testnet/   # pin 44ec78b6e — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
   nighthawk-android-wallet/
@@ -90,7 +90,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev` (`8af61b3f03b47164b4e4e01fcdc84e2744cb8570`). Overrides:
+`scripts/darkfi.rev` (`44ec78b6efbf1d3e797f99bffe95195994b2488d`). Overrides:
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
