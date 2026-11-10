@@ -43,25 +43,53 @@ use darkfi_lightwalletd::{
     server::LightWalletService,
 };
 
+/// Cyberpunk teal `#5CE1FF` and wallpaper pink `#C94BB8`.
+const CYBER_TEAL: (u8, u8, u8) = (0x5C, 0xE1, 0xFF);
+const CYBER_PINK: (u8, u8, u8) = (0xC9, 0x4B, 0xB8);
+
+/// Three-line wordmark: nighthawk × darkfi / lightwalletd server.
+const HEADER_ART: &str = r#"
+┌─ nighthawk  ×  darkfi ─┐
+│  lightwalletd server   │
+└────────────────────────┘
+"#;
+
+fn nighthawk_header() -> String {
+    paint_cyberpunk(HEADER_ART)
+}
+
+/// Sweep glyphs from teal to pink and back. Each row is phase-shifted so the
+/// two cyberpunk colors change across the wordmark.
+fn paint_cyberpunk(art: &str) -> String {
+    let mut out = String::new();
+    for (row, line) in art.trim_matches('\n').lines().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            if ch == ' ' {
+                out.push(' ');
+                continue;
+            }
+            let phase = (col as f64 + row as f64 * 7.0) * std::f64::consts::TAU / 28.0;
+            let t = (phase.cos() + 1.0) * 0.5;
+            let r = blend(CYBER_TEAL.0, CYBER_PINK.0, t);
+            let g = blend(CYBER_TEAL.1, CYBER_PINK.1, t);
+            let b = blend(CYBER_TEAL.2, CYBER_PINK.2, t);
+            out.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}"));
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    out
+}
+
+fn blend(from: u8, to: u8, t: f64) -> u8 {
+    (from as f64 + (to as f64 - from as f64) * t).round() as u8
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
-    let nighthawk_header = r#"
-[33m _   _ ___ ____ _   _ _____ _   _    ___        ___  _  __ 
-| \ | |_ _/ ___| | | |_   _| | | |  / \ \      / / |/ /
-|  \| || | |  _| |_| | | | | |_| | / _ \ \ /\ / /| ' / 
-| |\  || | |_| |  _  | | | |  _  |/ ___ \ V  V / | . \ 
-|_| \_|___\____|_| |_| |_| |_| |_/_/   \_\_/\_/  |_|\_\
-                                                       
-    _    ____  ____  ____  
-   / \  |  _ \|  _ \/ ___| 
-  / _ \ | |_) | |_) \___ \ 
- / ___ \|  __/|  __/ ___) |
-/_/   \_\_|   |_|   |____/ [0m
-"#;
-    println!("{}", nighthawk_header);
+    print!("{}", nighthawk_header());
 
     info!(target: "lightwalletd", "darkfi-lightwalletd v{} ({})", env!("CARGO_PKG_VERSION"), option_env!("GIT_HASH").unwrap_or("unknown"));
     info!(target: "lightwalletd", "Anonymous. Uncensored. Sovereign.");
@@ -396,4 +424,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(target: "lightwalletd", "Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::paint_cyberpunk;
+
+    #[test]
+    fn header_shifts_between_cyberpunk_teal_and_pink() {
+        let painted = paint_cyberpunk(&"#".repeat(48));
+        let mut saw_teal = false;
+        let mut saw_pink = false;
+        for code in painted.split("\u{1b}[38;2;").skip(1) {
+            let rgb = code.split('m').next().unwrap();
+            let mut parts = rgb.split(';');
+            let r: u8 = parts.next().unwrap().parse().unwrap();
+            let g: u8 = parts.next().unwrap().parse().unwrap();
+            let b: u8 = parts.next().unwrap().parse().unwrap();
+            if r < 120 && g > 180 && b > 220 {
+                saw_teal = true;
+            }
+            if r > 170 && g < 120 && (150..220).contains(&b) {
+                saw_pink = true;
+            }
+        }
+        assert!(saw_teal, "expected cyberpunk teal #5CE1FF");
+        assert!(saw_pink, "expected cyberpunk pink #C94BB8");
+
+        let header = super::nighthawk_header();
+        let plain = strip_ansi(&header);
+        assert_eq!(plain.trim_matches('\n').lines().count(), 3);
+        assert!(plain.contains("nighthawk"));
+        assert!(plain.contains("darkfi"));
+        assert!(plain.contains("lightwalletd server"));
+        assert!(header.contains("\u{1b}[38;2;"));
+        assert!(!header.contains("\u{1b}[33m"));
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
 }
