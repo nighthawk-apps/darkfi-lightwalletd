@@ -89,6 +89,10 @@ const META_CACHE_FORMAT: &[u8] = b"cache_format";
 const META_CLUE_DIR_PEPPER: &[u8] = b"unifomr_clue_dir_pepper";
 const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor";
 const META_TIP_FETCHED_UNIX: &[u8] = b"tip_fetched_unix";
+/// Height the in-progress rewind must reach. Cleared only after the tip matches.
+const META_REWINDING_TO: &[u8] = b"rewinding_to";
+/// `height || hash || block_target || difficulty` for the tip those facts describe.
+const META_TIP_CHAIN_FACTS: &[u8] = b"tip_chain_facts";
 
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
@@ -318,6 +322,16 @@ impl Cache {
     }
 
     fn verify_tip_readable(&self) -> Result<()> {
+        // zcash/lightwalletd applies a reorg inside one database transaction.
+        // Sled writes here span trees, so a crash mid-rewind leaves a marker
+        // and the next open finishes the same rewind.
+        if let Some(target) = self.rewind_marker()? {
+            warn!(
+                target: "lightwalletd::cache",
+                "Resuming interrupted rewind to height {target}"
+            );
+            return self.rewind_to_height(target);
+        }
         let Some((height, _)) = self.get_tip()? else {
             return Ok(());
         };
@@ -326,9 +340,9 @@ impl Cache {
             Ok(None) => {
                 warn!(
                     target: "lightwalletd::cache",
-                    "Tip height {height} has no compact block; cache may be mid-rewind"
+                    "Tip height {height} has no compact block; repairing tip"
                 );
-                Ok(())
+                self.repair_missing_tip(height)
             }
             Err(e) => {
                 error!(
@@ -338,6 +352,33 @@ impl Cache {
                 Err(e)
             }
         }
+    }
+
+    fn rewind_marker(&self) -> Result<Option<u32>> {
+        let Some(bytes) = self.meta.get(META_REWINDING_TO)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 4 {
+            return Ok(None);
+        }
+        Ok(Some(u32::from_be_bytes(bytes.as_ref().try_into().unwrap())))
+    }
+
+    /// Point the tip at the highest compact block that is still on disk.
+    fn repair_missing_tip(&self, recorded: u32) -> Result<()> {
+        let end = recorded.to_be_bytes();
+        let highest = self.compact_blocks.range(..=end).next_back().transpose()?;
+        if let Some((key, _)) = highest {
+            if key.len() == 4 {
+                let height = u32::from_be_bytes(key.as_ref().try_into().unwrap());
+                return self.rewind_to_height(height);
+            }
+        }
+        self.meta.remove(META_TIP_HEIGHT)?;
+        self.meta.remove(META_TIP_HASH)?;
+        self.meta.remove(META_REWINDING_TO)?;
+        self.db.flush()?;
+        Ok(())
     }
 
     /// Insert a compact block into the cache.
@@ -690,10 +731,11 @@ impl Cache {
         use darkfi_sdk::crypto::SecretKey;
         use darkfi_sdk::pasta::group::ff::PrimeField;
         const KEY: &[u8] = b"unifomr_dir_attest_sk";
-        if let Some(existing) = self.meta.get(KEY)? {
+        let current = self.meta.get(KEY)?;
+        if let Some(existing) = current.as_ref() {
             if existing.len() == 32 {
                 let mut out = [0u8; 32];
-                out.copy_from_slice(&existing);
+                out.copy_from_slice(existing);
                 return SecretKey::from_bytes(out).map_err(|e| {
                     LightWalletError::CacheError(format!("invalid directory attest secret: {e}"))
                 });
@@ -706,8 +748,16 @@ impl Cache {
                 break sk;
             }
         };
-        self.meta.insert(KEY, sk.inner().to_repr().as_slice())?;
-        Ok(sk)
+        // Same compare-and-swap as the clue-directory pepper: two cold starts
+        // must not each publish a different attestation key.
+        let repr = sk.inner().to_repr();
+        match self
+            .meta
+            .compare_and_swap(KEY, current, Some(repr.as_slice()))?
+        {
+            Ok(()) => Ok(sk),
+            Err(_) => self.get_or_create_directory_attest_secret(),
+        }
     }
 
     /// 32-byte directory attest public key advertised in `GetLightInfo`.
@@ -888,6 +938,39 @@ impl Cache {
         Ok(blocks)
     }
 
+    /// First height in `start..=last` that has no block hash.
+    ///
+    /// One ranged scan, not a point lookup per height. `None` means every
+    /// height in the span is present.
+    pub fn first_missing_hash(&self, start: u32, last: u32) -> Result<Option<u32>> {
+        if start > last {
+            return Ok(None);
+        }
+        let mut expect = start;
+        for item in self
+            .block_hashes
+            .range(start.to_be_bytes()..=last.to_be_bytes())
+        {
+            let (key, _) = item?;
+            if key.len() != 4 {
+                continue;
+            }
+            let height = u32::from_be_bytes(key.as_ref().try_into().unwrap());
+            if height != expect {
+                return Ok(Some(expect));
+            }
+            if expect == u32::MAX {
+                return Ok(None);
+            }
+            expect += 1;
+        }
+        if expect <= last {
+            Ok(Some(expect))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Get the hash stored for a given block height.
     pub fn get_block_hash(&self, height: u32) -> Result<Option<[u8; 32]>> {
         let height_key = height.to_be_bytes();
@@ -988,6 +1071,49 @@ impl Cache {
         Ok(())
     }
 
+    /// Block target and difficulty for one tip.
+    ///
+    /// One meta value, so a reader cannot pair this tip's target with the
+    /// previous tip's difficulty. `GetLightInfo` uses it instead of fan-out
+    /// to darkfid.
+    pub fn set_tip_chain_facts(
+        &self,
+        height: u32,
+        hash: &[u8; 32],
+        block_target: u32,
+        difficulty: &str,
+    ) -> Result<()> {
+        let diff = difficulty.as_bytes();
+        let mut blob = Vec::with_capacity(40 + diff.len());
+        blob.extend_from_slice(&height.to_be_bytes());
+        blob.extend_from_slice(hash);
+        blob.extend_from_slice(&block_target.to_le_bytes());
+        blob.extend_from_slice(diff);
+        self.meta.insert(META_TIP_CHAIN_FACTS, blob.as_slice())?;
+        Ok(())
+    }
+
+    /// Facts stored for this exact tip. `None` if missing or written for another.
+    pub fn tip_chain_facts_for(
+        &self,
+        height: u32,
+        hash: &[u8; 32],
+    ) -> Result<Option<(u32, String)>> {
+        let Some(bytes) = self.meta.get(META_TIP_CHAIN_FACTS)? else {
+            return Ok(None);
+        };
+        if bytes.len() < 40 {
+            return Ok(None);
+        }
+        let stored_height = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        if stored_height != height || bytes[4..36] != hash[..] {
+            return Ok(None);
+        }
+        let target = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+        let difficulty = std::str::from_utf8(&bytes[40..]).unwrap_or("").to_string();
+        Ok(Some((target, difficulty)))
+    }
+
     /// Unix seconds of the last successful darkfid tip poll. `0` if none yet.
     pub fn tip_fetched_unix(&self) -> Result<u64> {
         let Some(bytes) = self.meta.get(META_TIP_FETCHED_UNIX)? else {
@@ -1010,6 +1136,10 @@ impl Cache {
             target: "lightwalletd::cache",
             "Rewinding cache to height {height}"
         );
+
+        // Durable intent first. A crash before the tip is updated resumes here.
+        self.meta.insert(META_REWINDING_TO, &height.to_be_bytes())?;
+        self.db.flush()?;
 
         let delete_from = (height + 1).to_be_bytes();
 
@@ -1040,6 +1170,12 @@ impl Cache {
         } else if height == 0 {
             self.meta.remove(META_TIP_HEIGHT)?;
             self.meta.remove(META_TIP_HASH)?;
+        } else {
+            warn!(
+                target: "lightwalletd::cache",
+                "Rewind target {height} has no compact block; repairing to the highest block still on disk"
+            );
+            return self.repair_missing_tip(height);
         }
 
         // Drop snapshots above the rewind point, then rebuild the tip tree
@@ -1047,6 +1183,7 @@ impl Cache {
         self.delete_snapshots_above(height)?;
         self.rebuild_tip_merkle_tree(height)?;
 
+        self.meta.remove(META_REWINDING_TO)?;
         // Flush to disk
         self.db.flush()?;
 
@@ -1727,6 +1864,80 @@ mod tests {
             dao_calls: vec![],
             func_events: vec![],
         }
+    }
+
+    #[test]
+    fn missing_tip_block_is_repaired_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        {
+            let cache = Cache::new(&path).unwrap();
+            cache.insert_compact_block(&make_test_block(0)).unwrap();
+            cache.insert_compact_block(&make_test_block(1)).unwrap();
+            cache.insert_compact_block(&make_test_block(2)).unwrap();
+            assert_eq!(cache.get_tip().unwrap().unwrap().0, 2);
+        }
+        {
+            let db = sled::open(&path).unwrap();
+            let blocks = db.open_tree("lightwalletd_compact_blocks").unwrap();
+            blocks.remove(2u32.to_be_bytes()).unwrap();
+            db.flush().unwrap();
+        }
+        let cache = Cache::new(&path).unwrap();
+        let (height, _) = cache.get_tip().unwrap().unwrap();
+        assert_eq!(height, 1);
+        assert!(cache.get_compact_block(2).unwrap().is_none());
+        assert!(cache.get_compact_block(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn tip_chain_facts_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        let hash = [7u8; 32];
+        assert!(cache.tip_chain_facts_for(1, &hash).unwrap().is_none());
+        cache.set_tip_chain_facts(1, &hash, 20, "123").unwrap();
+        assert_eq!(
+            cache.tip_chain_facts_for(1, &hash).unwrap().unwrap(),
+            (20, "123".into())
+        );
+        assert!(cache.tip_chain_facts_for(2, &hash).unwrap().is_none());
+        assert!(cache.tip_chain_facts_for(1, &[8u8; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_rewind_resumes_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        {
+            let cache = Cache::new(&path).unwrap();
+            cache.insert_compact_block(&make_test_block(0)).unwrap();
+            cache.insert_compact_block(&make_test_block(1)).unwrap();
+            cache.insert_compact_block(&make_test_block(2)).unwrap();
+        }
+        {
+            let db = sled::open(&path).unwrap();
+            let meta = db.open_tree(META_TREE).unwrap();
+            meta.insert(META_REWINDING_TO, &1u32.to_be_bytes()).unwrap();
+            db.flush().unwrap();
+        }
+        let cache = reopen_cache(&path);
+        let (height, _) = cache.get_tip().unwrap().unwrap();
+        assert_eq!(height, 1);
+        assert!(cache.get_compact_block(2).unwrap().is_none());
+        assert!(cache.get_compact_block(1).unwrap().is_some());
+        assert!(cache.meta.get(META_REWINDING_TO).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_missing_hash_finds_a_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        cache.insert_compact_block(&make_test_block(0)).unwrap();
+        cache.insert_compact_block(&make_test_block(1)).unwrap();
+        cache.insert_compact_block(&make_test_block(3)).unwrap();
+        assert_eq!(cache.first_missing_hash(0, 3).unwrap(), Some(2));
+        assert_eq!(cache.first_missing_hash(0, 1).unwrap(), None);
     }
 
     #[test]

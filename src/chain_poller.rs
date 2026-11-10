@@ -158,6 +158,65 @@ impl ChainPoller {
         }
     }
 
+    /// One darkfid read of block target and difficulty, stored with the tip.
+    ///
+    /// zcash/lightwalletd serves chain metadata from the cache the ingestor
+    /// just wrote. Doing that here keeps GetLightInfo from opening a darkfid
+    /// connection per waiting client when the tip advances.
+    async fn refresh_tip_chain_facts(&self) {
+        let (height, hash) = match self.cache.get_tip() {
+            Ok(Some(tip)) => tip,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(
+                    target: "lightwalletd::chain_poller",
+                    "tip read failed before chain-fact refresh: {e}"
+                );
+                return;
+            }
+        };
+        let target = match self.rpc_client.get_block_target().await {
+            Ok(target) => target,
+            Err(e) => {
+                warn!(
+                    target: "lightwalletd::chain_poller",
+                    "block target refresh failed: {e}"
+                );
+                return;
+            }
+        };
+        let difficulty = match self.rpc_client.get_difficulty().await {
+            Ok(difficulty) => difficulty,
+            Err(e) => {
+                warn!(
+                    target: "lightwalletd::chain_poller",
+                    "difficulty refresh failed: {e}"
+                );
+                return;
+            }
+        };
+        match self.cache.get_tip() {
+            Ok(Some((now_h, now_hash))) if now_h == height && now_hash == hash => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!(
+                    target: "lightwalletd::chain_poller",
+                    "tip read failed after chain-fact refresh: {e}"
+                );
+                return;
+            }
+        }
+        if let Err(e) = self
+            .cache
+            .set_tip_chain_facts(height, &hash, target, &difficulty)
+        {
+            warn!(
+                target: "lightwalletd::chain_poller",
+                "failed to store tip chain facts: {e}"
+            );
+        }
+    }
+
     fn notify_tip(&self) {
         let tip = self
             .cache
@@ -287,8 +346,15 @@ impl ChainPoller {
             Some((h, _)) if h == remote_height => Some(remote_hash_bytes),
             Some((h, _)) => match self.rpc_client.get_block(h).await {
                 Ok(block) => Some(*block.hash().inner()),
-                Err(e) if e.is_connection() => return Err(e),
-                Err(_) => None,
+                // zcash/lightwalletd BlockIngestor: a failed getblock is
+                // retried. It is not evidence of a fork.
+                Err(e) => {
+                    warn!(
+                        target: "lightwalletd::chain_poller",
+                        "RPC error fetching cached tip {h}: {e}; will retry"
+                    );
+                    return Err(e);
+                }
             },
             None => None,
         };
@@ -348,6 +414,7 @@ impl ChainPoller {
         }
 
         if blocks_processed > 0 {
+            self.refresh_tip_chain_facts().await;
             self.cache.flush()?;
             self.notify_tip();
         }
@@ -371,12 +438,21 @@ impl ChainPoller {
                                 "Rewinding cache to common ancestor at height {h} (started at {from})"
                             );
                             self.cache.rewind_to_height(h)?;
+                            self.refresh_tip_chain_facts().await;
                             self.notify_tip();
                             return Ok(0);
                         }
                     }
-                    Err(e) if e.is_connection() => return Err(e),
-                    Err(_) => {}
+                    // Same rule as zcash/lightwalletd: only a block we actually
+                    // received can justify walking further. An RPC, timeout, or
+                    // decode error aborts the walk so a blip cannot wipe the cache.
+                    Err(e) => {
+                        warn!(
+                            target: "lightwalletd::chain_poller",
+                            "RPC error fetching block {h} during ancestor search: {e}; aborting walk"
+                        );
+                        return Err(e);
+                    }
                 }
             }
 
@@ -386,6 +462,7 @@ impl ChainPoller {
                     "No common ancestor at or above height {h}; rewinding to {h}"
                 );
                 self.cache.rewind_to_height(h)?;
+                self.refresh_tip_chain_facts().await;
                 self.notify_tip();
                 return Ok(0);
             }

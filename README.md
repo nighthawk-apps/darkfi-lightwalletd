@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.5.** `GetLightInfo` reports when the darkfid tip was last polled. At most 200 block-range streams run at once. Aligns with Nighthawk 3.01.09, desktop 3.1.9, and Moonshine 3.1.8. DarkFi pin `44ec78b6e`.
+**0.3.6.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk 3.01.09, desktop 3.1.9, and Moonshine 3.1.8. DarkFi pin `44ec78b6e`.
 
 ## Contents
 

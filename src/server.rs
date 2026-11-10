@@ -23,7 +23,7 @@
 //! and streams/returns data to wallet clients.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
@@ -132,6 +132,12 @@ const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const PIR_RATE_LIMIT_PER_MIN: u32 = 4096;
 /// Max opaque recipient OMR metadata on SendTransaction.
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
+/// Extra OMR clue hints on SendTransaction. DarkFi allows 20 calls per
+/// transaction; 64 leaves room for a few outputs per call and still stops
+/// the quadratic hint rewrite.
+const MAX_EXTRA_OMR_CLUES: usize = 64;
+/// Serialized UnifOMR clue public key (`n = 1024`: 4-byte header + 16 bytes × n).
+const CLUE_PUBLIC_KEY_WIRE_LEN: usize = 4 + 16 * 1024;
 /// Compact-block wire version reported by GetLightInfo.
 /// Bump when the compact format or RPC contract changes.
 /// 2.1.0: compact DAO calls and Money `func_code` (token mint, auth-token history).
@@ -208,12 +214,27 @@ fn digest_evaluable_end(
     if start > last {
         return Ok((None, false));
     }
-    for h in start..=last {
-        if cache.get_block_hash(h).map_err(cache_status)?.is_none() {
-            return Ok((h.checked_sub(1).filter(|&p| p >= start), false));
-        }
+    if let Some(hole) = cache
+        .first_missing_hash(start, last)
+        .map_err(cache_status)?
+    {
+        return Ok((hole.checked_sub(1).filter(|&p| p >= start), false));
     }
     Ok((Some(last), tip >= end))
+}
+
+/// Decoy clue key of the same wire length as a real UnifOMR public key.
+///
+/// Default builds cannot run BFV keygen. A 32-byte hash would still tell a
+/// network observer that the address is unregistered.
+#[cfg_attr(feature = "fhe-omr", allow(dead_code))]
+fn padded_decoy_clue_public_key(payment_pubkey: &[u8; 32], pepper: &[u8; 32]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new_keyed(pepper);
+    hasher.update(b"unifomr-clue-decoy-v1");
+    hasher.update(payment_pubkey);
+    let mut dummy = vec![0u8; CLUE_PUBLIC_KEY_WIRE_LEN];
+    hasher.finalize_xof().fill(&mut dummy);
+    dummy
 }
 
 /// Expand `[start, end]` into a padded bucket the server will accept.
@@ -582,7 +603,7 @@ fn spawn_dao_calls(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
-/// True if `ip` matches an allow-list entry (`1.2.3.4` or IPv4 CIDR).
+/// True if `ip` matches an allow-list entry (exact address or IPv4/IPv6 CIDR).
 fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     let entry = entry.trim();
     if let Ok(exact) = entry.parse::<IpAddr>() {
@@ -594,13 +615,23 @@ fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     let Ok(bits) = bits.parse::<u32>() else {
         return false;
     };
-    match (ip, base.parse::<Ipv4Addr>()) {
-        (IpAddr::V4(ip4), Ok(base4)) if bits <= 32 => {
+    if let (IpAddr::V4(ip4), Ok(base4)) = (ip, base.parse::<Ipv4Addr>()) {
+        if bits <= 32 {
             let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
-            (u32::from(ip4) & mask) == (u32::from(base4) & mask)
+            return (u32::from(ip4) & mask) == (u32::from(base4) & mask);
         }
-        _ => false,
     }
+    if let (IpAddr::V6(ip6), Ok(base6)) = (ip, base.parse::<Ipv6Addr>()) {
+        if bits <= 128 {
+            let mask = if bits == 0 {
+                0
+            } else {
+                !0u128 << (128 - bits)
+            };
+            return (u128::from(ip6) & mask) == (u128::from(base6) & mask);
+        }
+    }
+    false
 }
 
 /// Client IP from `X-Forwarded-For` when the TCP peer is a trusted proxy.
@@ -812,6 +843,7 @@ enum TipFact {
     Difficulty,
 }
 
+#[derive(Clone)]
 enum TipFactValue {
     BlockTarget(u32),
     Difficulty(String),
@@ -889,8 +921,23 @@ fn store_tip_fact(
     }
 }
 
+fn persisted_tip_fact(
+    cache: &Cache,
+    height: u32,
+    hash: [u8; 32],
+    fact: TipFact,
+) -> Option<TipFactValue> {
+    let (target, difficulty) = cache.tip_chain_facts_for(height, &hash).ok().flatten()?;
+    Some(match fact {
+        TipFact::BlockTarget => TipFactValue::BlockTarget(target),
+        TipFact::Difficulty => TipFactValue::Difficulty(difficulty),
+    })
+}
+
 async fn load_tip_fact(
     facts: &Mutex<Option<CachedTipFacts>>,
+    cache: &Cache,
+    fetch: &tokio::sync::Mutex<()>,
     rpc: &DarkfidRpcClient,
     height: u32,
     hash: [u8; 32],
@@ -898,6 +945,19 @@ async fn load_tip_fact(
     wait: Duration,
 ) -> TipFactValue {
     if let Some(hit) = tip_fact_hit(facts, height, hash, fact) {
+        return hit;
+    }
+    if let Some(hit) = persisted_tip_fact(cache, height, hash, fact) {
+        store_tip_fact(facts, height, hash, hit.clone());
+        return hit;
+    }
+    // One in-flight darkfid read. The others wait and reuse it.
+    let _guard = fetch.lock().await;
+    if let Some(hit) = tip_fact_hit(facts, height, hash, fact) {
+        return hit;
+    }
+    if let Some(hit) = persisted_tip_fact(cache, height, hash, fact) {
+        store_tip_fact(facts, height, hash, hit.clone());
         return hit;
     }
     match fact {
@@ -933,12 +993,25 @@ async fn load_tip_fact(
 
 async fn block_target_from(
     facts: &Mutex<Option<CachedTipFacts>>,
+    cache: &Cache,
+    fetch: &tokio::sync::Mutex<()>,
     rpc: &DarkfidRpcClient,
     height: u32,
     hash: [u8; 32],
     wait: Duration,
 ) -> u32 {
-    match load_tip_fact(facts, rpc, height, hash, TipFact::BlockTarget, wait).await {
+    match load_tip_fact(
+        facts,
+        cache,
+        fetch,
+        rpc,
+        height,
+        hash,
+        TipFact::BlockTarget,
+        wait,
+    )
+    .await
+    {
         TipFactValue::BlockTarget(target) => target,
         TipFactValue::Difficulty(_) => 0,
     }
@@ -1001,6 +1074,8 @@ pub struct LightWalletService {
     pir_inflight: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// darkfid block target and difficulty, refreshed when the tip changes.
     tip_facts: Arc<Mutex<Option<CachedTipFacts>>>,
+    /// Serializes the fallback darkfid read when the poller has not stored facts yet.
+    tip_fact_fetch: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LightWalletService {
@@ -1085,6 +1160,7 @@ impl LightWalletService {
             #[cfg(feature = "fhe-omr")]
             pir_inflight: Arc::new(Mutex::new(HashMap::new())),
             tip_facts: Arc::new(Mutex::new(None)),
+            tip_fact_fetch: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1306,6 +1382,8 @@ impl LightWalletService {
     async fn block_target_for_tip(&self, height: u32, hash: [u8; 32]) -> u32 {
         block_target_from(
             &self.tip_facts,
+            &self.cache,
+            &self.tip_fact_fetch,
             &self.rpc_client,
             height,
             hash,
@@ -1317,6 +1395,8 @@ impl LightWalletService {
     async fn difficulty_for_tip(&self, height: u32, hash: [u8; 32]) -> String {
         match load_tip_fact(
             &self.tip_facts,
+            &self.cache,
+            &self.tip_fact_fetch,
             &self.rpc_client,
             height,
             hash,
@@ -1807,6 +1887,7 @@ impl DarkFiLightWallet for LightWalletService {
         let cache = Arc::clone(&self.cache);
         let rpc = Arc::clone(&self.rpc_client);
         let tip_facts = Arc::clone(&self.tip_facts);
+        let tip_fact_fetch = Arc::clone(&self.tip_fact_fetch);
         let mut tip_rx = self.tip_notify.clone();
         let notice = Arc::clone(&self.tip_notice);
         let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_TIP_BUFFER);
@@ -1848,9 +1929,16 @@ impl DarkFiLightWallet for LightWalletService {
                         continue;
                     }
                 };
-                let block_target =
-                    block_target_from(&tip_facts, &rpc, height, hash, Duration::from_millis(200))
-                        .await;
+                let block_target = block_target_from(
+                    &tip_facts,
+                    &cache,
+                    &tip_fact_fetch,
+                    &rpc,
+                    height,
+                    hash,
+                    Duration::from_millis(200),
+                )
+                .await;
                 let chain_tip = proto::ChainTip {
                     height,
                     hash: hash.to_vec(),
@@ -1916,9 +2004,9 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<proto::SendResponse>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let peer = self.peer_ip(&request);
-        let req = request.into_inner();
-        let mut tx_data = req.data;
-        let mut omr_clue = req.omr_clue;
+        let mut req = request.into_inner();
+        let mut tx_data = req.data.clone();
+        let mut omr_clue = req.omr_clue.clone();
 
         if tx_data.starts_with(crate::omr_envelope::OMR_ENVELOPE_TAG) {
             let env = crate::omr_envelope::parse_envelope(&tx_data).ok_or_else(|| {
@@ -1927,7 +2015,17 @@ impl DarkFiLightWallet for LightWalletService {
             if omr_clue.is_empty() && !env.fhe_clue.is_empty() {
                 omr_clue = env.fhe_clue.to_vec();
             }
+            if req.omr_metadata_enc.is_empty() && !env.omr_memo.is_empty() {
+                req.omr_metadata_enc = env.omr_memo.to_vec();
+            }
             tx_data = env.raw_tx.to_vec();
+        }
+        if req.extra_omr_clues.len() > MAX_EXTRA_OMR_CLUES {
+            return Err(Status::invalid_argument(format!(
+                "extra_omr_clues length {} exceeds limit {}",
+                req.extra_omr_clues.len(),
+                MAX_EXTRA_OMR_CLUES
+            )));
         }
 
         if tx_data.len() > self.max_tx_bytes {
@@ -2811,10 +2909,11 @@ impl DarkFiLightWallet for LightWalletService {
             {
                 Some((ver, _stored_proof, real)) => (real, ver),
                 None => {
-                    // Non-empty dummy so `found=true` + empty body cannot leak
-                    // the registration bit on non-fhe-omr builds.
-                    let dummy = blake3::hash(&pk).as_bytes().to_vec();
-                    (dummy, 1)
+                    let pepper = self
+                        .cache
+                        .get_or_create_clue_dir_pepper()
+                        .map_err(cache_status)?;
+                    (padded_decoy_clue_public_key(&pk, &pepper), 1)
                 }
             }
         };
@@ -2975,6 +3074,18 @@ mod tests {
         assert!(ip_matches_proxy_entry(loopback, "127.0.0.1"));
         assert!(ip_matches_proxy_entry(loopback, "127.0.0.0/8"));
         assert!(!ip_matches_proxy_entry(loopback, "10.0.0.0/8"));
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(ip_matches_proxy_entry(v6, "::1"));
+        assert!(ip_matches_proxy_entry(v6, "::1/128"));
+        assert!(ip_matches_proxy_entry(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            "fd00::/8"
+        ));
+        assert!(!ip_matches_proxy_entry(v6, "fd00::/8"));
+        assert_eq!(
+            padded_decoy_clue_public_key(&[1; 32], &[2; 32]).len(),
+            CLUE_PUBLIC_KEY_WIRE_LEN
+        );
         let trusted = vec!["127.0.0.1".to_string()];
         // nginx appends; leftmost hop is client-spoofable and must be ignored.
         assert_eq!(

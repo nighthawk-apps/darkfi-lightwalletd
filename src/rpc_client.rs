@@ -263,7 +263,7 @@ impl DarkfidRpcClient {
     /// Send a JSON-RPC request to darkfid and return the result value.
     async fn request(&self, method: &str, params: JsonValue) -> Result<JsonValue> {
         use darkfi::rpc::jsonrpc::JsonRequest;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
 
         let connect_fut = TcpStream::connect(&self.connect_addr);
@@ -304,7 +304,11 @@ impl DarkfidRpcClient {
             LightWalletError::ConnectionError(format!("Failed to write request: {}", e))
         })?;
 
-        let mut reader = BufReader::new(stream);
+        // Cap the JSON line. `read_line` grows without bound until `\n`, so a
+        // peer that never sends one can fill memory inside the read timeout.
+        // 32 MiB covers a compact block response and rejects a stream.
+        const MAX_RPC_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+        let mut reader = BufReader::new(stream).take(MAX_RPC_RESPONSE_BYTES);
         let mut line = String::new();
         tokio::time::timeout(self.timeout, reader.read_line(&mut line))
             .await
@@ -318,6 +322,11 @@ impl DarkfidRpcClient {
         if line.is_empty() {
             return Err(LightWalletError::ConnectionError(
                 "Empty response from server".to_string(),
+            ));
+        }
+        if !line.ends_with('\n') {
+            return Err(LightWalletError::ConnectionError(
+                "darkfid RPC response exceeded 32 MiB or was truncated".into(),
             ));
         }
 
