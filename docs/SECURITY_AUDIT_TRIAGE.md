@@ -1,6 +1,6 @@
 # Security Audit Triage (2026-08-03)
 
-Validated against this Rust/tonic rewrite and the Nighthawk clients. The external audit mixed a Go `zcash/lightwalletd` threat model with this stack.
+Validated against this Rust/tonic rewrite and the Nighthawk clients. The external audit mixed a different lightwalletd threat model with this stack.
 
 ## Not applicable / already fixed
 

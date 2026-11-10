@@ -127,6 +127,13 @@ pub(crate) fn classify_tips(
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Chain poller that syncs blocks from darkfid into the local sled cache.
 pub struct ChainPoller {
     rpc_client: Arc<DarkfidRpcClient>,
@@ -248,6 +255,12 @@ impl ChainPoller {
     /// Returns the number of blocks processed.
     async fn poll_once(&self) -> Result<u32> {
         let (remote_height, remote_hash) = self.rpc_client.get_last_confirmed_block().await?;
+        if let Err(e) = self.cache.set_tip_fetched_unix(unix_now()) {
+            warn!(
+                target: "lightwalletd::chain_poller",
+                "failed to record tip poll time: {e}"
+            );
+        }
         let remote_hash_bytes: [u8; 32] = match blake3::Hash::from_hex(&remote_hash) {
             Ok(h) => *h.as_bytes(),
             Err(e) => {

@@ -88,6 +88,7 @@ const META_TIP_MERKLE_HEIGHT: &[u8] = b"tip_merkle_height";
 const META_CACHE_FORMAT: &[u8] = b"cache_format";
 const META_CLUE_DIR_PEPPER: &[u8] = b"unifomr_clue_dir_pepper";
 const META_CLUE_DIR_PEPPER_ANCHOR: &[u8] = b"unifomr_clue_dir_pepper_anchor";
+const META_TIP_FETCHED_UNIX: &[u8] = b"tip_fetched_unix";
 
 /// Checkpoints retained in the tip Money Merkle tree (matches wallet clients).
 const TIP_TREE_CHECKPOINTS: usize = 100;
@@ -779,7 +780,9 @@ impl Cache {
     /// Hints are kept until [`OMR_CLUE_HINT_TTL_SECS`] expiry rather than
     /// consumed: a reorg rewinds the block and darkfid re-serves it with empty
     /// clues, so the hint must still be there to re-merge. Merging is
-    /// idempotent (a clue already on the tx is not attached a second time).
+    /// idempotent per output. Named indexes each receive their hint, even when
+    /// the ciphertext bytes match (change and fee clues are the same RLWE
+    /// public key). An unindexed hint still fills only the first empty output.
     pub fn apply_omr_clue_hints(&self, block: &mut CompactBlock) -> Result<()> {
         for tx in &mut block.txs {
             let tx_hash: [u8; 32] = tx.tx_hash;
@@ -794,7 +797,15 @@ impl Cache {
                         self.omr_clue_hint_meta.remove(tx_hash.as_slice())?;
                     } else {
                         for (output_index, clue) in clues {
-                            if clue.is_empty() || tx.outputs.iter().any(|o| o.omr_clue == clue) {
+                            if clue.is_empty() {
+                                continue;
+                            }
+                            // Unindexed hints must not be stamped onto every
+                            // empty output. Named indexes are independent:
+                            // identical clue bytes still belong on each one.
+                            if output_index.is_none()
+                                && tx.outputs.iter().any(|o| o.omr_clue == clue)
+                            {
                                 continue;
                             }
                             let target = match output_index {
@@ -968,6 +979,26 @@ impl Cache {
         };
 
         Ok(Some((height, hash)))
+    }
+
+    /// Unix seconds of the last successful darkfid tip poll. `0` if none yet.
+    pub fn set_tip_fetched_unix(&self, unix: u64) -> Result<()> {
+        self.meta
+            .insert(META_TIP_FETCHED_UNIX, &unix.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Unix seconds of the last successful darkfid tip poll. `0` if none yet.
+    pub fn tip_fetched_unix(&self) -> Result<u64> {
+        let Some(bytes) = self.meta.get(META_TIP_FETCHED_UNIX)? else {
+            return Ok(0);
+        };
+        if bytes.len() != 8 {
+            return Ok(0);
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        Ok(u64::from_le_bytes(buf))
     }
 
     /// Rewind the cache to the given height (inclusive).
@@ -1699,6 +1730,15 @@ mod tests {
     }
 
     #[test]
+    fn tip_fetched_unix_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(cache.tip_fetched_unix().unwrap(), 0);
+        cache.set_tip_fetched_unix(1_700_000_000).unwrap();
+        assert_eq!(cache.tip_fetched_unix().unwrap(), 1_700_000_000);
+    }
+
+    #[test]
     fn test_notes_range_includes_empty_heights() {
         // S19: empty / missing heights must still occupy a slot.
         let dir = tempfile::tempdir().unwrap();
@@ -1799,6 +1839,32 @@ mod tests {
         assert_eq!(block.txs[0].outputs[0].omr_clue, clue);
         assert!(block.txs[0].outputs[1].omr_clue.is_empty());
         assert!(block.txs[0].outputs[2].omr_clue.is_empty());
+    }
+
+    #[test]
+    fn test_same_clue_bytes_apply_to_each_named_output() {
+        // Change and fee hints are encryptions to the same key and may share
+        // bytes. Each named output still needs its own copy or that output
+        // is absent from the digest.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+
+        let clue = vec![0x42u8; 16];
+        let tx_hash = [8u8; 32];
+        cache
+            .store_omr_clue_hint(&tx_hash, clue.clone(), Some(1))
+            .unwrap();
+        cache
+            .store_omr_clue_hint(&tx_hash, clue.clone(), Some(2))
+            .unwrap();
+
+        let mut block = make_multi_output_block(1, 3);
+        block.txs[0].tx_hash = tx_hash;
+        cache.apply_omr_clue_hints(&mut block).unwrap();
+
+        assert!(block.txs[0].outputs[0].omr_clue.is_empty());
+        assert_eq!(block.txs[0].outputs[1].omr_clue, clue);
+        assert_eq!(block.txs[0].outputs[2].omr_clue, clue);
     }
 
     #[test]

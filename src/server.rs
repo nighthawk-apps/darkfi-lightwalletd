@@ -115,6 +115,9 @@ const DEFAULT_MAX_UPLOADS_PER_IP: usize = 2;
 const MAX_PIR_INFLIGHT_PER_IP: usize = 1;
 /// A client that stops reading ends the stream instead of pinning the task.
 const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Process-wide cap on block-range streams. Extra requests wait, then fail.
+const MAX_BLOCK_RANGE_STREAMS: usize = 200;
+const BLOCK_RANGE_WAIT: Duration = Duration::from_secs(10);
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 const MAX_PIR_STRIPES: usize = 8;
@@ -338,6 +341,7 @@ fn spawn_compact_range<T, F>(
     cache: Arc<Cache>,
     start: u32,
     end: u32,
+    permit: tokio::sync::OwnedSemaphorePermit,
     map: F,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
 where
@@ -346,6 +350,7 @@ where
 {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
+        let _permit = permit;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -386,9 +391,11 @@ fn spawn_output_bodies(
     cache: Arc<Cache>,
     start: u32,
     end: u32,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
+        let _permit = permit;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -445,9 +452,11 @@ fn spawn_outputs_by_func(
     start: u32,
     end: u32,
     func_code: u32,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
+        let _permit = permit;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -524,9 +533,11 @@ fn spawn_dao_calls(
     cache: Arc<Cache>,
     start: u32,
     end: u32,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactDaoCall, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
+        let _permit = permit;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -960,6 +971,8 @@ pub struct LightWalletService {
     recent_send_peers: Arc<Mutex<HashMap<[u8; 32], (IpAddr, Instant)>>>,
     /// Tip height watch from the chain poller (wakes SubscribeBlocks).
     tip_notify: tokio::sync::watch::Receiver<u32>,
+    /// In-flight block-range streams across every connection.
+    block_range_permits: Arc<tokio::sync::Semaphore>,
     /// Limits concurrent FHE `spawn_blocking` workers (CPU / RAM).
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     fhe_permits: Arc<tokio::sync::Semaphore>,
@@ -1052,6 +1065,7 @@ impl LightWalletService {
             max_tx_bytes,
             recent_send_peers: Arc::new(Mutex::new(HashMap::new())),
             tip_notify,
+            block_range_permits: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCK_RANGE_STREAMS)),
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
             trusted_proxies,
             max_detection_key_bytes: MAX_DETECTION_KEY_BYTES,
@@ -1195,6 +1209,25 @@ impl LightWalletService {
             Err(Status::resource_exhausted(
                 "RPC rate limit exceeded; retry later",
             ))
+        }
+    }
+
+    /// Wait up to 10s for a process-wide block-range slot. The permit must
+    /// live until the stream task finishes.
+    async fn acquire_block_range(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        let sem = Arc::clone(&self.block_range_permits);
+        match tokio::time::timeout(BLOCK_RANGE_WAIT, sem.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(Status::unavailable("block-range limiter closed")),
+            Err(_) => {
+                tracing::warn!(
+                    target: "lightwalletd::server",
+                    "block-range capacity full ({MAX_BLOCK_RANGE_STREAMS})"
+                );
+                Err(Status::unavailable(
+                    "too many block-range streams; retry shortly",
+                ))
+            }
         }
     }
 
@@ -1578,10 +1611,12 @@ impl DarkFiLightWallet for LightWalletService {
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_output_bodies(
             Arc::clone(&self.cache),
             start,
             end,
+            permit,
         )))
     }
 
@@ -1597,11 +1632,13 @@ impl DarkFiLightWallet for LightWalletService {
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_outputs_by_func(
             Arc::clone(&self.cache),
             start,
             end,
             range.func_code,
+            permit,
         )))
     }
 
@@ -1617,10 +1654,12 @@ impl DarkFiLightWallet for LightWalletService {
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_dao_calls(
             Arc::clone(&self.cache),
             start,
             end,
+            permit,
         )))
     }
 
@@ -1633,10 +1672,12 @@ impl DarkFiLightWallet for LightWalletService {
         let range = request.into_inner();
         let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
 
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
+            permit,
             CompactBlock::to_proto,
         )))
     }
@@ -1705,8 +1746,10 @@ impl DarkFiLightWallet for LightWalletService {
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let permit = self.acquire_block_range().await?;
 
         tokio::spawn(async move {
+            let _permit = permit;
             for block in blocks {
                 if tx.is_closed() {
                     return;
@@ -2071,10 +2114,12 @@ impl DarkFiLightWallet for LightWalletService {
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
+            permit,
             |block| proto::NoteCommitmentUpdate {
                 height: block.height,
                 coins: block
@@ -2099,10 +2144,12 @@ impl DarkFiLightWallet for LightWalletService {
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
+        let permit = self.acquire_block_range().await?;
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
+            permit,
             |block| proto::NullifierUpdate {
                 height: block.height,
                 nullifiers: block
@@ -2314,6 +2361,7 @@ impl DarkFiLightWallet for LightWalletService {
                 .map_err(cache_status)?
                 .to_vec(),
             proto_version: LIGHTWALLET_PROTO_VERSION.to_string(),
+            tip_fetched_unix: self.cache.tip_fetched_unix().map_err(cache_status)?,
         }))
     }
 

@@ -2,15 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.4.** Same trial-decrypt default as 0.3.2; version bump aligned with Moonshine 3.1.7 / Nighthawk 3.01.08 light-wallet clients. Build pin `44ec78b6e` (`nighthawk-testnet`, includes upstream tx-local fees and net hosts/refinery fixes).
-
-**0.3.2.** Default build is trial decrypt: `GetCompactOutputBodies`, `GetNullifiers`, `GetCompactDaoCalls`, and auth-token history. `GetLightInfo.omr_supported` is false unless the binary is built with `fhe-omr`. DarkFi pin `e47d3f5f2` (Arti 0.48). Proto **2.1.0**.
-
-**0.3.1.** Clue registration accepts monotonic `key_version` values, including the wallet constant `1`. A lower version is rejected, and the same version is accepted only for the same clue key.
-
-**0.3.0.** DarkFi pin `8af61b3f0` (`nighthawk-testnet`), the same checkout as the 3.00.026 wallets. That pin pays a fee from tx-local change when the change output covers it. Proto **2.0.0**, with no 1.x compatibility path: historical tree snapshots for checkpoints, padded-range enforcement on `GetNoteCommitments`, `GetNullifiers`, and `GetCompactOutputBodies` (a power-of-two bucket of at least 1024, or one cut short within 64 blocks of the tip), a UnifOMR detection-key pool (`RegisterDetectionKey`, `GetUnifOmrDigestFromPool`; 24 h handles, 4096 handles and 8 GiB total), a `SubscribeBlocks` ChainTip stream, and `GetCompactOutputBodies`.
-
-**0.2.4.** `SendTransaction` accepts `extra_omr_clues`, one UniFOMR clue per sender output (transfer change and fee change) in addition to the recipient clue. Each clue is stored against its output index. A repeat registration for an index that already has a clue is left as first-writer-wins.
+**0.3.5.** `GetLightInfo` reports when the darkfid tip was last polled. At most 200 block-range streams run at once. Aligns with Nighthawk 3.01.09, desktop 3.1.9, and Moonshine 3.1.8. DarkFi pin `44ec78b6e`.
 
 ## Contents
 

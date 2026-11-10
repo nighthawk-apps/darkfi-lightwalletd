@@ -170,10 +170,10 @@ print(b58check_encode(bytes(body)))
 PY
 }
 
-DARKFID="$(bin_of "$PIN" darkfid)"
-DRK="$(bin_of "$PIN" drk)"
-LWD="$(bin_of "$ROOT" darkfi-lightwalletd)"
-MOON="$(bin_of "$MOON_DIR" moonshine)"
+DARKFID="${DARKFID:-$(bin_of "$PIN" darkfid)}"
+DRK="${DRK:-$(bin_of "$PIN" drk)}"
+LWD="${LWD:-$(bin_of "$ROOT" darkfi-lightwalletd)}"
+MOON="${MOON:-$(bin_of "$MOON_DIR" moonshine)}"
 AND_TX="${AND_TX:-$WORK/android-ffi-tx}"
 
 if [[ -z "$DARKFID" || -z "$DRK" || -z "$LWD" || -z "$MOON" || ! -x "$XMRIG" ]]; then
@@ -236,14 +236,16 @@ fi
 echo "waiting for faucet rewards"
 faucet_ok=0
 for _ in $(seq 1 180); do
-  # scan can exit non-zero before the wallet has a block
-  "$DRK" --config "$DRK_CFG" scan >"$WORK/drk-scan.log" 2>&1 || true
+  # Balance first. A scan walks every block and, while xmrig is running,
+  # the chain grows faster than drk scan, so the scan never returns.
   bal="$("$DRK" --config "$DRK_CFG" wallet balance 2>/dev/null || true)"
   echo "$bal" | tee "$WORK/faucet-balance.txt"
   if echo "$bal" | awk 'NF && $NF+0 > 80 { found=1 } END { exit found ? 0 : 1 }'; then
     faucet_ok=1
     break
   fi
+  # scan can exit non-zero before the wallet has a block
+  "$DRK" --config "$DRK_CFG" scan >"$WORK/drk-scan.log" 2>&1 || true
   sleep 5
 done
 if [[ "$faucet_ok" != 1 ]]; then
@@ -312,7 +314,14 @@ echo "funding sync uses --force-trial because the faucet payment has no clue"
 "$MOON" -w e2e_moon -s "$LWD_URL" sync --force-trial --rebuild-merkle >/dev/null
 funded=0
 for _ in $(seq 1 30); do
-  if "$MOON" -w e2e_moon balance | awk '/Raw:/{ if ($2+0 > 1000000000) ok=1 } END { exit ok ? 0 : 1 }'; then
+  if "$MOON" -w e2e_moon balance | awk '
+      /DRK:/ && /atomic units/ && match($0, /[0-9]+ atomic units/) {
+        v = substr($0, RSTART, RLENGTH)
+        sub(/ atomic units/, "", v)
+        if (v+0 > 1000000000) ok=1
+      }
+      END { exit ok ? 0 : 1 }
+    '; then
     funded=1
     break
   fi
@@ -378,7 +387,15 @@ read_balance() {
       else
         "$MOON" -w e2e_moon -s "$LWD_URL" sync >/dev/null
       fi
-      "$MOON" -w e2e_moon balance | awk '/Raw:/{print $2; exit}'
+      # Read the whole balance printout. Exiting awk early closes the
+      # pipe and current Rust panics on that SIGPIPE.
+      "$MOON" -w e2e_moon balance | awk '
+        /DRK:/ && /atomic units/ && match($0, /[0-9]+ atomic units/) {
+          v = substr($0, RSTART, RLENGTH)
+          sub(/ atomic units/, "", v)
+          print v
+        }
+      '
       ;;
     ffi-a|ffi-b)
       if [[ "$mode" == trial ]]; then
@@ -461,7 +478,9 @@ send_one() {
       echo "empty memo must be sent by moonshine; $src's send always sets a memo" >&2
       return 1
     fi
-    out="$(E2E_WALLET_DIR="$WORK/wallets/$src" E2E_LWD="$LWD_URL" \
+    # Without E2E_UNIFOMR the headless wallet omits the clue, and a strict
+    # UnifOMR receiver never sees the payment.
+    out="$(E2E_UNIFOMR=1 E2E_WALLET_DIR="$WORK/wallets/$src" E2E_LWD="$LWD_URL" \
       "$AND_TX" send --to "$to" --count 1 --amount "$amount")"
     hash="$(printf '%s\n' "$out" | awk -F= '/^TX=/{print $2; exit}')"
   fi
