@@ -1,6 +1,6 @@
 # Verification checklist (UnifOMR / Nighthawk)
 
-Use against **standalone** `darkfi-lightwalletd` with `fhe-omr`. Tick when proven.
+Use against a **standalone** `darkfi-lightwalletd` built with `fhe-omr`. The default binary is trial decryption and does not serve this checklist. Tick when proven.
 
 ## Protocol / sync
 
