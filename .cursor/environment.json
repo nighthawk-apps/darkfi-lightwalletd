@@ -1,0 +1,4 @@
+{
+  "name": "darkfi-lightwalletd",
+  "install": "bash .cursor/install.sh"
+}
