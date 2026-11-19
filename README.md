@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.6.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk 3.01.09, desktop 3.1.9, and Moonshine 3.1.8. DarkFi pin `44ec78b6e`.
+**0.3.8.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.14, desktop 3.1.12, and Moonshine 3.1.11. DarkFi pin `9d7ceaf77`.
 
 ## Contents
 
@@ -46,14 +46,14 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `44ec78b6e` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `9d7ceaf77` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi-nighthawk-testnet/   # pin 44ec78b6e — or symlink to Android third_party/darkfi
+  darkfi-nighthawk-testnet/   # pin 9d7ceaf77 — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
   nighthawk-android-wallet/
@@ -64,7 +64,7 @@ Recommended layout after `./scripts/build.sh`:
 # Clean setup on a new Mac:
 brew install protobuf
 
-# Sibling darkfi checkout at required pin (44ec78b6e):
+# Sibling darkfi checkout at required pin (9d7ceaf77):
 git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
 # Or reuse the Android pin instead of a worktree:
 # ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
@@ -82,7 +82,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev` (`44ec78b6efbf1d3e797f99bffe95195994b2488d`). Overrides:
+`scripts/darkfi.rev` (`9d7ceaf77da7ccfd29ead3ba168fab284decd8c8`). Overrides:
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
