@@ -61,13 +61,13 @@ Recommended layout after `./scripts/build.sh`:
 ```
 
 ```bash
-# Reuse the Android pin instead of a second clone:
-ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
-```
+# Clean setup on a new Mac:
+brew install protobuf
 
-```bash
-brew install protobuf                # macOS
-sudo apt install protobuf-compiler   # Debian/Ubuntu
+# Sibling darkfi checkout at required pin (44ec78b6e):
+git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
+# Or reuse the Android pin instead of a worktree:
+# ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
 ---

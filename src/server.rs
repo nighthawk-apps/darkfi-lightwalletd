@@ -623,11 +623,7 @@ fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     }
     if let (IpAddr::V6(ip6), Ok(base6)) = (ip, base.parse::<Ipv6Addr>()) {
         if bits <= 128 {
-            let mask = if bits == 0 {
-                0
-            } else {
-                !0u128 << (128 - bits)
-            };
+            let mask = if bits == 0 { 0 } else { !0u128 << (128 - bits) };
             return (u128::from(ip6) & mask) == (u128::from(base6) & mask);
         }
     }
@@ -1042,6 +1038,9 @@ pub struct LightWalletService {
     /// Recent SendTransaction peers keyed by tx hash (S12 peer bind).
     #[allow(clippy::type_complexity)]
     recent_send_peers: Arc<Mutex<HashMap<[u8; 32], (IpAddr, Instant)>>>,
+    /// Recently broadcast raw tx bytes held briefly while the tx is in darkfid's mempool.
+    #[allow(clippy::type_complexity)]
+    recent_mempool_txs: Arc<Mutex<HashMap<[u8; 32], (Vec<u8>, Instant)>>>,
     /// Tip height watch from the chain poller (wakes SubscribeBlocks).
     tip_notify: tokio::sync::watch::Receiver<u32>,
     /// In-flight block-range streams across every connection.
@@ -1139,6 +1138,7 @@ impl LightWalletService {
             )),
             max_tx_bytes,
             recent_send_peers: Arc::new(Mutex::new(HashMap::new())),
+            recent_mempool_txs: Arc::new(Mutex::new(HashMap::new())),
             tip_notify,
             block_range_permits: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCK_RANGE_STREAMS)),
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
@@ -1241,6 +1241,54 @@ impl LightWalletService {
             Some((bound, _)) => *bound == peer,
             None => false,
         }
+    }
+
+    fn remember_mempool_tx(&self, tx_hash: [u8; 32], raw_tx: Vec<u8>) {
+        if let Ok(mut map) = self.recent_mempool_txs.lock() {
+            let now = Instant::now();
+            map.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(1800));
+            const MAX_MEMPOOL_TX_CACHE: usize = 512;
+            if map.len() >= MAX_MEMPOOL_TX_CACHE {
+                let mut entries: Vec<_> = map.iter().map(|(k, (_, t))| (*k, *t)).collect();
+                entries.sort_by_key(|(_, t)| *t);
+                let evict_count = map.len().saturating_sub(MAX_MEMPOOL_TX_CACHE) + 1;
+                for (k, _) in entries.into_iter().take(evict_count) {
+                    map.remove(&k);
+                }
+            }
+            map.insert(tx_hash, (raw_tx, now));
+        }
+    }
+
+    fn cached_mempool_tx(&self, tx_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let Ok(mut map) = self.recent_mempool_txs.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        map.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(1800));
+        map.get(tx_hash).map(|(bytes, _)| bytes.clone())
+    }
+
+    async fn confirm_tx_in_mempool_or_chain(
+        &self,
+        tx_hash_hex: &str,
+    ) -> Result<bool, crate::error::LightWalletError> {
+        let needle = tx_hash_hex.trim().to_ascii_lowercase();
+        for attempt in 0..4 {
+            match self.rpc_client.get_pending_tx_hashes().await {
+                Ok(pending) if pending.iter().any(|h| h == &needle) => return Ok(true),
+                Ok(_) => {}
+                Err(e) if e.is_connection() => return Err(e),
+                Err(_) => {}
+            }
+            if self.rpc_client.get_tx(&needle).await.is_ok() {
+                return Ok(true);
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+        }
+        Ok(false)
     }
 
     #[allow(clippy::result_large_err)]
@@ -1989,7 +2037,24 @@ impl DarkFiLightWallet for LightWalletService {
                 extra_omr_clues: vec![],
             })),
             Err(e) if e.is_connection() => Err(backend_unavailable()),
-            Err(_) => Err(Status::not_found("transaction not found")),
+            Err(_) => {
+                if let Ok(pending) = self.rpc_client.get_pending_tx_hashes().await {
+                    if pending.iter().any(|h| h == &hash_hex) {
+                        if let Ok(arr) = <[u8; 32]>::try_from(hash.as_slice()) {
+                            if let Some(tx_bytes) = self.cached_mempool_tx(&arr) {
+                                return Ok(Response::new(proto::RawTransaction {
+                                    data: tx_bytes,
+                                    omr_clue: vec![],
+                                    omr_clue_output_index: 0,
+                                    omr_metadata_enc: vec![],
+                                    extra_omr_clues: vec![],
+                                }));
+                            }
+                        }
+                    }
+                }
+                Err(Status::not_found("transaction not found"))
+            }
         }
     }
 
@@ -2086,6 +2151,31 @@ impl DarkFiLightWallet for LightWalletService {
         .await
         {
             Ok(Ok(tx_hash)) => {
+                let confirmed = match self.confirm_tx_in_mempool_or_chain(&tx_hash).await {
+                    Ok(found) => found,
+                    Err(e) if e.is_connection() => {
+                        if clue_accepted {
+                            if let Some(hash) = tx_hash_for_clue {
+                                let _ = self.cache.remove_omr_clue_hint(&hash);
+                            }
+                        }
+                        return Err(backend_unavailable());
+                    }
+                    Err(_) => false,
+                };
+                if !confirmed {
+                    if clue_accepted {
+                        if let Some(hash) = tx_hash_for_clue {
+                            let _ = self.cache.remove_omr_clue_hint(&hash);
+                        }
+                    }
+                    return Ok(Response::new(proto::SendResponse {
+                        tx_hash: Vec::new(),
+                        error: "Transaction was not confirmed in lightwalletd mempool".to_string(),
+                        clue_accepted: false,
+                    }));
+                }
+
                 let tx_hash_bytes = hex::decode(&tx_hash).unwrap_or_else(|_| {
                     tracing::warn!(
                         target: "lightwalletd::server",
@@ -2104,6 +2194,11 @@ impl DarkFiLightWallet for LightWalletService {
                         None
                     }
                 });
+
+                // Remember mempool raw tx bytes so GetTransaction can also confirm mempool presence.
+                if let Some(hash) = hash {
+                    self.remember_mempool_tx(hash, tx_data.clone());
+                }
 
                 // S12: remember which peer submitted this tx so RegisterOmrClue
                 // can be bound to the same peer when clue arrives out-of-band.
@@ -3612,5 +3707,137 @@ mod tests {
             PIR_RATE_LIMIT_PER_MIN,
             crate::pir_server::MAX_PIR_LIMBS as u32
         );
+    }
+
+    async fn spawn_mock_darkfid(pending_contains_hash: bool, hash_hex: String) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let hash_hex = hash_hex.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut reader = BufReader::new(r);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let id = line
+                        .parse::<tinyjson::JsonValue>()
+                        .ok()
+                        .and_then(|v| v.get::<HashMap<String, tinyjson::JsonValue>>().cloned())
+                        .and_then(|m| m.get("id").and_then(|i| i.get::<f64>().copied()))
+                        .unwrap_or(1.0) as i64;
+                    let resp = if line.contains("\"tx.broadcast\"") {
+                        format!(r#"{{"jsonrpc":"2.0","result":"{hash_hex}","id":{id}}}"#) + "\n"
+                    } else if line.contains("\"tx.pending\"") {
+                        if pending_contains_hash {
+                            format!(r#"{{"jsonrpc":"2.0","result":["{hash_hex}"],"id":{id}}}"#)
+                                + "\n"
+                        } else {
+                            format!(r#"{{"jsonrpc":"2.0","result":[],"id":{id}}}"#) + "\n"
+                        }
+                    } else if line.contains("\"blockchain.get_tx\"") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","error":{{"code":-32603,"message":"not found"}},"id":{id}}}"#
+                        ) + "\n"
+                    } else {
+                        format!(r#"{{"jsonrpc":"2.0","result":null,"id":{id}}}"#) + "\n"
+                    };
+                    let _ = w.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn send_transaction_confirms_mempool_and_get_transaction_serves_it() {
+        use proto::dark_fi_light_wallet_server::DarkFiLightWallet;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let expected_hash = [0xABu8; 32];
+        let hash_hex = hex::encode(expected_hash);
+        let url_str = spawn_mock_darkfid(true, hash_hex).await;
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(
+            url::Url::parse(&url_str).unwrap(),
+        ));
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10_000,
+            10_000,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+        let raw_tx = vec![1u8, 2, 3, 4];
+        let send_resp = svc
+            .send_transaction(Request::new(proto::RawTransaction {
+                data: raw_tx.clone(),
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: vec![],
+                extra_omr_clues: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            send_resp.error.is_empty(),
+            "expected mempool confirmation, got {}",
+            send_resp.error
+        );
+        assert_eq!(send_resp.tx_hash, expected_hash.to_vec());
+
+        let got = svc
+            .get_transaction(Request::new(proto::TxHash {
+                hash: expected_hash.to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.data, raw_tx);
+    }
+
+    #[tokio::test]
+    async fn send_transaction_fails_when_missing_from_mempool() {
+        use proto::dark_fi_light_wallet_server::DarkFiLightWallet;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let hash_hex = hex::encode([0xCDu8; 32]);
+        let url_str = spawn_mock_darkfid(false, hash_hex).await;
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(
+            url::Url::parse(&url_str).unwrap(),
+        ));
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10_000,
+            10_000,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+        let send_resp = svc
+            .send_transaction(Request::new(proto::RawTransaction {
+                data: vec![9u8, 8, 7],
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: vec![],
+                extra_omr_clues: vec![],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!send_resp.error.is_empty());
+        assert!(send_resp.tx_hash.is_empty());
     }
 }

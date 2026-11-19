@@ -220,6 +220,26 @@ impl DarkfidRpcClient {
         Ok(tx_bytes)
     }
 
+    /// Fetch hashes of transactions currently in the darkfid mempool.
+    pub async fn get_pending_tx_hashes(&self) -> Result<Vec<String>> {
+        debug!(target: "lightwalletd::rpc_client", "Fetching pending mempool tx hashes");
+
+        let response = self.request("tx.pending", JsonValue::Array(vec![])).await?;
+        let arr = response.get::<Vec<JsonValue>>().ok_or_else(|| {
+            LightWalletError::RpcError("Expected array response for tx.pending".to_string())
+        })?;
+
+        let mut hashes = Vec::with_capacity(arr.len());
+        for entry in arr {
+            let s = entry.get::<String>().ok_or_else(|| {
+                LightWalletError::RpcError("Expected string tx hash in tx.pending".to_string())
+            })?;
+            hashes.push(s.to_ascii_lowercase());
+        }
+
+        Ok(hashes)
+    }
+
     /// Lookup zkas bincodes for a given contract ID.
     pub async fn lookup_zkas(&self, contract_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
         debug!(target: "lightwalletd::rpc_client", "Looking up zkas for contract {contract_id}");
