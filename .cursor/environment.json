@@ -1,0 +1,4 @@
+{
+  "name": "darkfi-lightwalletd",
+  "install": "./scripts/cloud-agent-install.sh"
+}
