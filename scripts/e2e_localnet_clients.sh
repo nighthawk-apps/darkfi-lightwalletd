@@ -229,18 +229,26 @@ if ! echo "$(cat "$WORK/faucet-balance.txt")" | awk 'NF && $NF+0 > 45 { found=1 
   exit 1
 fi
 
-# Stop the miner so wallet scans can catch a stable tip. It is restarted
-# after the faucet payment is broadcast.
+# Stop only the miner this script started. A broad pkill also stops the
+# Studio testnet miner, which shares the xmrig binary.
 if [[ -f "$WORK/xmrig.pid" ]]; then
   kill "$(cat "$WORK/xmrig.pid")" 2>/dev/null || true
+  rm -f "$WORK/xmrig.pid"
 fi
-pkill -f "$XMRIG" 2>/dev/null || true
 
-if ! listening 9067; then
-  echo "starting lightwalletd"
+# 9067 on the Studio is the live testnet lightwalletd. Localnet clients must
+# not sync that chain.
+LWD_PORT="${LWD_PORT:-9067}"
+if listening "$LWD_PORT"; then
+  echo "port $LWD_PORT is already in use; localnet lightwalletd will use 19067"
+  LWD_PORT=19067
+fi
+LWD_URL="http://127.0.0.1:${LWD_PORT}"
+if ! listening "$LWD_PORT"; then
+  echo "starting lightwalletd on $LWD_PORT"
   cat >"$WORK/lightwalletd.toml" <<EOF
 darkfid_endpoint = "tcp://127.0.0.1:48345"
-grpc_listen = "127.0.0.1:9067"
+grpc_listen = "127.0.0.1:${LWD_PORT}"
 cache_path = "$WORK/lwd/cache"
 poll_interval = 2
 chain_name = "darkfi-testnet"
@@ -249,10 +257,10 @@ EOF
   RUST_LOG=info "$LWD" --config "$WORK/lightwalletd.toml" >"$WORK/lightwalletd.log" 2>&1 &
   echo $! >"$WORK/lwd.pid"
   for _ in $(seq 1 30); do
-    listening 9067 && break
+    listening "$LWD_PORT" && break
     sleep 1
   done
-  listening 9067 || { echo "lightwalletd failed"; tail -40 "$WORK/lightwalletd.log"; exit 1; }
+  listening "$LWD_PORT" || { echo "lightwalletd failed"; tail -40 "$WORK/lightwalletd.log"; exit 1; }
 fi
 
 export E2E_LWD="$LWD_URL"
@@ -310,7 +318,7 @@ tx="$("$DRK" --config "$DRK_CFG" transfer 40 DRK "$MOON_FOR_DRK")"
 printf '%s\n' "$tx" | "$DRK" --config "$DRK_CFG" broadcast | tee "$WORK/fund-moon.log"
 "$DRK" --config "$DRK_CFG" scan >"$WORK/drk-scan.log" 2>&1 || true
 
-if ! pgrep -f "$XMRIG" >/dev/null; then
+if [[ ! -f "$WORK/xmrig.pid" ]] || ! kill -0 "$(cat "$WORK/xmrig.pid")" 2>/dev/null; then
   echo "starting xmrig for confirmations"
   "$XMRIG" -r 1000 -R 20 -o 127.0.0.1:48347 -t 1 -u "$FAUCET" >"$WORK/xmrig.log" 2>&1 &
   echo $! >"$WORK/xmrig.pid"
