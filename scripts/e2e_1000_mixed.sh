@@ -28,7 +28,29 @@ TRIAL_COUNT="${TRIAL_COUNT:-$COUNT}"
 AMOUNT="${AMOUNT:-0.001}"
 FEE="${FEE:-1000000}"
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
-XMRIG="${XMRIG:-$GH/nighthawk-desktop/src-tauri/target/release/xmrig}"
+resolve_xmrig() {
+  if [[ -n "${XMRIG:-}" && -x "$XMRIG" ]]; then
+    echo "$XMRIG"
+    return 0
+  fi
+  local arch
+  arch="$(uname -m)"
+  local -a candidates=(
+    "$GH/nighthawk-desktop/src-tauri/target/release/xmrig"
+    "$GH/nighthawk-desktop/src-tauri/binaries/xmrig-${arch}-apple-darwin"
+    "$GH/nighthawk-desktop/src-tauri/binaries/xmrig-${arch}-unknown-linux-gnu"
+    "/tmp/xmrig/build/xmrig"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  command -v xmrig 2>/dev/null || true
+}
+XMRIG="$(resolve_xmrig)"
 LOG="$WORK/matrix.log"
 HASHES="$WORK/hashes.txt"
 BALANCE_TIMEOUT="${BALANCE_TIMEOUT:-180}"
@@ -53,10 +75,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+iso_now() {
+  date -Is 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 mkdir -p "$WORK"/{darkfid,drk,lwd,wallets}
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== mixed localnet $(date -Is) strict_count=$COUNT trial_count=$TRIAL_COUNT ==="
+echo "=== mixed localnet $(iso_now) strict_count=$COUNT trial_count=$TRIAL_COUNT ==="
 echo "NOTE: ffi-a and ffi-b are headless darkfi-mobile-ffi wallets (localnet_tx)."
 echo "NOTE: the Android emulator and the Tauri desktop app are NOT exercised."
 
@@ -185,8 +211,17 @@ if [[ ! -x "$AND_TX" ]]; then
   echo "building headless ffi localnet_tx (not the emulator or the Tauri app)"
   (cd "$AND_FFI" && cargo build --release --bin localnet_tx --features localnet)
   # Workspace target is rust/target, not inside the crate directory.
-  built="$(find "$AND_FFI" "$AND_FFI/../target" -path '*/release/localnet_tx' -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}')"
+  built=""
+  for p in "$AND_FFI/target/release/localnet_tx" "$AND_FFI/../target/release/localnet_tx"; do
+    if [[ -x "$p" ]]; then
+      built="$p"
+      break
+    fi
+  done
   if [[ -z "$built" ]]; then
+    built="$(find "$AND_FFI" "$AND_FFI/../target" -path '*/release/localnet_tx' -type f 2>/dev/null | head -n 1)"
+  fi
+  if [[ -z "$built" || ! -x "$built" ]]; then
     echo "localnet_tx binary was not produced"
     exit 1
   fi
@@ -287,11 +322,15 @@ init_ffi() {
 
 if ! "$MOON" -w e2e_moon address default >/dev/null 2>&1; then
   if ! command -v script >/dev/null 2>&1; then
-    echo "moonshine wallet create needs a TTY; install util-linux script" >&2
+    echo "moonshine wallet create needs a TTY; install script" >&2
     exit 1
   fi
   # The mnemonic is printed on the TTY script allocates. Discard it.
-  script -qefc "$MOON wallet create e2e_moon" /dev/null >/dev/null 2>&1
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    script -q /dev/null "$MOON" wallet create e2e_moon >/dev/null 2>&1
+  else
+    script -qefc "$MOON wallet create e2e_moon" /dev/null >/dev/null 2>&1
+  fi
 fi
 MOON_ADDR="$("$MOON" -w e2e_moon address default | awk '/Default address:/ {print $NF; exit}')"
 if [[ -z "$MOON_ADDR" ]]; then
@@ -514,7 +553,7 @@ for ((i = 0; i < COUNT; i++)); do
   send_one "$src" "$dst" strict "e2e-strict-$i"
   strict_ok=$((strict_ok + 1))
   if (( i % 25 == 0 )); then
-    echo "PROGRESS strict i=$i ok=$strict_ok $(date -Is)"
+    echo "PROGRESS strict i=$i ok=$strict_ok $(iso_now)"
   fi
 done
 
@@ -553,4 +592,4 @@ if [[ "$strict_ok" != "$COUNT" || "$trial_ok" != "$TRIAL_COUNT" ]]; then
   echo "count mismatch"
   exit 1
 fi
-echo "=== done $(date -Is) ==="
+echo "=== done $(iso_now) ==="

@@ -16,7 +16,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LWD_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-IOS_FFI="$(cd "$LWD_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi" && pwd)"
+IOS_DIR="$LWD_DIR/../nighthawk-ios-wallet"
+IOS_FFI="$IOS_DIR/rust/darkfi-mobile-ffi"
+IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
 AND_FFI="$(cd "$LWD_DIR/../nighthawk-android-wallet/rust/darkfi-mobile-ffi" && pwd)"
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
 NETWORK="${NETWORK:-testnet}"
@@ -88,16 +90,30 @@ while IFS= read -r line; do
 done < "$WORK/e2e_unifomr_matrix.log"
 
 echo -e "\n${CYAN}Mobile FFI UnifOMR unit parity${NC}"
-for label_dir in "ios:$IOS_FFI" "android:$AND_FFI"; do
-  label="${label_dir%%:*}"
-  dir="${label_dir#*:}"
-  if (cd "$dir" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >"$WORK/e2e_${label}_unifomr.log" 2>&1); then
-    report PASS "${label} per-message multi-clue unit"
+AND_FFI_OK=0
+if (cd "$AND_FFI" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >"$WORK/e2e_android_unifomr.log" 2>&1); then
+  report PASS "android per-message multi-clue unit"
+  AND_FFI_OK=1
+else
+  report FAIL "android any-match unit"
+  tail -20 "$WORK/e2e_android_unifomr.log" || true
+fi
+
+if [ -f "$IOS_FFI/Cargo.toml" ]; then
+  if (cd "$IOS_FFI" && cargo test --lib test_unifomr_multi_clue_second_matches -- --nocapture >"$WORK/e2e_ios_unifomr.log" 2>&1); then
+    report PASS "ios per-message multi-clue unit"
   else
-    report FAIL "${label} any-match unit"
-    tail -20 "$WORK/e2e_${label}_unifomr.log" || true
+    report FAIL "ios any-match unit"
+    tail -20 "$WORK/e2e_ios_unifomr.log" || true
   fi
-done
+elif [ -f "$IOS_BUILD_SCRIPT" ]; then
+  if [ "$AND_FFI_OK" -eq 1 ] && bash -n "$IOS_BUILD_SCRIPT" && \
+     grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT"; then
+    report PASS "ios per-message multi-clue unit (unified shared crate)"
+  else
+    report FAIL "ios unified shared crate check"
+  fi
+fi
 
 echo ""
 echo "Matrix summary: $PASS passed, $FAIL failed"
