@@ -20,20 +20,36 @@ PIN="$GH/darkfi-nighthawk-testnet"
 LWD_DIR="$ROOT"
 MOON_DIR="$GH/moonshine"
 AND_FFI="$GH/nighthawk-android-wallet/rust/darkfi-mobile-ffi"
-IOS_FFI="$GH/nighthawk-ios-wallet/rust/darkfi-mobile-ffi"
+IOS_DIR="$GH/nighthawk-ios-wallet"
+IOS_FFI="$IOS_DIR/rust/darkfi-mobile-ffi"
+IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
 WORK="${WORK:-$HOME/.local/nighthawk-e2e/localnet}"
 COUNT="${COUNT:-100}"
 AMOUNT="${AMOUNT:-0.01}"
 FEE="${FEE:-1000000}"
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
 TARGET="$PIN/target"
-TRIPLE="x86_64-unknown-linux-gnu"
+if [[ -z "${TRIPLE:-}" ]]; then
+  TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')"
+fi
+if [[ -z "${TRIPLE:-}" ]]; then
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Darwin:aarch64) TRIPLE="aarch64-apple-darwin" ;;
+    Darwin:x86_64) TRIPLE="x86_64-apple-darwin" ;;
+    Linux:aarch64|Linux:arm64) TRIPLE="aarch64-unknown-linux-gnu" ;;
+    *) TRIPLE="x86_64-unknown-linux-gnu" ;;
+  esac
+fi
 LOG="$WORK/matrix.log"
+
+iso_now() {
+  date -Is 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
 
 mkdir -p "$WORK"/{darkfid,drk,lwd,wallets}
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== localnet UnifOMR client matrix $(date -Is) count=$COUNT ==="
+echo "=== localnet UnifOMR client matrix $(iso_now) count=$COUNT ==="
 
 bin_of() {
   local base="$1" name="$2"
@@ -50,11 +66,34 @@ bin_of() {
   fi
 }
 
+resolve_xmrig() {
+  if [[ -n "${XMRIG:-}" && -x "$XMRIG" ]]; then
+    echo "$XMRIG"
+    return 0
+  fi
+  local arch
+  arch="$(uname -m)"
+  local -a candidates=(
+    "$GH/nighthawk-desktop/src-tauri/target/release/xmrig"
+    "$GH/nighthawk-desktop/src-tauri/binaries/xmrig-${TRIPLE}"
+    "$GH/nighthawk-desktop/src-tauri/binaries/xmrig-${arch}-apple-darwin"
+    "/tmp/xmrig/build/xmrig"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  command -v xmrig 2>/dev/null || true
+}
+
 DARKFID="$(bin_of "$PIN" darkfid)"
 DRK="$(bin_of "$PIN" drk)"
 LWD="$(bin_of "$LWD_DIR" darkfi-lightwalletd)"
 MOON="$(bin_of "$MOON_DIR" moonshine)"
-XMRIG="${XMRIG:-/tmp/xmrig/build/xmrig}"
+XMRIG="$(resolve_xmrig)"
 
 if [[ -z "$DARKFID" || -z "$DRK" || -z "$LWD" || -z "$MOON" || ! -x "$XMRIG" ]]; then
   echo "missing binaries:"
@@ -81,8 +120,26 @@ build_named() {
   local dir="$1" out="$2"
   shift 2
   (cd "$dir" && cargo build --release --bin localnet_tx "$@")
-  local built
-  built="$(find "$dir" "$dir/../.." -path '*/release/localnet_tx' -type f -printf '%T@ %p\n' | sort -nr | awk 'NR==1{print $2}')"
+  local built=""
+  local -a search_paths=(
+    "$CARGO_TARGET_DIR/release/localnet_tx"
+    "$dir/target/release/localnet_tx"
+    "$dir/../target/release/localnet_tx"
+  )
+  local p
+  for p in "${search_paths[@]}"; do
+    if [[ -x "$p" ]]; then
+      built="$p"
+      break
+    fi
+  done
+  if [[ -z "$built" ]]; then
+    built="$(find "$dir" "$dir/.." -path '*/release/localnet_tx' -type f 2>/dev/null | head -n 1)"
+  fi
+  if [[ -z "$built" || ! -x "$built" ]]; then
+    echo "localnet_tx binary was not produced under $dir" >&2
+    exit 1
+  fi
   cp -f "$built" "$out"
 }
 
@@ -91,12 +148,28 @@ if [[ ! -x "$WORK/android-desktop-tx" ]]; then
   build_named "$AND_FFI" "$WORK/android-desktop-tx" --features localnet
 fi
 if [[ "${SKIP_IOS:-0}" != 1 && ! -x "$WORK/ios-tx" ]]; then
-  echo "building ios localnet_tx"
-  build_named "$IOS_FFI" "$WORK/ios-tx"
+  if [[ -f "$IOS_FFI/Cargo.toml" ]]; then
+    echo "building ios localnet_tx"
+    build_named "$IOS_FFI" "$WORK/ios-tx" --features localnet
+  elif [[ -f "$IOS_BUILD_SCRIPT" ]] && grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT"; then
+    echo "ios uses unified darkfi-mobile-ffi ($AND_FFI); reusing android-desktop-tx for ios-tx"
+    cp -f "$WORK/android-desktop-tx" "$WORK/ios-tx"
+  else
+    echo "ios darkfi-mobile-ffi Cargo.toml not found and unified build script missing; set SKIP_IOS=1 or restore FFI crate" >&2
+    exit 1
+  fi
 fi
 
 listening() {
-  ss -lnt | awk -v p=":$1" '$4 ~ p"$" { found=1 } END { exit found ? 0 : 1 }'
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnt | awk -v p=":$port" '$4 ~ p"$" { found=1 } END { exit found ? 0 : 1 }'
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    echo "need ss or lsof to see whether port $port is listening" >&2
+    return 1
+  fi
 }
 
 if ! listening 48345; then
@@ -161,7 +234,7 @@ fi
 if [[ -f "$WORK/xmrig.pid" ]]; then
   kill "$(cat "$WORK/xmrig.pid")" 2>/dev/null || true
 fi
-pkill -f '/tmp/xmrig/build/xmrig' 2>/dev/null || true
+pkill -f "$XMRIG" 2>/dev/null || true
 
 if ! listening 9067; then
   echo "starting lightwalletd"
@@ -198,7 +271,19 @@ init_ffi() {
 echo "init moonshine"
 # wallet create prints the seed and refuses a non-TTY stderr
 if ! "$MOON" -w e2e_moon address default >/dev/null 2>&1; then
-  script -qefc "$MOON wallet create e2e_moon" "$WORK/moon-create.log"
+  # script copies the typescript, including the seed, to stdout. The log
+  # redirect at the top of this file would otherwise archive it.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    script -q "$WORK/moon-create.log" "$MOON" wallet create e2e_moon >/dev/null 2>&1 || create_status=$?
+  else
+    script -qefc "$MOON wallet create e2e_moon" "$WORK/moon-create.log" >/dev/null 2>&1 || create_status=$?
+  fi
+  # wallet create prints the seed into this typescript. Drop it even when create fails.
+  rm -f "$WORK/moon-create.log"
+  if [[ "${create_status:-0}" -ne 0 ]]; then
+    echo "moonshine wallet create failed"
+    exit "$create_status"
+  fi
 fi
 MOON_ADDR="$("$MOON" -w e2e_moon address default | awk '/Default address:/ {print $NF; exit} /^f/{print; exit}')"
 echo "moonshine=$MOON_ADDR"
@@ -225,7 +310,7 @@ tx="$("$DRK" --config "$DRK_CFG" transfer 40 DRK "$MOON_FOR_DRK")"
 printf '%s\n' "$tx" | "$DRK" --config "$DRK_CFG" broadcast | tee "$WORK/fund-moon.log"
 "$DRK" --config "$DRK_CFG" scan >"$WORK/drk-scan.log" 2>&1 || true
 
-if ! pgrep -f '/tmp/xmrig/build/xmrig' >/dev/null; then
+if ! pgrep -f "$XMRIG" >/dev/null; then
   echo "starting xmrig for confirmations"
   "$XMRIG" -r 1000 -R 20 -o 127.0.0.1:48347 -t 1 -u "$FAUCET" >"$WORK/xmrig.log" 2>&1 &
   echo $! >"$WORK/xmrig.pid"
@@ -352,11 +437,11 @@ no_omr_send() {
 no_omr_send android "$AND_ADDR" || echo "NOOMR_FAIL android"
 no_omr_send desktop "$DESK_ADDR" || echo "NOOMR_FAIL desktop"
 
-echo "=== final sync and history $(date -Is) ==="
+echo "=== final sync and history $(iso_now) ==="
 E2E_WALLET_DIR="$WORK/wallets/android" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/android/final-sync.out"
 E2E_WALLET_DIR="$WORK/wallets/desktop" "$WORK/android-desktop-tx" sync | tee "$WORK/wallets/desktop/final-sync.out"
 "$MOON" -w e2e_moon -s "$LWD_URL" sync --force-trial | tee "$WORK/moon-final-sync.log" | tail -8
 "$MOON" -w e2e_moon balance | tee "$WORK/moon-final-balance.txt"
 "$MOON" -w e2e_moon tx list | tee "$WORK/moon-tx-list.txt" | tail -20
 
-echo "=== done $(date -Is) log=$LOG ==="
+echo "=== done $(iso_now) log=$LOG ==="
