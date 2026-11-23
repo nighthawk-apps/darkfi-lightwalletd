@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.10.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.15, desktop 3.1.13, and Moonshine 3.1.12. DarkFi pin `9d7ceaf77`.
+**0.3.11.** UnifOMR worker count, detection-key pool, and upload deadline are config knobs. A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.18, desktop 3.1.18, and Moonshine 3.1.18. DarkFi pin for wallets is `6e61deb26` (contains `9d7ceaf77`); build sibling checkout notes below still accept that pin.
 
 ## Contents
 
@@ -283,12 +283,96 @@ Defined in `proto/lightwallet.proto`.
 
 ## Infrastructure sizing
 
-| Resource | 1k users | 10k | 100k |
-|----------|----------|-----|------|
-| CPU | 2 | 8 | 32+ (detector pool) |
-| RAM | 4 GB | 16 GB | 64+ GB |
-| Storage | 50 GB SSD | 200 GB | 1 TB NVMe |
-| Bandwidth | ~50 Mbps | ~500 Mbps | ~5 Gbps |
+Two different loads. **Trial decryption** (default binary) is cheap per client.
+**UnifOMR** (`--features fhe-omr`) is dominated by Param2 detection keys
+(~120 MiB each on the wire; see [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md))
+and by the process-wide FHE worker pool (`fhe_workers`, default **2**).
+
+Configurable caps (see `lightwalletd.toml.example`):
+
+| Cap | Default | Config key |
+|-----|---------|------------|
+| Max TCP connections | 512 | `max_connections` |
+| Max streams / connection | 256 | `max_streams_per_conn` |
+| Concurrent block-range streams | 200 | `MAX_BLOCK_RANGE_STREAMS` (code) |
+| OMR RPCs / min / IP | 30 | `omr_rate_limit_per_min` |
+| Concurrent FHE digests | 2 | `fhe_workers` |
+| Concurrent PIR workers | `max(fhe_workers, 4)` | derived from `fhe_workers` |
+| Detection-key upload budget | 512 MiB | `upload_budget_mib` |
+| Det-key upload deadline | 300 s | `upload_deadline_s` |
+| Pooled detection keys | ≤4096 handles, **8 GiB** | `detection_pool_handles`, `detection_pool_mib` |
+| Det-key / request | ≤160 MiB | `max_detection_key_bytes` |
+| Compact-block range | ≤10 000 heights | `max_range_per_request` |
+
+### Trial decryption (default binary) — minimum host specs
+
+“Simultaneous” = active gRPC streams (compact blocks / tip poll), not UnifOMR digests.
+
+| Resource | **100 clients** (hosting floor) | **1000 clients** (simultaneous) |
+|----------|----------------------------------|---------------------------------|
+| CPU | **4 cores** | **8–16 cores** |
+| RAM | **8 GB** | **16–32 GB** |
+| Storage | **100 GB SSD** (compact cache) | **200–500 GB NVMe** |
+| NIC | **100–200 Mbps** | **500 Mbps–1 Gbps** |
+| Config | defaults fine | set `max_connections ≥ 1024` (or LB in front); keep block-range permits ≥ concurrent catch-up clients |
+
+### UnifOMR-enabled (`--features fhe-omr`) — minimum host specs
+
+UnifOMR stays **opt-in** on clients. Size for detection-key RAM and FHE CPU, not only TCP fan-out.
+
+| Resource | **100 UnifOMR-capable clients** | **1000 UnifOMR-capable clients** |
+|----------|----------------------------------|----------------------------------|
+| CPU | **8+ cores**; set `fhe_workers` ≈ `cores/2` (keep ≥2 free for gRPC) | **Multi-node.** Default `fhe_workers=2` per process; 1000 concurrent digests need a fleet or much larger `fhe_workers` + CPU |
+| RAM | **32 GB** (8 GiB key pool + 512 MiB upload budget + OS + sled) | **64 GB+ per node**, or raise `detection_pool_mib` / accept per-request uploads when the pool is full |
+| Storage | **200 GB NVMe** | **500 GB–1 TB NVMe** per node |
+| NIC | **1 Gbps** (~120 MiB/key; four uploads ≈500 Mbps) | **10 Gbps aggregate** across nodes, or edge-terminate TLS/gRPC |
+| Practical concurrent digests | ≈`fhe_workers` in flight; ≈`upload_budget_mib / 120` uploads; ≈`detection_pool_mib / 120` pooled keys | Same **per node**. Plan ~15–30 digest-capable nodes if every client digests often, or keep UnifOMR rare and rely on trial decrypt |
+
+Hard limits until the crypto path shrinks keys:
+
+1. **One Param2 detection key ≈ 120 MiB.** Symmetric seed encryption (`det_sk.try_encrypt`) can cut that roughly in half (~60 MiB) with no server change; still experimental.
+2. **`fhe_workers` (default 2)** serializes digests. Raising it without matching CPU makes the box thrash. PIR concurrency is `max(fhe_workers, 4)`.
+3. **OMR rate limit 30/min/IP** also covers `FetchPirBatch`. Shared Tor exits share that budget; PIR-per-limb loops can exhaust it (see [`docs/fable-5.1-audit-unifomr-sync-source.md`](docs/fable-5.1-audit-unifomr-sync-source.md)).
+4. **1000 simultaneous UnifOMR digests on one box is not realistic** with Param2. Size 1000 for *connections* on the trial-decrypt path; size UnifOMR for *active digests* (tens per node).
+
+Lab / self-host starting point (≤100 wallets, few digests at once): 8-core ARM or x86, 32 GB RAM, 200 GB NVMe, 1 Gbps, `request_timeout_s ≥ 1800`, `fhe_workers=4`, reverse-proxy body ≥ 160 MB (`docs/deploy-hardening.md`).
+
+Measured on this Mac (Apple Silicon, `cargo test --release --features fhe-omr --lib measure_hosting_timings -- --ignored`, 2026-11-23):
+
+| Op | Result |
+|----|--------|
+| Detection key size | **125 863 941 B (~120.0 MiB)**, 1024 CTs |
+| `from_wallet` | 21 ms |
+| `build_detection_key` | 759 ms |
+| `parse_detection_key` | 219 ms |
+| Encode one full SIMD chunk (`D=4096`) | 495 ms total (275 ms eval after parse) |
+| Digest size (1 chunk) | 81 997 B |
+| Decrypt digest slots | 0.42 ms |
+| PIR evaluate 1 / 2 stripes (one limb) | 0.63 ms / 1.25 ms |
+| PIR query CT | 122 910 B |
+| Money-tree append 1000 coins (Sinsemilla) | 70 ms |
+
+So UnifOMR hosting cost is **key upload + FHE encode**, not Merkle hashing. With `fhe_workers=2`, a single box sustains on the order of a few digests per second for one-chunk windows, not hundreds.
+
+### Compact-block Money-tree fast sync (Sinsemilla, not Pedersen)
+
+DarkFi’s Money Merkle tree uses **Sinsemilla** `MerkleCRH` (`darkfi` `MerkleNode::combine`, Orchard-style), not Sapling Pedersen hashes. Compact blocks carry a Pedersen **value commitment** (`value_commit`) for spend proofs; light clients append `coin` field elements into the tree via `MerkleNode::from` / `from_bytes`.
+
+What is already good enough for production trial-decrypt sync:
+
+- Tip tree on lightwalletd keeps the dummy `ZERO` leaf so roots match wallets (`cache.rs` `empty_tip_tree`).
+- Clients refuse non-canonical coin bytes instead of silently shifting leaves.
+- Supplemental UnifOMR trial decrypt can walk compact blocks with `append_commitments = false` so the tree is not double-appended.
+- Checkpoints / `GetNoteCommitments` replay are the catch-up path; see [`docs/wallet-sync-speed-plan.md`](docs/wallet-sync-speed-plan.md).
+
+Worthwhile cross-client optimizations (shared Rust in `darkfi-mobile-ffi` / Moonshine, not per-UI):
+
+| Idea | Why | Risk |
+|------|-----|------|
+| Historical Merkle snapshots every 1024 heights | Avoids replaying `0..=birthday` coin appends | Proto / disk; already designed in the sync-speed plan |
+| Batch `MerkleNode::combine` / fewer tree flushes per window | BridgeTree append is cheap; sled serialize of the full tree is not | Keep one flush per window |
+| Verify `value_commit` after AEAD decrypt (Pedersen open) | Catches a malicious LWD that swaps notes | Extra CPU on match only; not on every compact output |
+| Do not re-upload a 120 MiB UnifOMR det-key every 5 s poll | Dominates sync more than Merkle hashing | Unlinkability trade-off; use the detection-key pool |
 
 ---
 

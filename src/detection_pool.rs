@@ -98,6 +98,30 @@ impl DetectionKeyPool {
         self.entries.len()
     }
 
+    /// Fast pre-check before taking an FHE permit and parsing a ~120 MiB key.
+    /// Sweeps expired entries first; callers still check `insert` atomically.
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    pub fn can_accept(
+        &mut self,
+        byte_length: usize,
+        max_key_bytes: usize,
+        now_unix: u64,
+    ) -> Result<(), PoolReject> {
+        self.sweep_expired(now_unix);
+        if byte_length == 0 {
+            return Err(PoolReject::Empty);
+        }
+        if byte_length > max_key_bytes {
+            return Err(PoolReject::TooLarge);
+        }
+        if self.entries.len() >= self.max_handles
+            || self.total_bytes.saturating_add(byte_length as u64) > self.max_total_bytes
+        {
+            return Err(PoolReject::Full);
+        }
+        Ok(())
+    }
+
     /// Insert a validated key. Sweeps expired rows first.
     ///
     /// The handle is 32 bytes from the OS RNG. It is not derived from the key.

@@ -100,9 +100,10 @@ const DEFAULT_FHE_PERMITS: usize = 2;
 /// during this read; a slow client must not occupy a worker slot.
 #[cfg(feature = "fhe-omr")]
 const DETECTION_KEY_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Whole detection-key upload, including every chunk.
+/// Whole detection-key upload default deadline, including every chunk.
+/// Overridden by `Config.upload_deadline_s` (300s default for ~120 MiB over Tor).
 #[cfg(feature = "fhe-omr")]
-const UPLOAD_DEADLINE: Duration = Duration::from_secs(120);
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 /// Wait for an FHE worker before returning UNAVAILABLE.
 #[cfg(feature = "fhe-omr")]
 const FHE_PERMIT_WAIT: Duration = Duration::from_secs(10);
@@ -652,14 +653,23 @@ fn client_ip_from_forwarded(header: &str, trusted: &[String]) -> Option<IpAddr> 
     None
 }
 
-/// In-memory clue/note list for one `(start, end)` window.
+/// Pre-flattened, validated RLWE clues for one `(start, end)` window.
 ///
-/// A second digest for the same window skips the sled compact-block scan.
-/// Digest ciphertexts are not stored — they differ per handle and per range.
+/// Shared across concurrent digest requests via `Arc` so repeat digests for
+/// the same padded window skip sled reads, clue deserialization, BLAKE3
+/// checksums, and slot-height packing. Digest ciphertexts are never stored —
+/// they differ per detection key.
+#[cfg(feature = "fhe-omr")]
+struct FlattenedClueWindow {
+    messages: Vec<crate::unifomr::RlweCiphertext>,
+    slot_heights_wire: Vec<u8>,
+    truncated: bool,
+}
+
 #[cfg(feature = "fhe-omr")]
 struct ClueWindowEntry {
     end_hash: [u8; 32],
-    notes: Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>,
+    window: Arc<FlattenedClueWindow>,
 }
 
 #[cfg(feature = "fhe-omr")]
@@ -679,17 +689,12 @@ impl ClueWindowCache {
         }
     }
 
-    fn get(
-        &self,
-        start: u32,
-        end: u32,
-        end_hash: [u8; 32],
-    ) -> Option<Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>> {
+    fn get(&self, start: u32, end: u32, end_hash: [u8; 32]) -> Option<Arc<FlattenedClueWindow>> {
         let hit = self.map.get(&(start, end))?;
         if hit.end_hash != end_hash {
             return None;
         }
-        Some(hit.notes.clone())
+        Some(Arc::clone(&hit.window))
     }
 
     fn insert(
@@ -697,11 +702,11 @@ impl ClueWindowCache {
         start: u32,
         end: u32,
         end_hash: [u8; 32],
-        notes: Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>,
+        window: Arc<FlattenedClueWindow>,
     ) {
         let key = (start, end);
         if self.map.contains_key(&key) {
-            self.map.insert(key, ClueWindowEntry { end_hash, notes });
+            self.map.insert(key, ClueWindowEntry { end_hash, window });
             return;
         }
         while self.order.len() >= Self::CAP {
@@ -712,7 +717,7 @@ impl ClueWindowCache {
             }
         }
         self.order.push_back(key);
-        self.map.insert(key, ClueWindowEntry { end_hash, notes });
+        self.map.insert(key, ClueWindowEntry { end_hash, window });
     }
 }
 
@@ -1045,9 +1050,16 @@ pub struct LightWalletService {
     tip_notify: tokio::sync::watch::Receiver<u32>,
     /// In-flight block-range streams across every connection.
     block_range_permits: Arc<tokio::sync::Semaphore>,
-    /// Limits concurrent FHE `spawn_blocking` workers (CPU / RAM).
+    /// Limits concurrent FHE digest/registration `spawn_blocking` workers.
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     fhe_permits: Arc<tokio::sync::Semaphore>,
+    /// Separate permit pool for millisecond `FetchPirBatch` limbs so multi-second
+    /// digests do not starve Round-2 PIR fetches.
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    pir_permits: Arc<tokio::sync::Semaphore>,
+    /// Whole detection-key upload deadline (configurable for Tor/Nym links).
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    upload_deadline: Duration,
     /// TCP peers from which `X-Forwarded-For` is trusted (empty = ignore the header).
     trusted_proxies: Vec<String>,
     max_detection_key_bytes: usize,
@@ -1142,6 +1154,11 @@ impl LightWalletService {
             tip_notify,
             block_range_permits: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCK_RANGE_STREAMS)),
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
+            pir_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS.max(4))),
+            #[cfg(feature = "fhe-omr")]
+            upload_deadline: UPLOAD_DEADLINE,
+            #[cfg(not(feature = "fhe-omr"))]
+            upload_deadline: Duration::from_secs(300),
             trusted_proxies,
             max_detection_key_bytes: MAX_DETECTION_KEY_BYTES,
             max_detection_keys_total_bytes: MAX_DETECTION_KEYS_TOTAL_BYTES,
@@ -1188,6 +1205,25 @@ impl LightWalletService {
             .set_gc_threshold(rate_limit_gc_threshold);
         self.rpc_rate_limiter
             .set_gc_threshold(rate_limit_gc_threshold);
+    }
+
+    /// Override FHE worker concurrency, detection-key pool limits, and upload deadline.
+    pub fn apply_fhe_pool_config(
+        &mut self,
+        fhe_workers: usize,
+        detection_pool_handles: usize,
+        detection_pool_mib: u64,
+        upload_deadline_s: u64,
+    ) {
+        let workers = fhe_workers.max(1);
+        self.fhe_permits = Arc::new(tokio::sync::Semaphore::new(workers));
+        self.pir_permits = Arc::new(tokio::sync::Semaphore::new(workers.max(4)));
+        let pool_bytes = detection_pool_mib.max(1).saturating_mul(1 << 20);
+        self.detection_pool = Arc::new(Mutex::new(DetectionKeyPool::with_limits(
+            detection_pool_handles.max(1),
+            pool_bytes,
+        )));
+        self.upload_deadline = Duration::from_secs(upload_deadline_s.max(1));
     }
 
     fn peer_ip<T>(&self, request: &Request<T>) -> IpAddr {
@@ -1419,6 +1455,20 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    async fn acquire_pir_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        match tokio::time::timeout(
+            FHE_PERMIT_WAIT,
+            Arc::clone(&self.pir_permits).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(Status::unavailable("PIR workers unavailable")),
+            Err(_) => Err(Status::unavailable("timed out waiting for a PIR worker")),
+        }
+    }
+
+    #[cfg(feature = "fhe-omr")]
     fn begin_pir(&self, peer: IpAddr) -> Result<SlotGuard, Status> {
         Self::try_slot(&self.pir_inflight, peer, MAX_PIR_INFLIGHT_PER_IP).map_err(|_| {
             Status::resource_exhausted(
@@ -1508,11 +1558,11 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
-    fn cached_encrypted_notes(
+    fn cached_flattened_clues(
         &self,
         start: u32,
         end: u32,
-    ) -> Result<Vec<(u32, Vec<crate::omr_detector::NoteForDetection>)>, Status> {
+    ) -> Result<Arc<FlattenedClueWindow>, Status> {
         let end_hash = self
             .cache
             .get_block_hash(end)
@@ -1527,16 +1577,26 @@ impl LightWalletService {
             .cache
             .get_encrypted_notes_range(start, end)
             .map_err(cache_status)?;
+        let clue_notes = crate::unifomr::block_notes_from_detection(&notes);
+        let (mut messages, mut slot_heights) = crate::unifomr::flatten_messages(&clue_notes);
+        let truncated =
+            crate::unifomr::cap_messages_to_whole_heights(&mut messages, &mut slot_heights);
+        let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
+        let window = Arc::new(FlattenedClueWindow {
+            messages,
+            slot_heights_wire,
+            truncated,
+        });
         if let Ok(mut guard) = self.clue_windows.lock() {
-            guard.insert(start, end, end_hash, notes.clone());
+            guard.insert(start, end, end_hash, Arc::clone(&window));
         }
-        Ok(notes)
+        Ok(window)
     }
 
     /// Same digest evaluator `GetUnifOmrDigest` uses after the key is in hand.
     ///
-    /// Does not cache the ciphertext. The clue/note list for `(start, eval_end)`
-    /// may be reused across handles.
+    /// Does not cache the ciphertext. The flattened clue list for `(start, eval_end)`
+    /// is shared across handles via `Arc` without re-parsing or cloning clues.
     #[cfg(feature = "fhe-omr")]
     async fn evaluate_detection_keys(
         &self,
@@ -1547,44 +1607,50 @@ impl LightWalletService {
     ) -> Result<proto::OmrDigestResponse, Status> {
         reject_oversized_window(start, end)?;
         let (eval_end, range_complete) = digest_evaluable_end(&self.cache, start, end)?;
-        let block_notes = match eval_end {
-            Some(eval_end) => self.cached_encrypted_notes(start, eval_end)?,
-            None => Vec::new(),
+        let window = match eval_end {
+            Some(eval_end) => self.cached_flattened_clues(start, eval_end)?,
+            None => Arc::new(FlattenedClueWindow {
+                messages: Vec::new(),
+                slot_heights_wire: Vec::new(),
+                truncated: false,
+            }),
         };
         let network_byte = self.network_byte;
-        let (encrypted_digest, slot_heights_wire, truncated) =
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
-                let clue_notes = crate::unifomr::block_notes_from_detection(&block_notes);
-                let (mut messages, mut slot_heights) =
-                    crate::unifomr::flatten_messages(&clue_notes);
-                let truncated =
-                    crate::unifomr::cap_messages_to_whole_heights(&mut messages, &mut slot_heights);
-                let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
-                let digest = if keys.len() == 1 {
-                    crate::unifomr::encode_messages_padded(&detector, &keys[0], &messages)
-                        .map_err(|e| e.to_string())?
-                } else {
-                    let mut out = Vec::new();
-                    for key in &keys {
-                        let d = crate::unifomr::encode_messages_padded(&detector, key, &messages)
-                            .map_err(|e| e.to_string())?;
-                        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-                        out.extend_from_slice(&d);
-                    }
-                    out
-                };
-                Ok::<(Vec<u8>, Vec<u8>, bool), String>((digest, slot_heights_wire, truncated))
-            })
-            .await
-            .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
-            .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
+        let window_for_worker = Arc::clone(&window);
+        let encrypted_digest = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let detector = crate::unifomr::UnifOmrDetector::new(network_byte);
+            let digest = if keys.len() == 1 {
+                crate::unifomr::encode_messages_padded(
+                    &detector,
+                    &keys[0],
+                    &window_for_worker.messages,
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                let mut out = Vec::new();
+                for key in &keys {
+                    let d = crate::unifomr::encode_messages_padded(
+                        &detector,
+                        key,
+                        &window_for_worker.messages,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&d);
+                }
+                out
+            };
+            Ok::<Vec<u8>, String>(digest)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
+        .map_err(|e| Status::invalid_argument(format!("UnifOMR detection error: {e}")))?;
 
         Ok(proto::OmrDigestResponse {
             encrypted_digest,
-            complete: range_complete && !truncated,
-            slot_heights: slot_heights_wire,
+            complete: range_complete && !window.truncated,
+            slot_heights: window.slot_heights_wire.clone(),
         })
     }
 
@@ -1606,21 +1672,24 @@ impl LightWalletService {
         let mut current_key = Vec::new();
         let mut keys = Vec::new();
         let mut reservation: Option<UploadReservation> = None;
-        let deadline = tokio::time::Instant::now() + UPLOAD_DEADLINE;
+        let upload_deadline_secs = self.upload_deadline.as_secs();
+        let deadline = tokio::time::Instant::now() + self.upload_deadline;
 
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(Status::deadline_exceeded(
-                    "UnifOMR detection-key upload exceeded 120s",
-                ));
+                return Err(Status::deadline_exceeded(format!(
+                    "UnifOMR detection-key upload exceeded {upload_deadline_secs}s"
+                )));
             }
             let wait = DETECTION_KEY_CHUNK_IDLE_TIMEOUT.min(remaining);
             let next = tokio::time::timeout(wait, stream.next())
                 .await
                 .map_err(|_| {
                     if wait < DETECTION_KEY_CHUNK_IDLE_TIMEOUT {
-                        Status::deadline_exceeded("UnifOMR detection-key upload exceeded 120s")
+                        Status::deadline_exceeded(format!(
+                            "UnifOMR detection-key upload exceeded {upload_deadline_secs}s"
+                        ))
                     } else {
                         Status::deadline_exceeded("UnifOMR detection-key upload stalled")
                     }
@@ -2700,6 +2769,16 @@ impl DarkFiLightWallet for LightWalletService {
             let _reservation = upload.reservation;
             let network_byte = self.network_byte;
             let max_key_bytes = self.max_detection_key_bytes;
+            let raw_bytes: usize = upload.keys.iter().map(|k| k.len()).sum();
+            self.pool_lock()?
+                .can_accept(raw_bytes, max_key_bytes, detection_pool::unix_now())
+                .map_err(|e| match e {
+                    PoolReject::Full => Status::resource_exhausted("detection key pool is full"),
+                    PoolReject::TooLarge => {
+                        Status::invalid_argument("detection key exceeds the size cap")
+                    }
+                    PoolReject::Empty => Status::invalid_argument("empty detection key"),
+                })?;
             let permit = self.acquire_fhe_permit().await?;
             let keys = upload.keys;
             // Parse off the runtime. Ciphertexts are dropped; the wire bytes go
@@ -2866,7 +2945,7 @@ impl DarkFiLightWallet for LightWalletService {
                 )));
             }
 
-            let permit = self.acquire_fhe_permit().await?;
+            let permit = self.acquire_pir_permit().await?;
             let cache = Arc::clone(&self.cache);
             let pir_windows = Arc::clone(&self.pir_windows);
             let limb_index = req.limb_index as usize;
@@ -3626,20 +3705,20 @@ mod tests {
     #[test]
     fn clue_window_cache_keeps_notes_not_digest_bytes() {
         let mut cache = ClueWindowCache::new();
-        let notes = vec![(
-            4u32,
-            vec![crate::omr_detector::NoteForDetection {
-                encrypted_note: vec![1, 2, 3],
-                omr_clue: vec![9],
+        let window = Arc::new(FlattenedClueWindow {
+            messages: vec![crate::unifomr::RlweCiphertext {
+                a: vec![1, 2],
+                b: vec![3, 4],
             }],
-        )];
+            slot_heights_wire: crate::unifomr::pack_slot_heights(&[4]),
+            truncated: false,
+        });
         let hash = [7u8; 32];
-        cache.insert(0, 1023, hash, notes.clone());
+        cache.insert(0, 1023, hash, Arc::clone(&window));
         let hit = cache.get(0, 1023, hash).unwrap();
-        assert_eq!(hit.len(), 1);
-        assert_eq!(hit[0].0, 4);
-        assert_eq!(hit[0].1[0].encrypted_note, notes[0].1[0].encrypted_note);
-        assert_eq!(hit[0].1[0].omr_clue, notes[0].1[0].omr_clue);
+        assert!(Arc::ptr_eq(&hit, &window));
+        assert_eq!(hit.messages.len(), 1);
+        assert_eq!(hit.slot_heights_wire, window.slot_heights_wire);
         assert!(cache.get(0, 1023, [8u8; 32]).is_none());
     }
 

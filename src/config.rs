@@ -115,6 +115,22 @@ pub struct Config {
     /// Concurrent detection-key uploads accepted from one IP (default 2).
     #[serde(default = "default_max_uploads_per_ip")]
     pub max_uploads_per_ip: usize,
+
+    /// Concurrent FHE digest worker slots (default 2; scale with CPU cores for UnifOMR).
+    #[serde(default = "default_fhe_workers")]
+    pub fhe_workers: usize,
+
+    /// Max concurrent detection-key handles retained in memory (default 4096).
+    #[serde(default = "default_detection_pool_handles")]
+    pub detection_pool_handles: usize,
+
+    /// RAM budget for the in-memory detection-key pool, in MiB (default 8192 = 8 GiB).
+    #[serde(default = "default_detection_pool_mib")]
+    pub detection_pool_mib: u64,
+
+    /// Whole detection-key upload deadline in seconds (default 300; ~120 MiB over Tor).
+    #[serde(default = "default_upload_deadline_s")]
+    pub upload_deadline_s: u64,
 }
 
 fn default_darkfid_endpoint() -> String {
@@ -206,6 +222,22 @@ fn default_max_uploads_per_ip() -> usize {
     2
 }
 
+fn default_fhe_workers() -> usize {
+    2
+}
+
+fn default_detection_pool_handles() -> usize {
+    crate::detection_pool::MAX_DETECTION_KEY_HANDLES
+}
+
+fn default_detection_pool_mib() -> u64 {
+    crate::detection_pool::MAX_DETECTION_POOL_BYTES >> 20
+}
+
+fn default_upload_deadline_s() -> u64 {
+    300
+}
+
 /// Expand a leading `~/` to the user home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -268,6 +300,10 @@ impl Default for Config {
             max_detection_key_bytes: default_max_detection_key_bytes(),
             upload_budget_mib: default_upload_budget_mib(),
             max_uploads_per_ip: default_max_uploads_per_ip(),
+            fhe_workers: default_fhe_workers(),
+            detection_pool_handles: default_detection_pool_handles(),
+            detection_pool_mib: default_detection_pool_mib(),
+            upload_deadline_s: default_upload_deadline_s(),
         }
     }
 }
@@ -357,6 +393,18 @@ impl Config {
         if self.max_uploads_per_ip == 0 {
             return Err("max_uploads_per_ip must be >= 1".into());
         }
+        if self.fhe_workers == 0 {
+            return Err("fhe_workers must be >= 1".into());
+        }
+        if self.detection_pool_handles == 0 {
+            return Err("detection_pool_handles must be >= 1".into());
+        }
+        if self.detection_pool_mib == 0 {
+            return Err("detection_pool_mib must be >= 1".into());
+        }
+        if self.upload_deadline_s == 0 {
+            return Err("upload_deadline_s must be >= 1".into());
+        }
 
         let raw_cache = self.cache_path.clone();
         let mut cache = expand_tilde(&raw_cache);
@@ -417,6 +465,22 @@ mod tests {
         assert!(cfg.cache_path.ends_with("lightwalletd_cache/testnet"));
         assert_eq!(cfg.omr_network_byte(), 0x01);
         assert_eq!(cfg.max_tx_bytes, 2_000_000);
+        assert_eq!(cfg.fhe_workers, 2);
+        assert_eq!(cfg.detection_pool_handles, 4096);
+        assert_eq!(cfg.detection_pool_mib, 8192);
+        assert_eq!(cfg.upload_deadline_s, 300);
+    }
+
+    #[test]
+    fn finalize_rejects_zero_fhe_pool_knobs() {
+        for bad in [
+            Config { fhe_workers: 0, ..Config::default() },
+            Config { detection_pool_handles: 0, ..Config::default() },
+            Config { detection_pool_mib: 0, ..Config::default() },
+            Config { upload_deadline_s: 0, ..Config::default() },
+        ] {
+            assert!(bad.finalize().is_err());
+        }
     }
 
     #[test]

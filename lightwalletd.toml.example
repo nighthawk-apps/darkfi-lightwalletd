@@ -40,6 +40,16 @@ pin_darkfid_dns = true
 rate_limit_gc_threshold = 4096
 max_send_peer_entries = 100000
 max_detection_key_bytes = 167772160
+upload_budget_mib = 512
+max_uploads_per_ip = 2
+
+# UnifOMR (--features fhe-omr) worker & detection-key pool sizing.
+# Scale with CPU cores and RAM when serving experimental UnifOMR clients
+# (see README "Infrastructure sizing").
+fhe_workers = 2
+detection_pool_handles = 4096
+detection_pool_mib = 8192
+upload_deadline_s = 300
 
 # SECURITY: cleartext is ONLY allowed on 127.0.0.1 / ::1 / localhost.
 # For public binds you MUST set TLS:

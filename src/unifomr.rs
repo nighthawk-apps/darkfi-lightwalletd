@@ -430,8 +430,8 @@ pub fn deserialize_clue(bytes: &[u8]) -> Result<RlweCiphertext, String> {
     Ok(RlweCiphertext { a, b })
 }
 
-/// LWEmongrass-compatible validation for UnifOMR RLWE clues.
-pub fn validate_unifomr_clue(clue: &[u8]) -> Result<(), String> {
+/// Parse and LWEmongrass-validate a UnifOMR RLWE clue in a single pass.
+pub fn parse_and_validate_clue(clue: &[u8]) -> Result<RlweCiphertext, String> {
     if clue.is_empty() {
         return Err("Clue cannot be empty".into());
     }
@@ -454,7 +454,12 @@ pub fn validate_unifomr_clue(clue: &[u8]) -> Result<(), String> {
             return Err("Clue coefficient out of range (possible poison)".into());
         }
     }
-    Ok(())
+    Ok(ct)
+}
+
+/// LWEmongrass-compatible validation for UnifOMR RLWE clues.
+pub fn validate_unifomr_clue(clue: &[u8]) -> Result<(), String> {
+    parse_and_validate_clue(clue).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -872,24 +877,13 @@ impl UnifOmrDetector {
     }
 
     /// Encode a per-message digest frame for one detection key over the
-    /// pre-flattened `messages` (see [`flatten_messages`]).
-    ///
-    /// Wire: `[u8 version][u32 chunk_count]` then, per chunk of `D` messages,
-    /// `ℓ` mod-switched partial-decryption ciphertexts (`[u32 len][ct]`). The
-    /// final chunk's unused tail slots are padded with [`SlotClue::Impertinent`].
-    pub fn encode_messages(
+    /// Encode a per-message digest from a pre-parsed detection key (`CLUE_N`
+    /// BFV ciphertexts) over pre-flattened `messages`.
+    pub fn encode_messages_parsed(
         &self,
-        detection_key: &[u8],
+        sk_cts: &[Ciphertext],
         messages: &[RlweCiphertext],
     ) -> Result<Vec<u8>, OmrError> {
-        let (key_net, sk_cts) = parse_detection_key(detection_key, &self.params)
-            .map_err(OmrError::DeserializationError)?;
-        if key_net != self.network {
-            return Err(OmrError::InvalidParameter(format!(
-                "detection key network {key_net:#04x} does not match server network {:#04x}",
-                self.network
-            )));
-        }
         if sk_cts.len() != CLUE_N {
             return Err(OmrError::InvalidParameter(format!(
                 "expected {CLUE_N} sk ciphertexts"
@@ -904,19 +898,30 @@ impl UnifOmrDetector {
         digest.push(DIGEST_FORMAT_VERSION);
         digest.extend_from_slice(&(chunk_count as u32).to_le_bytes());
 
+        if chunk_count == 0 {
+            return Ok(digest);
+        }
+
+        let neg = Plaintext::try_encode(&vec![t - 1; degree], Encoding::simd(), &self.params)
+            .map_err(|e| OmrError::EvaluationError(format!("{e:?}")))?;
+        let mut a_slots = vec![0u64; degree];
+        let mut b_slots = vec![0u64; degree];
+
         for chunk in messages.chunks(degree) {
-            // One clue per slot; pad the final chunk's tail with Impertinent
-            // (a=0, b=t/2 ⇒ fails the range check by design).
-            let mut slot_clues: Vec<SlotClue> = Vec::with_capacity(degree);
-            for ct in chunk {
-                slot_clues.push(SlotClue::Clue(ct.clone()));
-            }
-            while slot_clues.len() < degree {
-                slot_clues.push(SlotClue::Impertinent);
-            }
+            // Trailing slots beyond `chunk.len()` stay `a=0, b=t/2` (impertinent).
+            a_slots[chunk.len()..].fill(0);
             for bit in 0..CLUE_PLAINTEXT_BITS {
-                let mut ct =
-                    Self::partial_decrypt_simd(&self.params, &sk_cts, &slot_clues, degree, t, bit)?;
+                let mut ct = Self::partial_decrypt_simd(
+                    &self.params,
+                    sk_cts,
+                    chunk,
+                    degree,
+                    t,
+                    bit,
+                    &neg,
+                    &mut a_slots,
+                    &mut b_slots,
+                )?;
                 ct.switch_to_level(ct.max_switchable_level())
                     .map_err(|e| OmrError::EvaluationError(format!("mod-switch: {e:?}")))?;
                 let bytes = ct.to_bytes();
@@ -928,66 +933,80 @@ impl UnifOmrDetector {
         Ok(digest)
     }
 
-    /// Homomorphic `Enc((b − a∗sk)[bit])` packed one height per SIMD slot.
+    /// Encode a per-message digest for one detection key over a window's
+    /// pre-flattened `messages` (see [`flatten_messages`]).
     ///
-    /// [`SlotClue::Impertinent`] slots use `a=0`, `b=t/2` (range check fails).
+    /// Wire: `[u8 version][u32 chunk_count]` then, per chunk of `D` messages,
+    /// `ℓ` mod-switched partial-decryption ciphertexts (`[u32 len][ct]`). The
+    /// final chunk's unused tail slots are padded as impertinent (`a=0, b=t/2`).
+    pub fn encode_messages(
+        &self,
+        detection_key: &[u8],
+        messages: &[RlweCiphertext],
+    ) -> Result<Vec<u8>, OmrError> {
+        let (key_net, sk_cts) = parse_detection_key(detection_key, &self.params)
+            .map_err(OmrError::DeserializationError)?;
+        if key_net != self.network {
+            return Err(OmrError::InvalidParameter(format!(
+                "detection key network {key_net:#04x} does not match server network {:#04x}",
+                self.network
+            )));
+        }
+        self.encode_messages_parsed(&sk_cts, messages)
+    }
+
+    /// Homomorphic `Enc((b − a∗sk)[bit])` packed one message per SIMD slot.
+    ///
+    /// Slots `chunk.len()..degree` use `a=0`, `b=t/2` (range check fails).
+    #[allow(clippy::too_many_arguments)]
     fn partial_decrypt_simd(
         params: &Arc<BfvParameters>,
         sk_cts: &[Ciphertext],
-        clues: &[SlotClue],
+        chunk: &[RlweCiphertext],
         degree: usize,
         t: u64,
         bit: usize,
+        neg: &Plaintext,
+        a_slots: &mut [u64],
+        b_slots: &mut [u64],
     ) -> Result<Ciphertext, OmrError> {
         let mut acc: Option<Ciphertext> = None;
         #[allow(clippy::needless_range_loop)]
         for j in 0..CLUE_N {
-            let mut a_slots = vec![0u64; degree];
-            for (i, clue) in clues.iter().enumerate().take(degree) {
-                if let SlotClue::Clue(ct) = clue {
+            if j <= bit {
+                let idx = bit - j;
+                for (i, ct) in chunk.iter().enumerate().take(degree) {
                     // Negacyclic (a∗s)[k] = Σ_{j≤k} a[k−j]s[j] − Σ_{j>k} a[n+k−j]s[j]
-                    let raw = if j <= bit {
-                        ct.a[bit - j] % t
-                    } else {
-                        let v = ct.a[CLUE_N + bit - j] % t;
-                        (t - v) % t
-                    };
-                    a_slots[i] = raw;
+                    a_slots[i] = ct.a[idx] % t;
+                }
+            } else {
+                let idx = CLUE_N + bit - j;
+                for (i, ct) in chunk.iter().enumerate().take(degree) {
+                    let v = ct.a[idx] % t;
+                    a_slots[i] = (t - v) % t;
                 }
             }
-            let pt = Plaintext::try_encode(&a_slots, Encoding::simd(), params)
+            let pt = Plaintext::try_encode(&*a_slots, Encoding::simd(), params)
                 .map_err(|e| OmrError::EvaluationError(format!("{e:?}")))?;
             let term = &sk_cts[j] * &pt;
-            acc = Some(match acc {
-                None => term,
-                Some(prev) => &prev + &term,
-            });
-        }
-        let acc = acc.ok_or_else(|| OmrError::EvaluationError("empty acc".into()))?;
-
-        let mut b_slots = vec![0u64; degree];
-        for (i, clue) in clues.iter().enumerate().take(degree) {
-            match clue {
-                SlotClue::Clue(ct) => b_slots[i] = ct.b[bit] % t,
-                SlotClue::Impertinent => b_slots[i] = (t / 2) % t,
+            match &mut acc {
+                None => acc = Some(term),
+                Some(prev) => *prev += &term,
             }
         }
-        let pt_b = Plaintext::try_encode(&b_slots, Encoding::simd(), params)
+        let mut acc = acc.ok_or_else(|| OmrError::EvaluationError("empty acc".into()))?;
+
+        for (i, ct) in chunk.iter().enumerate().take(degree) {
+            b_slots[i] = ct.b[bit] % t;
+        }
+        b_slots[chunk.len().min(degree)..].fill((t / 2) % t);
+        let pt_b = Plaintext::try_encode(&*b_slots, Encoding::simd(), params)
             .map_err(|e| OmrError::EvaluationError(format!("{e:?}")))?;
 
-        let diff = &acc - &pt_b;
-        let neg = Plaintext::try_encode(&vec![t - 1; degree], Encoding::simd(), params)
-            .map_err(|e| OmrError::EvaluationError(format!("{e:?}")))?;
-        Ok(&diff * &neg)
+        acc -= &pt_b;
+        acc *= neg;
+        Ok(acc)
     }
-}
-
-/// Per-slot clue state during digest evaluation.
-enum SlotClue {
-    /// A validated clue to evaluate.
-    Clue(RlweCiphertext),
-    /// No clue at this (height, layer): decrypts to t/2 → never matches.
-    Impertinent,
 }
 
 /// Timing-padded wrapper used by gRPC handlers.
@@ -1039,17 +1058,11 @@ pub fn flatten_messages(block_notes: &[(u32, Vec<ClueNote>)]) -> (Vec<RlweCipher
             if note.omr_clue.is_empty() {
                 continue;
             }
-            match validate_unifomr_clue(&note.omr_clue) {
-                Ok(()) => match deserialize_clue(&note.omr_clue) {
-                    Ok(ct) => {
-                        messages.push(ct);
-                        slot_heights.push(*h);
-                    }
-                    Err(e) => tracing::warn!(
-                        target: "lightwalletd::unifomr",
-                        "LWEmongrass/UnifOMR clue parse failed: {e}"
-                    ),
-                },
+            match parse_and_validate_clue(&note.omr_clue) {
+                Ok(ct) => {
+                    messages.push(ct);
+                    slot_heights.push(*h);
+                }
                 Err(e) => tracing::warn!(
                     target: "lightwalletd::unifomr",
                     "LWEmongrass rejected UnifOMR clue: {e}"
@@ -1574,5 +1587,96 @@ mod tests {
     #[test]
     fn decoy_key_version_matches_wallet_constant() {
         assert_eq!(decoy_key_version(), 1);
+    }
+
+    /// Measure release-mode UnifOMR / PIR / Merkle-append timings for hosting sizing.
+    ///
+    /// Run with: `cargo test --release --features fhe-omr --lib measure_hosting_timings -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement run; results cited in README Infrastructure sizing"]
+    fn measure_hosting_timings() {
+        use darkfi_sdk::crypto::{MerkleNode, MerkleTree};
+        use darkfi_sdk::pasta::pallas;
+
+        let wallet = [0x42u8; 32];
+        let t0 = Instant::now();
+        let client = UnifOmrClient::from_wallet(&wallet, 0x01).unwrap();
+        let from_wallet_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = Instant::now();
+        let det_key = client.build_detection_key(0x01).unwrap();
+        let build_det_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        let detector = UnifOmrDetector::new(0x01);
+        let t2 = Instant::now();
+        let (_net, parsed_cts) = parse_detection_key(&det_key, &detector.params).unwrap();
+        let parse_det_ms = t2.elapsed().as_secs_f64() * 1e3;
+
+        let (_, pk) = clue_keypair_from_wallet(&wallet, 0x01).unwrap();
+        let mut r = StdRng::seed_from_u64(0x1234);
+        let sample_ct = pk.encrypt_zeros(&mut r);
+        let degree = detector.params.degree();
+        let messages: Vec<RlweCiphertext> = vec![sample_ct; degree];
+
+        let t3 = Instant::now();
+        let digest = detector.encode_messages(&det_key, &messages).unwrap();
+        let encode_full_ms = t3.elapsed().as_secs_f64() * 1e3;
+
+        let t4 = Instant::now();
+        let slots = client.decrypt_digest_slots(&digest).unwrap();
+        let decrypt_ms = t4.elapsed().as_secs_f64() * 1e3;
+
+        let pir_client = crate::pir_server::BatchPirClient::from_seed([7u8; 32]);
+        let pir_server = crate::pir_server::BatchPirServer::with_unifomr_params();
+        let q1 = pir_client.generate_sealpir_queries(&[42], degree).unwrap();
+        let db1 = vec![0x1234u64; degree];
+        let t5 = Instant::now();
+        for _ in 0..10 {
+            let _ = pir_server
+                .evaluate_sealpir_stripes(&q1, &db1, degree)
+                .unwrap();
+        }
+        let pir_1stripe_ms = t5.elapsed().as_secs_f64() * 1e3 / 10.0;
+
+        let q2 = pir_client
+            .generate_sealpir_queries(&[42], degree * 2)
+            .unwrap();
+        let db2 = vec![0x1234u64; degree * 2];
+        let t6 = Instant::now();
+        for _ in 0..10 {
+            let _ = pir_server
+                .evaluate_sealpir_stripes(&q2, &db2, degree * 2)
+                .unwrap();
+        }
+        let pir_2stripe_ms = t6.elapsed().as_secs_f64() * 1e3 / 10.0;
+
+        let mut tree = MerkleTree::new(100);
+        tree.append(MerkleNode::from(pallas::Base::from(0u64)));
+        let _ = tree.mark();
+        let t7 = Instant::now();
+        for i in 1u64..=1000 {
+            tree.append(MerkleNode::from(pallas::Base::from(i)));
+        }
+        let merkle_1000_ms = t7.elapsed().as_secs_f64() * 1e3;
+        let tree_bytes = darkfi_serial::serialize(&tree).len();
+
+        println!("MEASURE_DET_KEY_BYTES={}", det_key.len());
+        println!("MEASURE_DET_KEY_CTS={}", parsed_cts.len());
+        println!("MEASURE_DIGEST_1CHUNK_BYTES={}", digest.len());
+        println!("MEASURE_SLOTS={}", slots.len());
+        println!("MEASURE_FROM_WALLET_MS={from_wallet_ms:.2}");
+        println!("MEASURE_BUILD_DET_KEY_MS={build_det_ms:.2}");
+        println!("MEASURE_PARSE_DET_KEY_MS={parse_det_ms:.2}");
+        println!("MEASURE_ENCODE_1CHUNK_TOTAL_MS={encode_full_ms:.2}");
+        println!(
+            "MEASURE_ENCODE_1CHUNK_EVAL_ONLY_MS={:.2}",
+            encode_full_ms - parse_det_ms
+        );
+        println!("MEASURE_DECRYPT_1CHUNK_MS={decrypt_ms:.2}");
+        println!("MEASURE_PIR_1STRIPE_LIMB_MS={pir_1stripe_ms:.2}");
+        println!("MEASURE_PIR_2STRIPE_LIMB_MS={pir_2stripe_ms:.2}");
+        println!("MEASURE_PIR_QUERY_CT_BYTES={}", q1[0].len());
+        println!("MEASURE_MERKLE_1000_APPEND_MS={merkle_1000_ms:.2}");
+        println!("MEASURE_MERKLE_TREE_SERIAL_BYTES={tree_bytes}");
     }
 }

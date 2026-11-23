@@ -252,6 +252,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.upload_budget_mib,
         config.max_uploads_per_ip,
     );
+    service.apply_fhe_pool_config(
+        config.fhe_workers,
+        config.detection_pool_handles,
+        config.detection_pool_mib,
+        config.upload_deadline_s,
+    );
 
     // Start chain poller in background
     let poller = ChainPoller::new(
