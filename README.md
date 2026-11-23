@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.11.** UnifOMR worker count, detection-key pool, and upload deadline are config knobs. A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.18, desktop 3.1.18, and Moonshine 3.1.18. DarkFi pin for wallets is `6e61deb26` (contains `9d7ceaf77`); build sibling checkout notes below still accept that pin.
+**0.3.12.** UnifOMR worker count, detection-key pool, and upload deadline are config knobs. A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.19, desktop 3.1.19, and Moonshine 3.1.19. DarkFi pin for wallets is `6e61deb26` (contains `9d7ceaf77`); build sibling checkout notes below still accept that pin.
 
 ## Contents
 

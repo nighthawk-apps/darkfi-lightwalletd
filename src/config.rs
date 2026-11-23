@@ -474,10 +474,22 @@ mod tests {
     #[test]
     fn finalize_rejects_zero_fhe_pool_knobs() {
         for bad in [
-            Config { fhe_workers: 0, ..Config::default() },
-            Config { detection_pool_handles: 0, ..Config::default() },
-            Config { detection_pool_mib: 0, ..Config::default() },
-            Config { upload_deadline_s: 0, ..Config::default() },
+            Config {
+                fhe_workers: 0,
+                ..Config::default()
+            },
+            Config {
+                detection_pool_handles: 0,
+                ..Config::default()
+            },
+            Config {
+                detection_pool_mib: 0,
+                ..Config::default()
+            },
+            Config {
+                upload_deadline_s: 0,
+                ..Config::default()
+            },
         ] {
             assert!(bad.finalize().is_err());
         }
