@@ -172,6 +172,17 @@ listening() {
   fi
 }
 
+cleanup() {
+  local pidfile
+  for pidfile in "$WORK/xmrig.pid" "$WORK/lwd.pid" "$WORK/darkfid.pid"; do
+    if [[ -f "$pidfile" ]]; then
+      kill "$(cat "$pidfile")" 2>/dev/null || true
+      rm -f "$pidfile"
+    fi
+  done
+}
+trap cleanup EXIT
+
 if ! listening 48345; then
   echo "starting darkfid"
   cp "$PIN/contrib/localnet/darkfid-single-node/darkfid.toml" "$WORK/darkfid.toml"

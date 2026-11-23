@@ -261,7 +261,7 @@ fi
 FAUCET="$("$DRK" --config "$DRK_CFG" wallet address | awk 'NF{print $NF; exit}')"
 echo "faucet=$FAUCET"
 
-if ! pgrep -f "$XMRIG" >/dev/null; then
+if [[ -z "$xmrig_pid" ]] || ! kill -0 "$xmrig_pid" 2>/dev/null; then
   echo "starting xmrig"
   "$XMRIG" -r 1000 -R 20 -o 127.0.0.1:48347 -t 2 -u "$FAUCET" >"$WORK/xmrig.log" 2>&1 &
   xmrig_pid=$!
@@ -289,11 +289,17 @@ if [[ "$faucet_ok" != 1 ]]; then
   exit 1
 fi
 
-if ! listening 9067; then
-  echo "starting lightwalletd"
+LWD_PORT="${LWD_PORT:-9067}"
+if listening "$LWD_PORT"; then
+  echo "port $LWD_PORT is already in use; localnet lightwalletd will use 19067"
+  LWD_PORT=19067
+fi
+LWD_URL="http://127.0.0.1:${LWD_PORT}"
+if ! listening "$LWD_PORT"; then
+  echo "starting lightwalletd on $LWD_PORT"
   cat >"$WORK/lightwalletd.toml" <<EOF
 darkfid_endpoint = "tcp://127.0.0.1:48345"
-grpc_listen = "127.0.0.1:9067"
+grpc_listen = "127.0.0.1:${LWD_PORT}"
 cache_path = "$WORK/lwd/cache"
 poll_interval = 1
 chain_name = "darkfi-testnet"
@@ -306,10 +312,10 @@ EOF
   lwd_pid=$!
   started_lwd=1
   for _ in $(seq 1 40); do
-    listening 9067 && break
+    listening "$LWD_PORT" && break
     sleep 1
   done
-  listening 9067 || { echo "lightwalletd failed"; tail -40 "$WORK/lightwalletd.log"; exit 1; }
+  listening "$LWD_PORT" || { echo "lightwalletd failed"; tail -40 "$WORK/lightwalletd.log"; exit 1; }
 fi
 
 init_ffi() {

@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.9.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.15, desktop 3.1.13, and Moonshine 3.1.12. DarkFi pin `9d7ceaf77`.
+**0.3.10.** A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.15, desktop 3.1.13, and Moonshine 3.1.12. DarkFi pin `9d7ceaf77`.
 
 ## Contents
 
@@ -152,8 +152,8 @@ Full pin guide: [`docs/TLS_PINNING.md`](docs/TLS_PINNING.md).
 # Ensure darkfid is up on darkfid_endpoint (same network as config.network)
 cargo run --release -- --config lightwalletd.toml
 # or: ./target/release/darkfi-lightwalletd --config lightwalletd.toml
-# Remote Mac Studio deploy helper supports STUDIO_HOST, REMOTE_DIR, and LOCAL_REPO overrides:
-# STUDIO_HOST=hawk@mac-studio ./scripts/deploy-studio-lwd.sh
+# Remote Mac Studio deploy helper supports STUDIO_SSH_TARGET, STUDIO_REPO_DIR, LWD_NGROK_DOMAIN, and LWD_PORT overrides:
+# STUDIO_SSH_TARGET=hawk@mac-studio ./scripts/deploy-studio-lwd.sh --remote
 ```
 
 ### Point clients
