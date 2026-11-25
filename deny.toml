@@ -1,0 +1,52 @@
+# cargo-deny configuration for darkfi-lightwalletd
+# Run locally with:
+#   cargo deny check advisories
+#   cargo deny --all-features check advisories
+
+[graph]
+all-features = false
+
+[advisories]
+# Accepted unmaintained / transitive advisories tracked for future upstream or
+# storage migrations. New advisories fail the check until triaged.
+#
+# Note on sled 0.34: sled is unmaintained (no RUSTSEC ID currently assigned).
+# Migrating to redb / kvdb-overlay requires a CACHE_FORMAT_VERSION bump and
+# operator resync from darkfid, so sled 0.34 + bincode 1.3 are retained for the
+# current release series.
+ignore = [
+    # Direct legacy cache serialization dep (paired with sled 0.34 cache format).
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained; retained with sled 0.34 until CACHE_FORMAT_VERSION storage migration" },
+
+    # Transitive via tonic 0.12.3 (tracked for tonic 0.13+ upgrade).
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 pulled transitively by tonic 0.12.3" },
+
+    # Transitive via sled 0.34 / parking_lot_core.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash 0.2.1 pulled transitively by sled 0.34 / pinned darkfi" },
+    { id = "RUSTSEC-2024-0384", reason = "instant 0.1.13 pulled transitively by sled 0.34 / parking_lot_core" },
+
+    # Transitive via pinned darkfi 0.5.0 (nighthawk-testnet pin b87318e80) and its
+    # embedded arti-client 0.48.0 dependency tree. darkfi-lightwalletd does not
+    # use Arti Tor, SQLite, RSA, or async-std at runtime.
+    { id = "RUSTSEC-2021-0139", reason = "ansi_term 0.12.1 via structopt in pinned darkfi 0.5.0" },
+    { id = "RUSTSEC-2022-0104", reason = "structopt 0.3.26 in pinned darkfi 0.5.0" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 via ssh-key-fork-arti -> arti-client 0.48.0 in darkfi 0.5.0; RSA is not used by lightwalletd" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 via pinned darkfi 0.5.0" },
+    { id = "RUSTSEC-2024-0375", reason = "atty 0.2.14 via clap 2 / structopt in pinned darkfi 0.5.0" },
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 via pinned darkfi 0.5.0 / halo2" },
+    { id = "RUSTSEC-2025-0052", reason = "async-std 1.13.2 via tor-rtcompat -> arti-client 0.48.0 in darkfi 0.5.0; lightwalletd runs on tokio" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.1 via pinned darkfi 0.5.0 / arti-client 0.48.0" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.38.2 via rusqlite -> tor-dirmgr -> arti-client 0.48.0 in darkfi 0.5.0; lightwalletd does not use SQLite" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime 2.4.0 via pinned darkfi 0.5.0 / arti-client 0.48.0" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/parazyd/halo2",
+    "https://github.com/parazyd/quinn",
+    "https://github.com/darkrenaissance/rust-url",
+    "https://gitlab.com/nighthawk24/kvdb-overlay",
+]

@@ -187,6 +187,11 @@ message CompactOutputBody {
   bytes omr_clue = 6;
   bytes omr_metadata_enc = 7;
   bytes tx_hash = 8;
+  // MoneyFunction discriminant (0=FeeV1, 1=GenesisMintV1, 2=PoWRewardV1,
+  // 3=TransferV1, 4=AuthTokenMintV1, 5=AuthTokenFreezeV1, 6=TokenMintV1,
+  // 7=BurnV1). On servers with CACHE_FORMAT_VERSION >= 2 (proto 2.1.0+),
+  // func_code = 0 represents MoneyFunction::FeeV1; only legacy pre-2.1.0
+  // caches left this field at proto3 default 0 ("unrecorded").
   uint32 func_code = 9;
 }
 
@@ -234,7 +239,11 @@ message CompactOutput {
   // Encrypted with recipient's pubkey via DH + ChaCha20Poly1305.
   // LWD stores opaquely; cannot decrypt. Merged on block confirm.
   bytes omr_metadata_enc = 6;
-  // MoneyFunction discriminant. Zero means the server did not record one.
+  // MoneyFunction discriminant (0=FeeV1, 1=GenesisMintV1, 2=PoWRewardV1,
+  // 3=TransferV1, 4=AuthTokenMintV1, 5=AuthTokenFreezeV1, 6=TokenMintV1,
+  // 7=BurnV1). On servers with CACHE_FORMAT_VERSION >= 2 (proto 2.1.0+),
+  // func_code = 0 represents MoneyFunction::FeeV1; only legacy pre-2.1.0
+  // caches left this field at proto3 default 0 ("unrecorded").
   uint32 func_code = 7;
 }
 

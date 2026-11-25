@@ -23,7 +23,8 @@
 //! and streams/returns data to wallet clients.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
@@ -172,6 +173,61 @@ const SEND_PEER_BIND_TTL: Duration = Duration::from_secs(86_400);
 const SEND_PEER_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// Hard cap on `recent_send_peers` entries to prevent unbounded memory growth (M2).
 const MAX_SEND_PEER_ENTRIES: usize = 100_000;
+
+/// Lock-free atomic metrics counters for periodic INFO summaries.
+#[derive(Default)]
+pub struct ServiceMetrics {
+    rpc_requests: AtomicU64,
+    rate_limited: AtomicU64,
+    active_streams: AtomicUsize,
+}
+
+/// Point-in-time snapshot of [`ServiceMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub rpc_requests: u64,
+    pub rate_limited: u64,
+    pub active_streams: usize,
+}
+
+impl ServiceMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_request(&self) {
+        self.rpc_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rate_limited(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            rpc_requests: self.rpc_requests.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            active_streams: self.active_streams.load(Ordering::Relaxed),
+        }
+    }
+
+    fn track_stream(self: &Arc<Self>) -> ActiveStreamGuard {
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        ActiveStreamGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+}
+
+struct ActiveStreamGuard {
+    metrics: Arc<ServiceMetrics>,
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.metrics.active_streams.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 struct SendPeerTable {
     entries: HashMap<[u8; 32], (IpAddr, Instant)>,
@@ -389,6 +445,7 @@ fn spawn_compact_range<T, F>(
     start: u32,
     end: u32,
     permit: tokio::sync::OwnedSemaphorePermit,
+    stream_guard: ActiveStreamGuard,
     map: F,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<T, Status>>
 where
@@ -398,6 +455,7 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
         let _permit = permit;
+        let _stream_guard = stream_guard;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -439,10 +497,12 @@ fn spawn_output_bodies(
     start: u32,
     end: u32,
     permit: tokio::sync::OwnedSemaphorePermit,
+    stream_guard: ActiveStreamGuard,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
         let _permit = permit;
+        let _stream_guard = stream_guard;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -500,10 +560,12 @@ fn spawn_outputs_by_func(
     end: u32,
     func_code: u32,
     permit: tokio::sync::OwnedSemaphorePermit,
+    stream_guard: ActiveStreamGuard,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
         let _permit = permit;
+        let _stream_guard = stream_guard;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -581,10 +643,12 @@ fn spawn_dao_calls(
     start: u32,
     end: u32,
     permit: tokio::sync::OwnedSemaphorePermit,
+    stream_guard: ActiveStreamGuard,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactDaoCall, Status>> {
     let (tx, rx) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
         let _permit = permit;
+        let _stream_guard = stream_guard;
         let mut prev: Option<CompactBlock> = None;
         for height in start..=end {
             if tx.is_closed() {
@@ -629,11 +693,19 @@ fn spawn_dao_calls(
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
+/// Canonicalize IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1` -> `127.0.0.1`)
+/// so dual-stack listeners and `X-Forwarded-For` hops match `trusted_proxies`
+/// and share a single per-IP rate-limit bucket.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
 /// True if `ip` matches an allow-list entry (exact address or IPv4/IPv6 CIDR).
 fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
+    let ip = canonical_ip(ip);
     let entry = entry.trim();
     if let Ok(exact) = entry.parse::<IpAddr>() {
-        return ip == exact;
+        return ip == canonical_ip(exact);
     }
     let Some((base, bits)) = entry.split_once('/') else {
         return false;
@@ -656,26 +728,80 @@ fn ip_matches_proxy_entry(ip: IpAddr, entry: &str) -> bool {
     false
 }
 
-/// Client IP from `X-Forwarded-For` when the TCP peer is a trusted proxy.
-///
-/// Walk hops **right-to-left** and skip entries that match `trusted` (the
-/// proxies themselves). nginx `$proxy_add_x_forwarded_for` *appends*, so the
-/// leftmost hop is client-controlled and must not be used for rate limits.
-fn client_ip_from_forwarded(header: &str, trusted: &[String]) -> Option<IpAddr> {
-    for hop in header.split(',').rev() {
-        let hop = hop.trim();
-        if hop.is_empty() {
-            continue;
+/// Parse one `X-Forwarded-For` hop (bare IPv4/IPv6, bracketed IPv6, or `ip:port`).
+fn parse_forwarded_hop(hop: &str) -> Option<IpAddr> {
+    let hop = hop.trim();
+    if let Ok(ip) = hop.parse::<IpAddr>() {
+        return Some(canonical_ip(ip));
+    }
+    if let Ok(sa) = hop.parse::<SocketAddr>() {
+        return Some(canonical_ip(sa.ip()));
+    }
+    if let Some(inner) = hop.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if let Ok(ip) = inner.parse::<Ipv6Addr>() {
+            return Some(canonical_ip(IpAddr::V6(ip)));
         }
-        let Ok(ip) = hop.parse::<IpAddr>() else {
-            continue;
-        };
-        if trusted.iter().any(|e| ip_matches_proxy_entry(ip, e)) {
-            continue;
-        }
-        return Some(ip);
     }
     None
+}
+
+/// Client IP from one or more `X-Forwarded-For` header values when the TCP peer
+/// is a trusted proxy.
+///
+/// Walks headers and comma-separated hops **right-to-left** and skips entries
+/// that match `trusted` (the proxies themselves). Both nginx and ngrok append
+/// the immediate client IP at the right end (or as a later HTTP/2 header), so
+/// leftmost hops are client-controlled and must never be trusted. If an
+/// unparseable non-empty hop is encountered before an untrusted IP, stops and
+/// returns `None` (falling back to the TCP peer) rather than trusting a spoofed
+/// IP further left.
+fn client_ip_from_forwarded_headers<'a, I>(headers: I, trusted: &[String]) -> Option<IpAddr>
+where
+    I: DoubleEndedIterator<Item = &'a str>,
+{
+    for header in headers.rev() {
+        for hop in header.split(',').rev() {
+            let hop = hop.trim();
+            if hop.is_empty() {
+                continue;
+            }
+            let ip = parse_forwarded_hop(hop)?;
+            if trusted.iter().any(|e| ip_matches_proxy_entry(ip, e)) {
+                continue;
+            }
+            return Some(ip);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn client_ip_from_forwarded(header: &str, trusted: &[String]) -> Option<IpAddr> {
+    client_ip_from_forwarded_headers(std::iter::once(header), trusted)
+}
+
+/// Resolve the effective client IP from the TCP peer address and gRPC metadata.
+fn resolve_peer_ip(
+    remote: IpAddr,
+    metadata: &tonic::metadata::MetadataMap,
+    trusted_proxies: &[String],
+) -> IpAddr {
+    let remote = canonical_ip(remote);
+    if trusted_proxies.is_empty() {
+        return remote;
+    }
+    let trusted = trusted_proxies
+        .iter()
+        .any(|e| ip_matches_proxy_entry(remote, e));
+    if !trusted {
+        return remote;
+    }
+    let xff_headers: Vec<&str> = metadata
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    client_ip_from_forwarded_headers(xff_headers.into_iter(), trusted_proxies).unwrap_or(remote)
 }
 
 /// Pre-flattened, validated RLWE clues for one `(start, end)` window.
@@ -1132,6 +1258,8 @@ pub struct LightWalletService {
     tip_fact_fetch: Arc<tokio::sync::Mutex<()>>,
     /// Cached 32-byte directory attestation public key (derived once from sled secret).
     directory_attest_pubkey: std::sync::OnceLock<[u8; 32]>,
+    /// Lock-free atomic metrics counters for periodic INFO summaries.
+    metrics: Arc<ServiceMetrics>,
 }
 
 impl LightWalletService {
@@ -1230,7 +1358,13 @@ impl LightWalletService {
             tip_facts: Arc::new(Mutex::new(None)),
             tip_fact_fetch: Arc::new(tokio::sync::Mutex::new(())),
             directory_attest_pubkey,
+            metrics: Arc::new(ServiceMetrics::new()),
         }
+    }
+
+    /// Lock-free atomic metrics counters shared with the periodic reporter task.
+    pub fn metrics(&self) -> Arc<ServiceMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Override DoS caps from operator config (defaults stay conservative).
@@ -1283,22 +1417,7 @@ impl LightWalletService {
             .remote_addr()
             .map(|a| a.ip())
             .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        if self.trusted_proxies.is_empty() {
-            return remote;
-        }
-        let trusted = self
-            .trusted_proxies
-            .iter()
-            .any(|e| ip_matches_proxy_entry(remote, e));
-        if !trusted {
-            return remote;
-        }
-        request
-            .metadata()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|h| client_ip_from_forwarded(h, &self.trusted_proxies))
-            .unwrap_or(remote)
+        resolve_peer_ip(remote, request.metadata(), &self.trusted_proxies)
     }
 
     fn remember_send_peer(&self, tx_hash: [u8; 32], peer: IpAddr) {
@@ -1422,6 +1541,7 @@ impl LightWalletService {
         if self.omr_rate_limiter.check_n(peer, n.max(1)) {
             Ok(())
         } else {
+            self.metrics.record_rate_limited();
             Err(Status::resource_exhausted(
                 "OMR digest rate limit exceeded; retry later",
             ))
@@ -1434,6 +1554,7 @@ impl LightWalletService {
         if self.pir_rate_limiter.check_n(peer, 1) {
             Ok(())
         } else {
+            self.metrics.record_rate_limited();
             Err(Status::resource_exhausted(
                 "PIR rate limit exceeded; retry later",
             ))
@@ -1445,6 +1566,7 @@ impl LightWalletService {
         if self.clue_rate_limiter.check(self.peer_ip(request)) {
             Ok(())
         } else {
+            self.metrics.record_rate_limited();
             Err(Status::resource_exhausted(
                 "OMR clue registration rate limit exceeded; retry later",
             ))
@@ -1456,6 +1578,7 @@ impl LightWalletService {
         if self.rpc_rate_limiter.check(self.peer_ip(request)) {
             Ok(())
         } else {
+            self.metrics.record_rate_limited();
             Err(Status::resource_exhausted(
                 "RPC rate limit exceeded; retry later",
             ))
@@ -1942,16 +2065,19 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetCompactOutputBodiesStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_output_bodies(
             Arc::clone(&self.cache),
             start,
             end,
             permit,
+            stream_guard,
         )))
     }
 
@@ -1963,17 +2089,20 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::FuncBlockRange>,
     ) -> Result<Response<Self::GetCompactOutputsByFuncStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_outputs_by_func(
             Arc::clone(&self.cache),
             start,
             end,
             range.func_code,
             permit,
+            stream_guard,
         )))
     }
 
@@ -1985,16 +2114,19 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetCompactDaoCallsStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_dao_calls(
             Arc::clone(&self.cache),
             start,
             end,
             permit,
+            stream_guard,
         )))
     }
 
@@ -2003,16 +2135,19 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) = resolve_block_range(&self.cache, range.start_height, range.end_height)?;
 
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
             permit,
+            stream_guard,
             CompactBlock::to_proto,
         )))
     }
@@ -2022,6 +2157,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockHeight>,
     ) -> Result<Response<proto::CompactBlock>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let height = request.into_inner().height;
 
@@ -2046,6 +2182,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::HeightList>,
     ) -> Result<Response<Self::GetCompactBlocksAtHeightsStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let mut heights = request.into_inner().heights;
         if heights.is_empty() {
@@ -2088,9 +2225,11 @@ impl DarkFiLightWallet for LightWalletService {
         .map_err(|e| Status::internal(format!("block fetch worker join error: {e}")))??;
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let stream_guard = self.metrics.track_stream();
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _stream_guard = stream_guard;
             for block in blocks {
                 if tx.is_closed() {
                     return;
@@ -2111,6 +2250,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::ChainTip>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         match self.cache.get_tip() {
             Ok(Some((height, hash))) => {
@@ -2144,6 +2284,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<Self::SubscribeBlocksStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let permit = Arc::clone(&self.subscribe_permits)
             .try_acquire_owned()
@@ -2157,9 +2298,11 @@ impl DarkFiLightWallet for LightWalletService {
         let mut tip_rx = self.tip_notify.clone();
         let notice = Arc::clone(&self.tip_notice);
         let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_TIP_BUFFER);
+        let stream_guard = self.metrics.track_stream();
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _stream_guard = stream_guard;
             loop {
                 tokio::select! {
                     biased;
@@ -2237,6 +2380,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::TxHash>,
     ) -> Result<Response<proto::RawTransaction>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let hash = request.into_inner().hash;
         if hash.len() != 32 {
@@ -2286,6 +2430,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::RawTransaction>,
     ) -> Result<Response<proto::SendResponse>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let peer = self.peer_ip(&request);
         let mut req = request.into_inner();
@@ -2534,17 +2679,20 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetNoteCommitmentsStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
             permit,
+            stream_guard,
             |block| proto::NoteCommitmentUpdate {
                 height: block.height,
                 coins: block
@@ -2564,17 +2712,20 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockRange>,
     ) -> Result<Response<Self::GetNullifiersStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let range = request.into_inner();
         let (start, end) =
             require_padded_block_range(&self.cache, range.start_height, range.end_height)?;
 
         let permit = self.acquire_block_range().await?;
+        let stream_guard = self.metrics.track_stream();
         Ok(Response::new(spawn_compact_range(
             Arc::clone(&self.cache),
             start,
             end,
             permit,
+            stream_guard,
             |block| proto::NullifierUpdate {
                 height: block.height,
                 nullifiers: block
@@ -2594,6 +2745,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockHeight>,
     ) -> Result<Response<proto::TreeState>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let height = request.into_inner().height;
         let tip = self
@@ -2664,6 +2816,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::CheckpointRequest>,
     ) -> Result<Response<Self::GetCheckpointSnapshotStream>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let preferred = request.into_inner().preferred_height;
         let permit = self.acquire_block_range().await?;
@@ -2686,9 +2839,11 @@ impl DarkFiLightWallet for LightWalletService {
         let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
         let snapshot_hash = snapshot_integrity_hash(tree_height, &tree_data, &[]).to_vec();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let stream_guard = self.metrics.track_stream();
 
         tokio::spawn(async move {
             let _permit = permit;
+            let _stream_guard = stream_guard;
             const CHUNK_SIZE: usize = 1024 * 1024;
             let total_chunks = if tree_data.is_empty() {
                 1
@@ -2729,6 +2884,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::ContractId>,
     ) -> Result<Response<proto::ZkasResponse>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let contract_id = request.into_inner().id;
         if contract_id.is_empty() || contract_id.len() > MAX_CONTRACT_ID_CHARS {
@@ -2758,6 +2914,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::LightInfo>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         let (height, hash) = self
             .cache
@@ -2798,6 +2955,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::Empty>,
     ) -> Result<Response<proto::OmrCapabilities>, Status> {
+        self.metrics.record_request();
         self.check_rpc_rate_limit(&request)?;
         #[cfg(feature = "fhe-omr")]
         {
@@ -2830,6 +2988,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::OmrClueRegistration>,
     ) -> Result<Response<proto::Empty>, Status> {
+        self.metrics.record_request();
         // Prefer clue-on-SendTransaction; standalone Register is transitional and rate-limited.
         self.check_clue_rate_limit(&request)?;
         let peer = self.peer_ip(&request);
@@ -2919,6 +3078,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<tonic::Streaming<proto::DetectionKeyChunk>>,
     ) -> Result<Response<proto::OmrDigestResponse>, Status> {
+        self.metrics.record_request();
         #[cfg(not(feature = "fhe-omr"))]
         {
             let _ = request;
@@ -2946,6 +3106,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<tonic::Streaming<proto::DetectionKeyChunk>>,
     ) -> Result<Response<proto::DetectionKeyHandle>, Status> {
+        self.metrics.record_request();
         #[cfg(not(feature = "fhe-omr"))]
         {
             let _ = request;
@@ -3024,6 +3185,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::PoolDigestRequest>,
     ) -> Result<Response<proto::OmrDigestResponse>, Status> {
+        self.metrics.record_request();
         #[cfg(not(feature = "fhe-omr"))]
         {
             let _ = request;
@@ -3075,6 +3237,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BatchPirRequest>,
     ) -> Result<Response<proto::BatchPirResponse>, Status> {
+        self.metrics.record_request();
         #[cfg(not(feature = "fhe-omr"))]
         {
             let _ = request;
@@ -3186,6 +3349,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::CluePublicKeyRegistration>,
     ) -> Result<Response<proto::Empty>, Status> {
+        self.metrics.record_request();
         self.check_clue_rate_limit(&request)?;
         let req = request.into_inner();
         if req.payment_pubkey.len() != 32 {
@@ -3249,6 +3413,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::PaymentPubkey>,
     ) -> Result<Response<proto::CluePublicKey>, Status> {
+        self.metrics.record_request();
         self.check_clue_rate_limit(&request)?;
         let start = Instant::now();
         let req = request.into_inner();
@@ -4388,7 +4553,7 @@ mod tests {
             &svc,
             Request::new(proto::CluePublicKeyRegistration {
                 payment_pubkey: pk2.to_vec(),
-                clue_public_key: clue_bytes,
+                clue_public_key: clue_bytes.clone(),
                 ownership_proof: proof2,
                 key_version: 1,
             }),
@@ -4396,5 +4561,330 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(full.code(), tonic::Code::ResourceExhausted);
+
+        // Even while the directory is at capacity, an existing key can still
+        // refresh at the same key_version (idempotent) or rotate to a higher
+        // key_version, while key_version=0 and downgrades are rejected.
+        let proof1_refresh =
+            crate::clue_ownership::sign_clue_pk_ownership(&kp1.secret, 0x01, 1, &pk1, &clue_bytes);
+        DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: clue_bytes.clone(),
+                ownership_proof: proof1_refresh,
+                key_version: 1,
+            }),
+        )
+        .await
+        .expect("idempotent refresh of existing entry must succeed when full");
+
+        #[cfg(feature = "fhe-omr")]
+        let rotated_clue = {
+            let (_, cpk) = crate::unifomr::clue_keypair_from_wallet(&[0x22u8; 32], 0x01).unwrap();
+            crate::unifomr::serialize_public_key(&cpk)
+        };
+        #[cfg(not(feature = "fhe-omr"))]
+        let rotated_clue = vec![0xDDu8; 32];
+
+        let proof1_v2 = crate::clue_ownership::sign_clue_pk_ownership(
+            &kp1.secret,
+            0x01,
+            2,
+            &pk1,
+            &rotated_clue,
+        );
+        DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: rotated_clue.clone(),
+                ownership_proof: proof1_v2,
+                key_version: 2,
+            }),
+        )
+        .await
+        .expect("higher key_version rotation of existing entry must succeed when full");
+
+        let proof1_downgrade =
+            crate::clue_ownership::sign_clue_pk_ownership(&kp1.secret, 0x01, 1, &pk1, &clue_bytes);
+        let err_down = DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: clue_bytes,
+                ownership_proof: proof1_downgrade,
+                key_version: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_down.code(), tonic::Code::InvalidArgument);
+
+        let proof1_v0 = crate::clue_ownership::sign_clue_pk_ownership(
+            &kp1.secret,
+            0x01,
+            0,
+            &pk1,
+            &rotated_clue,
+        );
+        let err_v0 = DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: rotated_clue,
+                ownership_proof: proof1_v0,
+                key_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_v0.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_clue_public_key_decoy_matches_client_key_version_and_attestation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (svc, _) = test_service(Arc::clone(&cache));
+
+        let attest_pk = svc.directory_attest_pubkey().unwrap();
+        let unregistered = [0x42u8; 32];
+
+        let r1 = DarkFiLightWallet::get_clue_public_key(
+            &svc,
+            Request::new(proto::PaymentPubkey {
+                payment_pubkey: unregistered.to_vec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let r2 = DarkFiLightWallet::get_clue_public_key(
+            &svc,
+            Request::new(proto::PaymentPubkey {
+                payment_pubkey: unregistered.to_vec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(r1.found, "decoy must report found=true");
+        assert_eq!(
+            r1.key_version, 1,
+            "decoy key_version must match client constant 1"
+        );
+        assert_eq!(r1.clue_public_key.len(), CLUE_PUBLIC_KEY_WIRE_LEN);
+        assert_eq!(
+            r1.clue_public_key, r2.clue_public_key,
+            "decoy key must be deterministic for the same payment_pubkey"
+        );
+        assert_eq!(
+            r1.ownership_proof.len(),
+            crate::clue_ownership::OWNERSHIP_PROOF_WIRE_LEN
+        );
+        crate::clue_ownership::verify_directory_attestation(
+            &attest_pk,
+            0x01,
+            r1.key_version,
+            &unregistered,
+            &r1.clue_public_key,
+            &r1.ownership_proof,
+        )
+        .expect("decoy directory attestation must verify against LightInfo key");
+    }
+
+    #[test]
+    fn peer_ip_handles_spoofed_xff_trusted_proxies_ipv6_and_multi_header() {
+        use tonic::metadata::MetadataMap;
+
+        let trusted = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        let loopback4: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback6: IpAddr = "::1".parse().unwrap();
+        let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let direct_peer: IpAddr = "198.51.100.77".parse().unwrap();
+
+        // 1. Untrusted direct peer: spoofed XFF must be completely ignored.
+        let mut meta = MetadataMap::new();
+        meta.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(resolve_peer_ip(direct_peer, &meta, &trusted), direct_peer);
+
+        // 2. Empty trusted_proxies: XFF ignored even from loopback.
+        assert_eq!(resolve_peer_ip(loopback4, &meta, &[]), loopback4);
+
+        // 3. Trusted loopback proxy with spoofed leftmost IP: rightmost untrusted wins.
+        let mut spoofed = MetadataMap::new();
+        spoofed.insert(
+            "x-forwarded-for",
+            "1.2.3.4, 203.0.113.9, 127.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_peer_ip(loopback4, &spoofed, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+
+        // 4. Multi-header HTTP/2 XFF (client sends spoofed header, proxy appends second header):
+        //    rightmost header must win instead of metadata.get() returning the first spoofed value.
+        let mut multi = MetadataMap::new();
+        multi.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        multi.append("x-forwarded-for", "203.0.113.55".parse().unwrap());
+        assert_eq!(
+            resolve_peer_ip(loopback4, &multi, &trusted),
+            "203.0.113.55".parse::<IpAddr>().unwrap()
+        );
+
+        // 5. Trailing unparseable garbage must not fall through to a spoofed IP to its left.
+        let mut garbage = MetadataMap::new();
+        garbage.insert("x-forwarded-for", "1.2.3.4, not-an-ip".parse().unwrap());
+        assert_eq!(resolve_peer_ip(loopback4, &garbage, &trusted), loopback4);
+
+        // 6. IPv6 client behind IPv6 loopback proxy (`::1`).
+        let mut v6_client = MetadataMap::new();
+        v6_client.insert(
+            "x-forwarded-for",
+            "1.2.3.4, 2001:db8::42, ::1".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_peer_ip(loopback6, &v6_client, &trusted),
+            "2001:db8::42".parse::<IpAddr>().unwrap()
+        );
+
+        // 7. IPv4-mapped IPv6 proxy peer (`::ffff:127.0.0.1`) matches `"127.0.0.1"`
+        //    and canonicalizes IPv4-mapped client hops.
+        let mut mapped_client = MetadataMap::new();
+        mapped_client.insert("x-forwarded-for", "::ffff:203.0.113.88".parse().unwrap());
+        assert_eq!(
+            resolve_peer_ip(mapped_loopback, &mapped_client, &trusted),
+            "203.0.113.88".parse::<IpAddr>().unwrap()
+        );
+
+        // 8. All-trusted XFF chain falls back to the proxy peer IP.
+        let mut all_trusted = MetadataMap::new();
+        all_trusted.insert("x-forwarded-for", "127.0.0.1, ::1".parse().unwrap());
+        assert_eq!(
+            resolve_peer_ip(loopback4, &all_trusted, &trusted),
+            loopback4
+        );
+    }
+
+    #[test]
+    fn per_ip_rate_limiting_isolates_clients_behind_trusted_loopback_proxy() {
+        use tonic::metadata::MetadataMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let endpoint = url::Url::parse("http://127.0.0.1:9").unwrap();
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(endpoint));
+        let trusted = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10,
+            2,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            trusted.clone(),
+        );
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // Client A exhausts its 2/min bucket; rotating spoofed leftmost XFF
+        // hops must still map to Client A (198.51.100.10) and stay blocked.
+        let mut meta_a1 = MetadataMap::new();
+        meta_a1.insert(
+            "x-forwarded-for",
+            "10.0.0.1, 198.51.100.10".parse().unwrap(),
+        );
+        let ip_a1 = resolve_peer_ip(loopback, &meta_a1, &trusted);
+
+        let mut meta_a2 = MetadataMap::new();
+        meta_a2.insert(
+            "x-forwarded-for",
+            "10.0.0.2, 198.51.100.10".parse().unwrap(),
+        );
+        let ip_a2 = resolve_peer_ip(loopback, &meta_a2, &trusted);
+
+        let mut meta_a3 = MetadataMap::new();
+        meta_a3.insert(
+            "x-forwarded-for",
+            "10.0.0.3, 198.51.100.10".parse().unwrap(),
+        );
+        let ip_a3 = resolve_peer_ip(loopback, &meta_a3, &trusted);
+
+        assert_eq!(ip_a1, "198.51.100.10".parse::<IpAddr>().unwrap());
+        assert_eq!(ip_a1, ip_a2);
+        assert_eq!(ip_a2, ip_a3);
+        assert!(svc.rpc_rate_limiter.check(ip_a1));
+        assert!(svc.rpc_rate_limiter.check(ip_a2));
+        assert!(
+            !svc.rpc_rate_limiter.check(ip_a3),
+            "client A must not bypass rate limit by spoofing leftmost XFF"
+        );
+
+        // Client B behind the same ngrok loopback proxy gets its own fresh bucket.
+        let mut meta_b = MetadataMap::new();
+        meta_b.insert("x-forwarded-for", "203.0.113.20".parse().unwrap());
+        let ip_b = resolve_peer_ip(loopback, &meta_b, &trusted);
+        assert_eq!(ip_b, "203.0.113.20".parse::<IpAddr>().unwrap());
+        assert!(svc.rpc_rate_limiter.check(ip_b));
+        assert!(svc.rpc_rate_limiter.check(ip_b));
+        assert!(!svc.rpc_rate_limiter.check(ip_b));
+    }
+
+    #[tokio::test]
+    async fn service_metrics_counts_requests_rate_limits_and_active_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let endpoint = url::Url::parse("http://127.0.0.1:9").unwrap();
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(endpoint));
+        // Allow 2 RPCs/min so the 3rd triggers rate_limited.
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10,
+            2,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+        let metrics = svc.metrics();
+        assert_eq!(
+            metrics.snapshot(),
+            MetricsSnapshot {
+                rpc_requests: 0,
+                rate_limited: 0,
+                active_streams: 0,
+            }
+        );
+
+        let stream = DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap();
+        assert_eq!(metrics.snapshot().rpc_requests, 1);
+        assert_eq!(metrics.snapshot().active_streams, 1);
+
+        let _ = DarkFiLightWallet::get_omr_capabilities(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap();
+        let err = DarkFiLightWallet::get_omr_capabilities(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.rpc_requests, 3);
+        assert_eq!(snap.rate_limited, 1);
+        assert_eq!(snap.active_streams, 1);
+
+        drop(stream);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(metrics.snapshot().active_streams, 0);
     }
 }

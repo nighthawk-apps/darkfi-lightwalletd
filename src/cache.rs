@@ -728,6 +728,7 @@ impl Cache {
             ));
         }
         let existing = self.omr_clue_pubkeys.get(payment_pubkey.as_slice())?;
+        let mut reserved_slot = false;
         if let Some(ref existing) = existing {
             if let Some((stored_version, _stored_proof, stored_clue)) =
                 Self::parse_clue_pubkey_value(existing)
@@ -745,22 +746,47 @@ impl Cache {
             }
         } else {
             let cap = self.max_clue_pubkey_entries.load(Ordering::Relaxed);
-            if self.clue_pubkey_count.load(Ordering::Relaxed) >= cap {
-                return Err(LightWalletError::CacheError(
-                    "clue public key registry is full".into(),
-                ));
+            let mut cur = self.clue_pubkey_count.load(Ordering::Acquire);
+            loop {
+                if cur >= cap {
+                    return Err(LightWalletError::CacheError(
+                        "clue public key registry is full".into(),
+                    ));
+                }
+                match self.clue_pubkey_count.compare_exchange_weak(
+                    cur,
+                    cur + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
             }
+            reserved_slot = true;
         }
         let mut value = Vec::with_capacity(8 + 4 + ownership_proof.len() + clue_pk.len());
         value.extend_from_slice(&key_version.to_le_bytes());
         value.extend_from_slice(&(ownership_proof.len() as u32).to_le_bytes());
         value.extend_from_slice(ownership_proof);
         value.extend_from_slice(clue_pk);
-        let prev = self
+        let prev = match self
             .omr_clue_pubkeys
-            .insert(payment_pubkey.as_slice(), value)?;
-        if prev.is_none() {
-            self.clue_pubkey_count.fetch_add(1, Ordering::Relaxed);
+            .insert(payment_pubkey.as_slice(), value)
+        {
+            Ok(prev) => prev,
+            Err(e) => {
+                if reserved_slot {
+                    self.clue_pubkey_count.fetch_sub(1, Ordering::AcqRel);
+                }
+                return Err(e.into());
+            }
+        };
+        if reserved_slot && prev.is_some() {
+            // Raced with a concurrent insert of the same key; release our extra count.
+            self.clue_pubkey_count.fetch_sub(1, Ordering::AcqRel);
+        } else if !reserved_slot && prev.is_none() {
+            self.clue_pubkey_count.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }

@@ -187,6 +187,14 @@ fn blend(from: u8, to: u8, t: f64) -> u8 {
     (from as f64 + (to as f64 - from as f64) * t).round() as u8
 }
 
+fn format_tip_age(fetched_unix: u64, now_unix: u64) -> String {
+    if fetched_unix == 0 {
+        "unknown".to_string()
+    } else {
+        format!("{}s", now_unix.saturating_sub(fetched_unix))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, verbosity) = match parse_cli_args(std::env::args()) {
@@ -371,6 +379,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.upload_deadline_s,
     );
 
+    // Periodic 60s INFO metrics summary using lock-free atomic counters.
+    let service_metrics = service.metrics();
+    let metrics_cache = Arc::clone(&cache);
+    let metrics_handle = tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(60);
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prev_requests = 0u64;
+        let mut prev_rate_limited = 0u64;
+        loop {
+            interval.tick().await;
+            let snap = service_metrics.snapshot();
+            let req_delta = snap.rpc_requests.saturating_sub(prev_requests);
+            let rl_delta = snap.rate_limited.saturating_sub(prev_rate_limited);
+            prev_requests = snap.rpc_requests;
+            prev_rate_limited = snap.rate_limited;
+            let tip_height = metrics_cache
+                .get_tip()
+                .ok()
+                .flatten()
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let tip_age =
+                format_tip_age(metrics_cache.tip_fetched_unix().ok().unwrap_or(0), now_unix);
+            info!(
+                target: "lightwalletd::metrics",
+                "summary: rpc_requests={} (+{}) rate_limited={} (+{}) active_streams={} tip_height={} tip_age={}",
+                snap.rpc_requests,
+                req_delta,
+                snap.rate_limited,
+                rl_delta,
+                snap.active_streams,
+                tip_height,
+                tip_age,
+            );
+        }
+    });
+
     // Start chain poller in background
     let poller = ChainPoller::new(
         Arc::clone(&rpc_client),
@@ -533,6 +583,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(target: "lightwalletd", "gRPC server stopped");
         }
     }
+    metrics_handle.abort();
 
     // Flush cache on shutdown
     info!(target: "lightwalletd", "Flushing cache...");
@@ -631,5 +682,12 @@ mod header_tests {
         assert!(parse_cli_args(["lwd", "--config"]).is_err());
         assert!(parse_cli_args(["lwd", "--unknown-flag"]).is_err());
         assert!(parse_cli_args(["lwd", "extra-positional"]).is_err());
+    }
+
+    #[test]
+    fn format_tip_age_handles_unknown_and_elapsed() {
+        assert_eq!(super::format_tip_age(0, 1_700_000_000), "unknown");
+        assert_eq!(super::format_tip_age(1_700_000_000, 1_700_000_012), "12s");
+        assert_eq!(super::format_tip_age(1_700_000_050, 1_700_000_012), "0s");
     }
 }

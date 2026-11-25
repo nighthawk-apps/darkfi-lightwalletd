@@ -281,7 +281,7 @@ impl ChainPoller {
                     }
                 }
                 Err(e) => {
-                    consecutive_failures += 1;
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                     error!(
                         target: "lightwalletd::chain_poller",
                         "Poll failed (attempt {consecutive_failures}): {e}"
@@ -476,13 +476,14 @@ impl ChainPoller {
         }
     }
 
-    /// Calculate backoff interval with exponential growth.
+    /// Calculate backoff interval with exponential growth, capped cleanly at `max_backoff_secs`.
     fn backoff_interval(&self, failures: u32) -> u64 {
         if failures == 0 {
             return self.config.poll_interval_secs;
         }
 
-        let backoff = self.config.poll_interval_secs * 2u64.pow(failures.min(6));
+        let shift = failures.min(6);
+        let backoff = self.config.poll_interval_secs.saturating_mul(1u64 << shift);
         backoff.min(self.config.max_backoff_secs)
     }
 }
@@ -530,6 +531,19 @@ mod tests {
         assert_eq!(poller.backoff_interval(4), 160);
         assert_eq!(poller.backoff_interval(5), 300); // capped
         assert_eq!(poller.backoff_interval(10), 300); // still capped
+        assert_eq!(poller.backoff_interval(u32::MAX), 300); // never overflows
+
+        let huge_poller = ChainPoller {
+            rpc_client: Arc::clone(&poller.rpc_client),
+            cache: Arc::clone(&poller.cache),
+            config: ChainPollerConfig {
+                poll_interval_secs: u64::MAX / 2,
+                max_backoff_secs: 300,
+                ..ChainPollerConfig::default()
+            },
+            tip_notify: poller.tip_notify.clone(),
+        };
+        assert_eq!(huge_poller.backoff_interval(6), 300);
     }
 
     fn h(b: u8) -> [u8; 32] {

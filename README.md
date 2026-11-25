@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.13.** Fixes `blockchain.get_difficulty` `[height]` array parsing and tip-fact caching, `ChainPoller` IBD/reorg `-32121` handling, `FeeV1` bounds/decoding, `GetTreeState`/`SubscribeBlocks` rate-limiting & stream caps, `omr_metadata_enc` reorg retention with 24h TTL, `Cache` rewind/reconciliation, and `RUST_LOG`/`--version` CLI support. Aligns with Nighthawk Android/iOS 3.01.20, desktop 3.1.20, and Moonshine 3.1.20. DarkFi pin for wallets is `191941936` (`6e61deb26` recipient memos on top of `9d7ceaf77`).
+**0.3.14.** Hardens HTTP/2 multi-header `X-Forwarded-For` peer extraction behind trusted proxies, adds atomic capacity enforcement (`100,000` entries) and decoy `key_version` coverage for clue keys, clarifies `func_code = 0` (`FeeV1`) semantics, adds `cargo-deny` CI gating (`deny.toml`), adds saturating poller backoff, lock-free 60s `lightwalletd::metrics` logging, and [docs/OPERATIONS.md](docs/OPERATIONS.md). Aligns with Nighthawk Android/iOS 3.01.21, desktop 3.1.21, and Moonshine 3.1.21. DarkFi pin for wallets is `b87318e80`.
 
 ## Contents
 
@@ -36,7 +36,7 @@ The server:
 4. Serves them to wallets over gRPC
 5. Serves those compact records for wallet trial decryption. Experimental UnifOMR detection runs only when the binary is built with `fhe-omr`.
 
-**Production clients use the default binary** (no `fhe-omr`). See [`docs/verification-checklist.md`](docs/verification-checklist.md) and [`docs/connectivity-triage.md`](docs/connectivity-triage.md). UnifOMR limits stay in [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md).
+**Production clients use the default binary** (no `fhe-omr`). See [`docs/OPERATIONS.md`](docs/OPERATIONS.md), [`docs/verification-checklist.md`](docs/verification-checklist.md), and [`docs/connectivity-triage.md`](docs/connectivity-triage.md). UnifOMR limits stay in [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md).
 
 ---
 
@@ -46,14 +46,14 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `191941936` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `b87318e80` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi-nighthawk-testnet/   # pin 191941936 — or symlink to Android third_party/darkfi
+  darkfi-nighthawk-testnet/   # pin b87318e80 — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
   nighthawk-android-wallet/
@@ -64,7 +64,7 @@ Recommended layout after `./scripts/build.sh`:
 # Clean setup on a new Mac:
 brew install protobuf
 
-# Sibling darkfi checkout at required pin (191941936):
+# Sibling darkfi checkout at required pin (b87318e80):
 git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
 # Or reuse the Android pin instead of a worktree:
 # ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
@@ -82,7 +82,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev` (`1919419364a406b85a68411fa8ad80919b286113`). Overrides:
+`scripts/darkfi.rev` (`b87318e80968ea071fbd3a56eb1ea17110252753`). Overrides:
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
@@ -200,6 +200,7 @@ Defined in `proto/lightwallet.proto`.
 | Network | Mainnet `0x00` · Testnet `0x01` |
 | Scheme | **UnifOMR `0x05` (only)** |
 | Multi-address | Cap **16** keys; SIMD slots = block heights |
+| `func_code` (`CompactOutput` / `CompactOutputBody`) | `MoneyFunction` discriminant: `0` = `FeeV1`, `1` = `GenesisMintV1`, `2` = `PoWRewardV1`, `3` = `TransferV1`, `4` = `AuthTokenMintV1`, `5` = `AuthTokenFreezeV1`, `6` = `TokenMintV1`, `7` = `BurnV1`. On servers running `CACHE_FORMAT_VERSION >= 2` (proto `2.1.0`+), `func_code = 0` represents `MoneyFunction::FeeV1` (not "unrecorded"; only legacy pre-`2.1.0` caches omitted it). |
 
 ---
 

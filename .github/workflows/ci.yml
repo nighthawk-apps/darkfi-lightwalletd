@@ -55,3 +55,11 @@ jobs:
       - name: Test (fhe-omr feature)
         working-directory: darkfi-lightwalletd
         run: cargo test --release --features fhe-omr
+
+      - name: Dependency advisory check (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check advisories sources
+          manifest-path: darkfi-lightwalletd/Cargo.toml
+          config: darkfi-lightwalletd/deny.toml

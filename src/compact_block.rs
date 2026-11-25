@@ -64,7 +64,11 @@ pub struct CompactOutput {
     #[serde(default)]
     pub omr_metadata_enc: Vec<u8>,
 
-    /// `MoneyFunction` discriminant. Zero means an older cache row did not record one.
+    /// `MoneyFunction` discriminant (`0` = `FeeV1`, `1` = `GenesisMintV1`,
+    /// `2` = `PoWRewardV1`, `3` = `TransferV1`, `4` = `AuthTokenMintV1`,
+    /// `5` = `AuthTokenFreezeV1`, `6` = `TokenMintV1`, `7` = `BurnV1`).
+    /// On `CACHE_FORMAT_VERSION >= 2`, `0` represents `MoneyFunction::FeeV1`
+    /// (only pre-v2 legacy cache rows defaulted to `0` as unrecorded).
     #[serde(default)]
     pub func_code: u8,
 }
