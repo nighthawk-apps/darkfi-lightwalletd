@@ -45,9 +45,11 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct PooledDetectionKey {
     pub keys: Vec<Arc<Vec<u8>>>,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub network_byte: u8,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub expires_unix: u64,
-    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub byte_length: usize,
 }
 
@@ -100,7 +102,7 @@ impl DetectionKeyPool {
 
     /// Fast pre-check before taking an FHE permit and parsing a ~120 MiB key.
     /// Sweeps expired entries first; callers still check `insert` atomically.
-    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub fn can_accept(
         &mut self,
         byte_length: usize,
@@ -162,6 +164,7 @@ impl DetectionKeyPool {
     }
 
     /// Clone the entry if it is still live. Expired and unknown handles yield `None`.
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub fn lookup(&mut self, handle: &[u8; 32], now_unix: u64) -> Option<PooledDetectionKey> {
         if self.last_sweep.elapsed() >= SWEEP_INTERVAL {
             self.sweep_expired(now_unix);
@@ -198,6 +201,7 @@ impl Default for DetectionKeyPool {
     }
 }
 
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

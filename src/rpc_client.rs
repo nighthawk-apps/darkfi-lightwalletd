@@ -91,12 +91,28 @@ impl DarkfidRpcClient {
         }
     }
 
+    /// Configured RPC timeout duration.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Fetch a block at the given height from darkfid.
     pub async fn get_block(&self, height: u32) -> Result<BlockInfo> {
         debug!(target: "lightwalletd::rpc_client", "Fetching block at height {height}");
 
         let params = JsonValue::Array(vec![JsonValue::Number(height as f64)]);
-        let response = self.request("blockchain.get_block", params).await?;
+        let response = match self.request_raw("blockchain.get_block", params).await {
+            Ok(resp) => resp,
+            Err(RpcCallError::JsonRpc { code, message, raw }) => {
+                if code == Some(DARKFID_ERR_UNKNOWN_BLOCK_HEIGHT)
+                    || message.contains("Did not find block height")
+                {
+                    return Err(LightWalletError::BlockNotFound(height));
+                }
+                return Err(LightWalletError::RpcError(raw));
+            }
+            Err(RpcCallError::Other(e)) => return Err(e),
+        };
 
         let block_b64 = response.get::<String>().ok_or_else(|| {
             LightWalletError::RpcError(format!("Expected string response for get_block({height})"))
@@ -166,20 +182,20 @@ impl DarkfidRpcClient {
         Ok(target)
     }
 
-    /// Get the current network difficulty.
-    pub async fn get_difficulty(&self) -> Result<String> {
-        debug!(target: "lightwalletd::rpc_client", "Fetching difficulty");
+    /// Get the network difficulty at the given block height.
+    ///
+    /// `darkfid`'s `blockchain.get_difficulty` expects `params: [height]` and
+    /// returns `[difficulty, cumulative_difficulty]`.
+    pub async fn get_difficulty(&self, height: u32) -> Result<String> {
+        debug!(
+            target: "lightwalletd::rpc_client",
+            "Fetching difficulty at height {height}"
+        );
 
-        let params = JsonValue::Array(vec![]);
+        let params = JsonValue::Array(vec![JsonValue::Number(height as f64)]);
         let response = self.request("blockchain.get_difficulty", params).await?;
 
-        match response {
-            JsonValue::String(s) => Ok(s),
-            JsonValue::Number(n) => Ok(n.to_string()),
-            _ => Err(LightWalletError::RpcError(
-                "Expected string or number for difficulty".to_string(),
-            )),
-        }
+        parse_difficulty_response(&response)
     }
 
     /// Submit a signed transaction to the network.
@@ -282,6 +298,18 @@ impl DarkfidRpcClient {
 
     /// Send a JSON-RPC request to darkfid and return the result value.
     async fn request(&self, method: &str, params: JsonValue) -> Result<JsonValue> {
+        match self.request_raw(method, params).await {
+            Ok(v) => Ok(v),
+            Err(RpcCallError::JsonRpc { raw, .. }) => Err(LightWalletError::RpcError(raw)),
+            Err(RpcCallError::Other(e)) => Err(e),
+        }
+    }
+
+    async fn request_raw(
+        &self,
+        method: &str,
+        params: JsonValue,
+    ) -> std::result::Result<JsonValue, RpcCallError> {
         use darkfi::rpc::jsonrpc::JsonRequest;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
@@ -290,16 +318,16 @@ impl DarkfidRpcClient {
         let mut stream = tokio::time::timeout(self.timeout, connect_fut)
             .await
             .map_err(|_| {
-                LightWalletError::ConnectionError(format!(
+                RpcCallError::Other(LightWalletError::ConnectionError(format!(
                     "Timeout connecting to darkfid at {}",
                     self.connect_addr
-                ))
+                )))
             })?
             .map_err(|e| {
-                LightWalletError::ConnectionError(format!(
+                RpcCallError::Other(LightWalletError::ConnectionError(format!(
                     "Failed to connect to {} ({}): {}",
                     self.endpoint, self.connect_addr, e
-                ))
+                )))
             })?;
 
         // Prefer nodelay for request/response RPC.
@@ -308,7 +336,10 @@ impl DarkfidRpcClient {
         let req = JsonRequest::new(method, params);
 
         let req_str = req.stringify().map_err(|e| {
-            LightWalletError::SerializationError(format!("Failed to stringify request: {}", e))
+            RpcCallError::Other(LightWalletError::SerializationError(format!(
+                "Failed to stringify request: {}",
+                e
+            )))
         })?;
 
         tokio::time::timeout(self.timeout, async {
@@ -318,10 +349,15 @@ impl DarkfidRpcClient {
         })
         .await
         .map_err(|_| {
-            LightWalletError::ConnectionError("Timeout writing darkfid RPC request".into())
+            RpcCallError::Other(LightWalletError::ConnectionError(
+                "Timeout writing darkfid RPC request".into(),
+            ))
         })?
         .map_err(|e| {
-            LightWalletError::ConnectionError(format!("Failed to write request: {}", e))
+            RpcCallError::Other(LightWalletError::ConnectionError(format!(
+                "Failed to write request: {}",
+                e
+            )))
         })?;
 
         // Cap the JSON line. `read_line` grows without bound until `\n`, so a
@@ -333,45 +369,221 @@ impl DarkfidRpcClient {
         tokio::time::timeout(self.timeout, reader.read_line(&mut line))
             .await
             .map_err(|_| {
-                LightWalletError::ConnectionError("Timeout reading darkfid RPC response".into())
+                RpcCallError::Other(LightWalletError::ConnectionError(
+                    "Timeout reading darkfid RPC response".into(),
+                ))
             })?
             .map_err(|e| {
-                LightWalletError::ConnectionError(format!("Failed to read response: {}", e))
+                RpcCallError::Other(LightWalletError::ConnectionError(format!(
+                    "Failed to read response: {}",
+                    e
+                )))
             })?;
 
         if line.is_empty() {
-            return Err(LightWalletError::ConnectionError(
+            return Err(RpcCallError::Other(LightWalletError::ConnectionError(
                 "Empty response from server".to_string(),
-            ));
+            )));
         }
         if !line.ends_with('\n') {
-            return Err(LightWalletError::ConnectionError(
+            return Err(RpcCallError::Other(LightWalletError::ConnectionError(
                 "darkfid RPC response exceeded 32 MiB or was truncated".into(),
-            ));
+            )));
         }
 
         let parsed: JsonValue = line.parse().map_err(|e| {
-            LightWalletError::SerializationError(format!("Failed to parse response JSON: {}", e))
+            RpcCallError::Other(LightWalletError::SerializationError(format!(
+                "Failed to parse response JSON: {}",
+                e
+            )))
         })?;
 
         let result = parsed
             .get::<std::collections::HashMap<String, JsonValue>>()
             .ok_or_else(|| {
-                LightWalletError::SerializationError("Expected JSON object response".to_string())
+                RpcCallError::Other(LightWalletError::SerializationError(
+                    "Expected JSON object response".to_string(),
+                ))
             })?;
 
         if let Some(err) = result.get("error") {
-            return Err(LightWalletError::RpcError(format!("{err:?}")));
+            let (code, message) = extract_jsonrpc_error_fields(err);
+            return Err(RpcCallError::JsonRpc {
+                code,
+                message,
+                raw: format!("{err:?}"),
+            });
         }
 
-        result
-            .get("result")
+        result.get("result").cloned().ok_or_else(|| {
+            RpcCallError::Other(LightWalletError::RpcError(
+                "Missing result field".to_string(),
+            ))
+        })
+    }
+}
+
+/// `darkfid` JSON-RPC error code `RpcError::UnknownBlockHeight` ("Did not find block height").
+pub(crate) const DARKFID_ERR_UNKNOWN_BLOCK_HEIGHT: i64 = -32121;
+
+enum RpcCallError {
+    JsonRpc {
+        code: Option<i64>,
+        message: String,
+        raw: String,
+    },
+    Other(LightWalletError),
+}
+
+fn extract_jsonrpc_error_fields(err: &JsonValue) -> (Option<i64>, String) {
+    if let Some(obj) = err.get::<std::collections::HashMap<String, JsonValue>>() {
+        let code = obj
+            .get("code")
+            .and_then(|v| v.get::<f64>())
+            .map(|&n| n as i64);
+        let message = obj
+            .get("message")
+            .and_then(|v| v.get::<String>())
             .cloned()
-            .ok_or_else(|| LightWalletError::RpcError("Missing result field".to_string()))
+            .unwrap_or_default();
+        (code, message)
+    } else if let Some(s) = err.get::<String>() {
+        (None, s.clone())
+    } else {
+        (None, String::new())
+    }
+}
+
+fn format_difficulty_f64(n: f64) -> Result<String> {
+    if !n.is_finite() {
+        return Err(LightWalletError::RpcError(
+            "Non-finite difficulty value".to_string(),
+        ));
+    }
+    if n == 0.0 {
+        return Ok("0".to_string());
+    }
+    if n.fract() == 0.0 {
+        Ok(format!("{n:.0}"))
+    } else {
+        Ok(n.to_string())
+    }
+}
+
+fn parse_difficulty_response(response: &JsonValue) -> Result<String> {
+    match response {
+        JsonValue::Array(arr) => match arr.first() {
+            Some(JsonValue::Number(n)) => format_difficulty_f64(*n),
+            Some(JsonValue::String(s)) => Ok(s.clone()),
+            _ => Err(LightWalletError::RpcError(
+                "Expected [difficulty, cumulative_difficulty] array for difficulty".to_string(),
+            )),
+        },
+        JsonValue::String(s) => Ok(s.clone()),
+        JsonValue::Number(n) => format_difficulty_f64(*n),
+        _ => Err(LightWalletError::RpcError(
+            "Expected array, string, or number for difficulty".to_string(),
+        )),
     }
 }
 
 #[allow(dead_code)]
 fn _socket_addr_hint(addr: &str) -> Option<SocketAddr> {
     addr.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn parse_difficulty_handles_array_and_fallbacks() {
+        let arr = JsonValue::Array(vec![JsonValue::Number(123.0), JsonValue::Number(456.0)]);
+        assert_eq!(parse_difficulty_response(&arr).unwrap(), "123");
+
+        let big = JsonValue::Array(vec![
+            JsonValue::Number(1_000_000_000_000.0),
+            JsonValue::Number(9_000_000_000_000.0),
+        ]);
+        assert_eq!(parse_difficulty_response(&big).unwrap(), "1000000000000");
+
+        let frac = JsonValue::Array(vec![JsonValue::Number(12.5), JsonValue::Number(25.0)]);
+        assert_eq!(parse_difficulty_response(&frac).unwrap(), "12.5");
+
+        let str_arr = JsonValue::Array(vec![JsonValue::String("999".into())]);
+        assert_eq!(parse_difficulty_response(&str_arr).unwrap(), "999");
+
+        assert_eq!(
+            parse_difficulty_response(&JsonValue::String("42".into())).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            parse_difficulty_response(&JsonValue::Number(77.0)).unwrap(),
+            "77"
+        );
+        assert!(parse_difficulty_response(&JsonValue::Array(vec![])).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_difficulty_sends_height_param_and_parses_array() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+
+            let parsed: JsonValue = line.parse().unwrap();
+            let obj = parsed
+                .get::<std::collections::HashMap<String, JsonValue>>()
+                .unwrap();
+            assert_eq!(
+                obj.get("method").and_then(|v| v.get::<String>()).unwrap(),
+                "blockchain.get_difficulty"
+            );
+            let params = obj
+                .get("params")
+                .and_then(|v| v.get::<Vec<JsonValue>>())
+                .unwrap();
+            assert_eq!(params.len(), 1);
+            assert_eq!(*params[0].get::<f64>().unwrap() as u32, 42);
+            let id = *obj.get("id").and_then(|v| v.get::<f64>()).unwrap() as i64;
+
+            let resp =
+                format!(r#"{{"jsonrpc":"2.0","result":[12345.0,99999.0],"id":{id}}}"#) + "\n";
+            w.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = DarkfidRpcClient::new_simple(Url::parse(&format!("tcp://{addr}")).unwrap());
+        let diff = client.get_difficulty(42).await.unwrap();
+        assert_eq!(diff, "12345");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_block_maps_32121_to_block_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let resp = r#"{"jsonrpc":"2.0","error":{"code":-32121,"message":"Did not find block height"},"id":1}"#.to_string() + "\n";
+            w.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = DarkfidRpcClient::new_simple(Url::parse(&format!("tcp://{addr}")).unwrap());
+        let err = client.get_block(500).await.unwrap_err();
+        assert!(matches!(err, LightWalletError::BlockNotFound(500)));
+        assert!(err.is_not_found());
+        server.await.unwrap();
+    }
 }

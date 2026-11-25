@@ -19,13 +19,13 @@
 //! darkfi-lightwalletd main entry point.
 //!
 //! Usage:
-//!   darkfi-lightwalletd [--config <path>]
+//!   darkfi-lightwalletd [--config <path>] [-v | -vv] [--version | -V] [--help | -h]
 //!
 //! The server:
 //! 1. Loads configuration from TOML file
 //! 2. Opens/creates the sled cache database
 //! 3. Connects to darkfid via JSON-RPC
-//! 4. Starts the chain poller (syncs blocks from darkfid ? cache)
+//! 4. Starts the chain poller (syncs blocks from darkfid -> cache)
 //! 5. Starts the gRPC server (serves compact blocks to wallet clients)
 
 use std::sync::Arc;
@@ -42,6 +42,109 @@ use darkfi_lightwalletd::{
     rpc_client::DarkfidRpcClient,
     server::LightWalletService,
 };
+
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Run {
+        config_path: Option<String>,
+        verbosity: u8,
+    },
+    Help,
+    Version,
+}
+
+fn version_string() -> String {
+    format!(
+        "darkfi-lightwalletd {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_HASH").unwrap_or("unknown")
+    )
+}
+
+fn usage_text() -> &'static str {
+    "Usage: darkfi-lightwalletd [OPTIONS]\n\
+     \n\
+     Options:\n\
+       --config <PATH>    Path to TOML configuration file\n\
+       -v, --verbose      Increase log verbosity (-v = debug, -vv = trace)\n\
+       -V, --version      Print version and exit\n\
+       -h, --help         Print this help message and exit\n\
+     \n\
+     Environment:\n\
+       RUST_LOG           Tracing filter directive (e.g. info,lightwalletd=debug)\n"
+}
+
+fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut iter = args.into_iter().skip(1);
+    let mut config_path: Option<String> = None;
+    let mut verbosity: u8 = 0;
+
+    while let Some(arg) = iter.next() {
+        let arg = arg.as_ref();
+        match arg {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "--config" => {
+                let Some(path) = iter.next() else {
+                    return Err("missing value for --config".to_string());
+                };
+                let path = path.as_ref();
+                if path.is_empty() || path.starts_with('-') {
+                    return Err(format!("invalid value for --config: `{path}`"));
+                }
+                config_path = Some(path.to_string());
+            }
+            _ if arg.starts_with("--config=") => {
+                let path = &arg["--config=".len()..];
+                if path.is_empty() {
+                    return Err("missing value for --config=".to_string());
+                }
+                config_path = Some(path.to_string());
+            }
+            "--verbose" => {
+                verbosity = verbosity.saturating_add(1);
+            }
+            _ if arg.starts_with("-v") && arg[1..].bytes().all(|b| b == b'v') => {
+                verbosity = verbosity.saturating_add((arg.len() - 1).min(u8::MAX as usize) as u8);
+            }
+            other => {
+                return Err(format!("unknown argument: `{other}`"));
+            }
+        }
+    }
+
+    Ok(CliAction::Run {
+        config_path,
+        verbosity,
+    })
+}
+
+fn init_tracing(verbosity: u8) {
+    let default_filter = match verbosity {
+        0 => "info",
+        1 => "info,lightwalletd=debug,darkfi_lightwalletd=debug",
+        _ => "debug,lightwalletd=trace,darkfi_lightwalletd=trace",
+    };
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(env) if verbosity == 0 => env,
+        Ok(mut env) => {
+            let level = if verbosity == 1 { "debug" } else { "trace" };
+            if let Ok(d) = format!("lightwalletd={level}").parse() {
+                env = env.add_directive(d);
+            }
+            if let Ok(d) = format!("darkfi_lightwalletd={level}").parse() {
+                env = env.add_directive(d);
+            }
+            env
+        }
+        Err(_) => tracing_subscriber::EnvFilter::new(default_filter),
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
 /// Cyberpunk teal `#5CE1FF` and wallpaper pink `#C94BB8`.
 const CYBER_TEAL: (u8, u8, u8) = (0x5C, 0xE1, 0xFF);
@@ -86,8 +189,27 @@ fn blend(from: u8, to: u8, t: f64) -> u8 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    let (config_path, verbosity) = match parse_cli_args(std::env::args()) {
+        Ok(CliAction::Help) => {
+            print!("{}", usage_text());
+            return Ok(());
+        }
+        Ok(CliAction::Version) => {
+            println!("{}", version_string());
+            return Ok(());
+        }
+        Ok(CliAction::Run {
+            config_path,
+            verbosity,
+        }) => (config_path, verbosity),
+        Err(msg) => {
+            eprintln!("error: {msg}\n\n{}", usage_text());
+            std::process::exit(2);
+        }
+    };
+
+    // Initialize tracing (honors RUST_LOG plus -v / -vv verbosity flags)
+    init_tracing(verbosity);
 
     print!("{}", nighthawk_header());
 
@@ -95,28 +217,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(target: "lightwalletd", "Anonymous. Uncensored. Sovereign.");
 
     // Load config from --config <path> CLI argument, or use defaults (then finalize).
-    let config = {
-        let args: Vec<String> = std::env::args().collect();
-        let config_path = args
-            .iter()
-            .position(|a| a == "--config")
-            .and_then(|i| args.get(i + 1))
-            .map(|s| s.to_string());
-
-        let loaded = if let Some(path) = config_path {
-            info!(target: "lightwalletd", "Loading config from: {}", path);
-            Config::load_from_file(&path).unwrap_or_else(|e| {
-                error!(target: "lightwalletd", "Config error: {e}");
-                std::process::exit(1);
-            })
-        } else {
-            info!(target: "lightwalletd", "No --config specified, using defaults.");
-            Config::default().finalize().unwrap_or_else(|e| {
-                error!(target: "lightwalletd", "Default config error: {e}");
-                std::process::exit(1);
-            })
-        };
-        loaded
+    let config = if let Some(path) = config_path {
+        info!(target: "lightwalletd", "Loading config from: {}", path);
+        Config::load_from_file(&path).unwrap_or_else(|e| {
+            error!(target: "lightwalletd", "Config error: {e}");
+            std::process::exit(1);
+        })
+    } else {
+        info!(target: "lightwalletd", "No --config specified, using defaults.");
+        Config::default().finalize().unwrap_or_else(|e| {
+            error!(target: "lightwalletd", "Default config error: {e}");
+            std::process::exit(1);
+        })
     };
 
     info!(
@@ -482,5 +594,42 @@ mod header_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn cli_args_parse_flags_and_reject_unknown() {
+        use super::{parse_cli_args, CliAction};
+
+        assert_eq!(
+            parse_cli_args(["lwd"]).unwrap(),
+            CliAction::Run {
+                config_path: None,
+                verbosity: 0,
+            }
+        );
+        assert_eq!(
+            parse_cli_args(["lwd", "--config", "/etc/lwd.toml", "-vv"]).unwrap(),
+            CliAction::Run {
+                config_path: Some("/etc/lwd.toml".into()),
+                verbosity: 2,
+            }
+        );
+        assert_eq!(
+            parse_cli_args(["lwd", "--config=/etc/lwd.toml", "-v", "--verbose"]).unwrap(),
+            CliAction::Run {
+                config_path: Some("/etc/lwd.toml".into()),
+                verbosity: 2,
+            }
+        );
+        assert_eq!(parse_cli_args(["lwd", "--help"]).unwrap(), CliAction::Help);
+        assert_eq!(parse_cli_args(["lwd", "-h"]).unwrap(), CliAction::Help);
+        assert_eq!(
+            parse_cli_args(["lwd", "--version"]).unwrap(),
+            CliAction::Version
+        );
+        assert_eq!(parse_cli_args(["lwd", "-V"]).unwrap(), CliAction::Version);
+        assert!(parse_cli_args(["lwd", "--config"]).is_err());
+        assert!(parse_cli_args(["lwd", "--unknown-flag"]).is_err());
+        assert!(parse_cli_args(["lwd", "extra-positional"]).is_err());
     }
 }

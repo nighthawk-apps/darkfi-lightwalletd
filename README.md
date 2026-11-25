@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.12.** UnifOMR worker count, detection-key pool, and upload deadline are config knobs. A darkfid error during reorg search no longer wipes the cache. An interrupted rewind resumes on startup, and O2 recipient memos are kept. Aligns with Nighthawk Android/iOS 3.01.19, desktop 3.1.19, and Moonshine 3.1.19. DarkFi pin for wallets is `6e61deb26` (contains `9d7ceaf77`); build sibling checkout notes below still accept that pin.
+**0.3.13.** Fixes `blockchain.get_difficulty` `[height]` array parsing and tip-fact caching, `ChainPoller` IBD/reorg `-32121` handling, `FeeV1` bounds/decoding, `GetTreeState`/`SubscribeBlocks` rate-limiting & stream caps, `omr_metadata_enc` reorg retention with 24h TTL, `Cache` rewind/reconciliation, and `RUST_LOG`/`--version` CLI support. Aligns with Nighthawk Android/iOS 3.01.20, desktop 3.1.20, and Moonshine 3.1.20. DarkFi pin for wallets is `191941936` (`6e61deb26` recipient memos on top of `9d7ceaf77`).
 
 ## Contents
 
@@ -46,14 +46,14 @@ The server:
 |-------------|--------|
 | **Rust** stable (edition 2021) | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` (`tonic-build` in `build.rs`) |
-| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `9d7ceaf77` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
+| **`darkfi-nighthawk-testnet`** | Sibling directory **literally named** `../darkfi-nighthawk-testnet` at pin `191941936` (nighthawk24 `nighthawk-testnet`). Upstream DarkFi is [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi), not the GitHub mirror. That pin is not on git.dark.fi, so a master checkout is not enough. Reuse Android `nighthawk-android-wallet/third_party/darkfi` with `ln -sfn`. |
 | **Running `darkfid`** | JSON-RPC endpoint for full blocks |
 
 Recommended layout after `./scripts/build.sh`:
 
 ```text
 ~/GitHub/
-  darkfi-nighthawk-testnet/   # pin 9d7ceaf77 — or symlink to Android third_party/darkfi
+  darkfi-nighthawk-testnet/   # pin 191941936 — or symlink to Android third_party/darkfi
   darkfi-lightwalletd/        # this repo
   moonshine/
   nighthawk-android-wallet/
@@ -64,7 +64,7 @@ Recommended layout after `./scripts/build.sh`:
 # Clean setup on a new Mac:
 brew install protobuf
 
-# Sibling darkfi checkout at required pin (9d7ceaf77):
+# Sibling darkfi checkout at required pin (191941936):
 git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
 # Or reuse the Android pin instead of a worktree:
 # ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
@@ -82,7 +82,7 @@ Independent clone (pulls `darkfi-nighthawk-testnet` next to this repo, then buil
 ```
 
 `scripts/fetch-darkfi.sh` clones/updates the sibling checkout pinned by
-`scripts/darkfi.rev` (`9d7ceaf77da7ccfd29ead3ba168fab284decd8c8`). Overrides:
+`scripts/darkfi.rev` (`1919419364a406b85a68411fa8ad80919b286113`). Overrides:
 
 ```bash
 DARKFI_DIR=/path/to/darkfi-nighthawk-testnet DARKFI_GIT_REF=<commit> ./scripts/fetch-darkfi.sh
@@ -186,11 +186,12 @@ Defined in `proto/lightwallet.proto`.
 | `GetOmrCapabilities` | Disabled in the default build. `unifomr` only with `--features fhe-omr` |
 | `GetNullifiers` / `GetNoteCommitments` | Spend / commitment sync |
 
-`OmrDigestRequest`:
+`GetUnifOmrDigest` and `RegisterDetectionKey` stream `DetectionKeyChunk` messages:
 
-- `detection_key` — legacy single key
-- `detection_keys` — multi-address (preferred when N > 1)
-- Multi-key response framing: repeated `[u32 LE len][digest bytes]`
+- First chunk carries header fields (`start_height`, `end_height`, `num_keys`, up to 16)
+- Subsequent chunks stream raw detection-key bytes (`data`), delimiting each key with `key_done = true`
+- Pooled keys use `GetUnifOmrDigestFromPool(PoolDigestRequest)` with the 32-byte server handle
+- Multi-key `OmrDigestResponse.encrypted_digest` framing: repeated `[u32 LE len][digest bytes]`
 
 ### Wire constants
 
@@ -212,7 +213,7 @@ Defined in `proto/lightwallet.proto`.
 | **Optional PEM TLS** | ✅ | `tls_cert_path` + `tls_key_path` |
 | **OMR rate limit** | ✅ | `omr_rate_limit_per_min` |
 | **Clue rate limit** | ✅ | Tighter on `RegisterOmrClue` |
-| **Detection key size cap** | ✅ | Reject oversized UnifOMR keys (~48 MiB) |
+| **Detection key size cap** | ✅ | Reject oversized UnifOMR keys (160 MiB cap for ~120 MiB Param2 keys) |
 | **Max block range** | ✅ | Caps range RPCs (DoS) |
 
 ### Compact blocks & cache
@@ -233,7 +234,7 @@ Defined in `proto/lightwallet.proto`.
 | **Trial decrypt compact blocks (default)** | ✅ | `GetCompactOutputBodies`, nullifiers, DAO calls |
 | **FetchPirBatch** | ✅ | Length-prefixed SealPIR-style limbs |
 | **RegisterCluePublicKey / GetCluePublicKey** | ✅ | Decoy directory; **250 ms** timing pad |
-| **FHE any-match (S1)** | ✅ | Per-clue layers, client OR |
+| **Per-message SIMD packing** | ✅ | One clue per SIMD slot (`slot_heights`), ℓ=2 bit AND |
 | **Multi-key digest (S17)** | ✅ | Cap **16** |
 | **spawn_blocking OMR (P1)** | ✅ | Off the async gRPC worker |
 | **Timing pad** | ✅ | Min response time on UnifOMR + clue-dir |
@@ -251,7 +252,7 @@ Defined in `proto/lightwallet.proto`.
 ### UnifOMR (scheme 0x05)
 
 - Experimental. Build with `--features fhe-omr`. The default binary does not serve it.
-- Cross-client crypto parity: RLWE `n=1024`, signed AHE, `CLUE_ERROR_BOUND=2`, length-prefixed SealPIR limbs
+- Cross-client crypto parity: Param2 RLWE `n=1024`, discrete Gaussian σ=0.5 (`CLUE_ERROR_BOUND=84`, `R_PRIME=149`, ℓ=2, digest mod-switch), length-prefixed SealPIR limbs
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
 - Empty OMR → clients may supplemental trial-decrypt (decoy directory ≠ failure)
 - Clients default to `http://127.0.0.1:9067`; `network` / `chain_name` must match wallets
@@ -269,7 +270,7 @@ Defined in `proto/lightwallet.proto`.
 | Decoy directory `found` channel | ✅ |
 | Funded broadcast → confirm → PIR e2e | ⏳ needs live `darkfid` |
 | Paper Param2 structural params (`n,q,h,r,D,ℓ`) | ✅ active — see `docs/unifomr_mvp_limits.md`; archived MVP in `docs/unifomr_mvp_archive.md` |
-| Paper FP/FN rates | ❌ not claimed until digest mod-switch + measured FP |
+| Param2 digest mod-switch + measured FP/FN | ✅ active — ε_p ≈ 2⁻²³·⁵ (see `docs/unifomr_mvp_limits.md`) |
 
 ### Privacy invariants
 
@@ -332,7 +333,7 @@ Hard limits until the crypto path shrinks keys:
 
 1. **One Param2 detection key ≈ 120 MiB.** Symmetric seed encryption (`det_sk.try_encrypt`) can cut that roughly in half (~60 MiB) with no server change; still experimental.
 2. **`fhe_workers` (default 2)** serializes digests. Raising it without matching CPU makes the box thrash. PIR concurrency is `max(fhe_workers, 4)`.
-3. **OMR rate limit 30/min/IP** also covers `FetchPirBatch`. Shared Tor exits share that budget; PIR-per-limb loops can exhaust it (see [`docs/fable-5.1-audit-unifomr-sync-source.md`](docs/fable-5.1-audit-unifomr-sync-source.md)).
+3. **OMR digest rate limit is 30/min/IP** (`omr_rate_limit_per_min`), while `FetchPirBatch` has its own **4096/min/IP** limiter (`PIR_RATE_LIMIT_PER_MIN`, 1 in-flight PIR request/IP). Shared Tor exits still share per-IP budgets across clients (see [`docs/fable-5.1-audit-unifomr-sync-source.md`](docs/fable-5.1-audit-unifomr-sync-source.md)).
 4. **1000 simultaneous UnifOMR digests on one box is not realistic** with Param2. Size 1000 for *connections* on the trial-decrypt path; size UnifOMR for *active digests* (tens per node).
 
 Lab / self-host starting point (≤100 wallets, few digests at once): 8-core ARM or x86, 32 GB RAM, 200 GB NVMe, 1 Gbps, `request_timeout_s ≥ 1800`, `fhe_workers=4`, reverse-proxy body ≥ 160 MB (`docs/deploy-hardening.md`).

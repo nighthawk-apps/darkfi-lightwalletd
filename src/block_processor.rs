@@ -107,7 +107,7 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
         let tx_hash = tx.hash();
         let mut outputs = Vec::new();
         let mut nullifiers = Vec::new();
-        let fee: u64 = 0;
+        let mut fee: u64 = 0;
 
         // Iterate through the transaction's contract calls
         for call_leaf in &tx.calls {
@@ -163,8 +163,16 @@ pub async fn process_block(block: &BlockInfo) -> Result<CompactBlock> {
 
             match func {
                 MoneyFunction::FeeV1 => {
-                    // FeeV1 uses data[9..] for params (first 9 bytes are function
-                    // discriminant + gas cost)
+                    // FeeV1 layout: data[0] discriminant, data[1..9] fee (u64 LE),
+                    // data[9..] serialized MoneyFeeParamsV1.
+                    if data.len() < 9 {
+                        return Err(LightWalletError::ProcessingError(format!(
+                            "FeeV1 call data too short: {} bytes (need at least 9)",
+                            data.len()
+                        )));
+                    }
+                    let call_fee = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                    fee = fee.saturating_add(call_fee);
                     let params: MoneyFeeParamsV1 =
                         deserialize_async(&data[9..]).await.map_err(|e| {
                             LightWalletError::ProcessingError(format!(
@@ -663,5 +671,100 @@ mod tests {
                 .any(|window| window == raw.as_slice()),
             "proposal inputs are stripped"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fee_v1_short_data_returns_error_without_panic() {
+        // Discriminant FeeV1 (0x00) with fewer than 9 bytes must return ProcessingError, not panic.
+        for len in [1usize, 2, 8] {
+            let mut data = vec![0u8; len];
+            data[0] = MoneyFunction::FeeV1 as u8;
+            let mut block = make_empty_block(12);
+            block.txs.push(tx_with_call(*MONEY_CONTRACT_ID, data));
+
+            let err = process_block(&block).await.unwrap_err();
+            assert!(
+                matches!(err, LightWalletError::ProcessingError(_)),
+                "expected ProcessingError for len={len}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fee_v1_decodes_and_accumulates_fee() {
+        use darkfi_money_contract::model::{Coin, Input, MoneyFeeParamsV1, Nullifier, Output};
+        use darkfi_sdk::crypto::{MerkleNode, PublicKey, SecretKey};
+        use darkfi_sdk::pasta::group::Group;
+        use darkfi_sdk::pasta::pallas;
+
+        let make_fee_call = |fee_amount: u64, seed: u64| -> Vec<u8> {
+            use darkfi_sdk::crypto::Blind;
+            let params = MoneyFeeParamsV1 {
+                input: Input {
+                    merkle_root: MerkleNode::from(pallas::Base::from(seed)),
+                    nullifier: Nullifier::from(pallas::Base::from(seed + 100)),
+                    value_commit: pallas::Point::generator(),
+                    token_commit: pallas::Base::from(1u64),
+                    user_data_enc: pallas::Base::from(0u64),
+                    signature_public: PublicKey::from_secret(SecretKey::from(pallas::Base::from(
+                        seed + 1,
+                    ))),
+                    tx_local: false,
+                },
+                output: Output {
+                    coin: Coin::from(pallas::Base::from(seed + 200)),
+                    value_commit: pallas::Point::generator(),
+                    token_commit: pallas::Base::from(1u64),
+                    note: dummy_note(),
+                    tx_local: false,
+                },
+                fee_value_blind: Blind(pallas::Scalar::from(3u64)),
+                token_blind: Blind(pallas::Base::from(2u64)),
+            };
+            let mut data = Vec::new();
+            data.push(MoneyFunction::FeeV1 as u8);
+            data.extend_from_slice(&fee_amount.to_le_bytes());
+            data.extend(serialize(&params));
+            data
+        };
+
+        // Single FeeV1 call
+        let mut block = make_empty_block(13);
+        block
+            .txs
+            .push(tx_with_call(*MONEY_CONTRACT_ID, make_fee_call(42_500, 1)));
+        let compact = process_block(&block).await.unwrap();
+        assert_eq!(compact.txs.len(), 1);
+        assert_eq!(compact.txs[0].fee, 42_500);
+        assert_eq!(compact.txs[0].nullifiers.len(), 1);
+        assert_eq!(compact.txs[0].outputs.len(), 1);
+
+        // Multiple FeeV1 calls saturate cleanly
+        let multi_tx = Transaction {
+            calls: vec![
+                DarkLeaf {
+                    data: ContractCall {
+                        contract_id: *MONEY_CONTRACT_ID,
+                        data: make_fee_call(u64::MAX - 5, 10),
+                    },
+                    parent_index: None,
+                    children_indexes: vec![],
+                },
+                DarkLeaf {
+                    data: ContractCall {
+                        contract_id: *MONEY_CONTRACT_ID,
+                        data: make_fee_call(100, 20),
+                    },
+                    parent_index: None,
+                    children_indexes: vec![],
+                },
+            ],
+            proofs: vec![],
+            signatures: vec![],
+        };
+        let mut block2 = make_empty_block(14);
+        block2.txs.push(multi_tx);
+        let compact2 = process_block(&block2).await.unwrap();
+        assert_eq!(compact2.txs[0].fee, u64::MAX);
     }
 }

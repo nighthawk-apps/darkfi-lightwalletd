@@ -13,7 +13,7 @@ async fn test_live_testnet_mining_omr() {
 
     // 2. Generate a new address for the recipient
     let output = Command::new("cargo")
-        .args(&["run", "-p", "drk", "--", "wallet", "address"])
+        .args(["run", "-p", "drk", "--", "wallet", "address"])
         .current_dir("../../") // We are in bin/darkfi-lightwalletd usually for tests
         .output()
         .await
@@ -27,7 +27,7 @@ async fn test_live_testnet_mining_omr() {
     // Using `drk wallet mine`
     println!("Mining testnet block...");
     let mut child = Command::new("cargo")
-        .args(&["run", "-p", "drk", "--", "wallet", "mine"])
+        .args(["run", "-p", "drk", "--", "wallet", "mine"])
         .current_dir("../../")
         .spawn()
         .expect("Failed to start mining");

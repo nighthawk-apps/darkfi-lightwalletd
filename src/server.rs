@@ -119,6 +119,8 @@ const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Process-wide cap on block-range streams. Extra requests wait, then fail.
 const MAX_BLOCK_RANGE_STREAMS: usize = 200;
 const BLOCK_RANGE_WAIT: Duration = Duration::from_secs(10);
+/// Process-wide cap on concurrent `SubscribeBlocks` streams.
+const MAX_SUBSCRIBE_STREAMS: usize = 512;
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 const MAX_PIR_STRIPES: usize = 8;
@@ -131,7 +133,7 @@ const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 /// One `FetchPirBatch` per limb. Matches `MAX_PIR_LIMBS` (4096) so a peer can
 /// pull every column of one compact block within the minute window.
 const PIR_RATE_LIMIT_PER_MIN: u32 = 4096;
-/// Max opaque recipient OMR metadata on SendTransaction.
+/// Max opaque recipient OMR metadata on SendTransaction / RegisterOmrClue.
 const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// Extra OMR clue hints on SendTransaction. DarkFi allows 20 calls per
 /// transaction; 64 leaves room for a few outputs per call and still stops
@@ -139,6 +141,10 @@ const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 const MAX_EXTRA_OMR_CLUES: usize = 64;
 /// Serialized UnifOMR clue public key (`n = 1024`: 4-byte header + 16 bytes × n).
 const CLUE_PUBLIC_KEY_WIRE_LEN: usize = 4 + 16 * 1024;
+/// Upper bound on `CluePublicKeyRegistration.clue_public_key` before signature verify.
+const MAX_CLUE_PUBLIC_KEY_BYTES: usize = 65_536;
+/// Upper bound on `CluePublicKeyRegistration.ownership_proof` before signature verify.
+const MAX_OWNERSHIP_PROOF_BYTES: usize = 4096;
 /// Compact-block wire version reported by GetLightInfo.
 /// Bump when the compact format or RPC contract changes.
 /// 2.1.0: compact DAO calls and Money `func_code` (token mint, auth-token history).
@@ -162,10 +168,27 @@ const MAX_CONTRACT_ID_CHARS: usize = 128;
 
 /// How long a SendTransaction peer binding remains valid for RegisterOmrClue (S12).
 const SEND_PEER_BIND_TTL: Duration = Duration::from_secs(86_400);
+/// Minimum interval between full-map GC scans of `recent_send_peers`.
+const SEND_PEER_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// Hard cap on `recent_send_peers` entries to prevent unbounded memory growth (M2).
 const MAX_SEND_PEER_ENTRIES: usize = 100_000;
 
+struct SendPeerTable {
+    entries: HashMap<[u8; 32], (IpAddr, Instant)>,
+    last_gc: Instant,
+}
+
+impl SendPeerTable {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_gc: Instant::now(),
+        }
+    }
+}
+
 /// Inclusive height span as `u64` so `end = u32::MAX` cannot wrap the cap.
+#[allow(clippy::result_large_err)]
 fn height_span(start: u32, end: u32) -> Result<u64, Status> {
     if start > end {
         return Err(Status::invalid_argument(format!(
@@ -176,6 +199,7 @@ fn height_span(start: u32, end: u32) -> Result<u64, Status> {
 }
 
 /// `end == 0` means "through the cached tip". Any other end is clamped to the tip.
+#[allow(clippy::result_large_err)]
 fn resolve_block_range(
     cache: &crate::cache::Cache,
     start: u32,
@@ -272,6 +296,7 @@ pub fn pad_block_range(start: u32, end: u32, tip: u32) -> (u32, u32) {
     (0, span_u.saturating_sub(1))
 }
 
+#[allow(clippy::result_large_err)]
 fn reject_oversized_window(start: u32, end: u32) -> Result<u64, Status> {
     let span = height_span(start, end)?;
     if span > MAX_BLOCKS_PER_REQUEST as u64 {
@@ -311,7 +336,7 @@ fn padded_range_rejection(start: u32, end: u32, tip: u32, max_range: u32) -> Opt
     // max(B_full / 2, MIN) where B_full is the full span rounded up.
     let full = span.max(MIN_PADDED_RANGE_SPAN as u64).next_power_of_two();
     let align = (full / 2).max(MIN_PADDED_RANGE_SPAN as u64);
-    if (start as u64) % align != 0 {
+    if !(start as u64).is_multiple_of(align) {
         return Some(format!(
             "range span {span} must be a power of two of at least {MIN_PADDED_RANGE_SPAN}, \
              or a bucket aligned to {align} that ends at the tip"
@@ -353,10 +378,10 @@ async fn send_stream<T: Send>(
     tx: &tokio::sync::mpsc::Sender<Result<T, Status>>,
     msg: Result<T, Status>,
 ) -> bool {
-    match tokio::time::timeout(STREAM_SEND_TIMEOUT, tx.send(msg)).await {
-        Ok(Ok(())) => true,
-        _ => false,
-    }
+    matches!(
+        tokio::time::timeout(STREAM_SEND_TIMEOUT, tx.send(msg)).await,
+        Ok(Ok(()))
+    )
 }
 
 fn spawn_compact_range<T, F>(
@@ -690,6 +715,9 @@ impl ClueWindowCache {
     }
 
     fn get(&self, start: u32, end: u32, end_hash: [u8; 32]) -> Option<Arc<FlattenedClueWindow>> {
+        if end_hash == [0u8; 32] {
+            return None;
+        }
         let hit = self.map.get(&(start, end))?;
         if hit.end_hash != end_hash {
             return None;
@@ -704,9 +732,12 @@ impl ClueWindowCache {
         end_hash: [u8; 32],
         window: Arc<FlattenedClueWindow>,
     ) {
+        if end_hash == [0u8; 32] {
+            return;
+        }
         let key = (start, end);
-        if self.map.contains_key(&key) {
-            self.map.insert(key, ClueWindowEntry { end_hash, window });
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.map.entry(key) {
+            entry.insert(ClueWindowEntry { end_hash, window });
             return;
         }
         while self.order.len() >= Self::CAP {
@@ -749,6 +780,9 @@ impl PirWindowCache {
     }
 
     fn get(&self, start: u32, end: u32, end_hash: [u8; 32]) -> Option<Arc<Vec<Vec<u8>>>> {
+        if end_hash == [0u8; 32] {
+            return None;
+        }
         let hit = self.map.get(&(start, end))?;
         if hit.end_hash != end_hash {
             return None;
@@ -757,9 +791,12 @@ impl PirWindowCache {
     }
 
     fn insert(&mut self, start: u32, end: u32, end_hash: [u8; 32], payloads: Arc<Vec<Vec<u8>>>) {
+        if end_hash == [0u8; 32] {
+            return;
+        }
         let key = (start, end);
-        if self.map.contains_key(&key) {
-            self.map.insert(key, PirWindowEntry { end_hash, payloads });
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.map.entry(key) {
+            entry.insert(PirWindowEntry { end_hash, payloads });
             return;
         }
         while self.order.len() >= Self::CAP {
@@ -807,6 +844,7 @@ fn encode_compact_block_for_pir(block: &CompactBlock) -> Vec<u8> {
 
 /// Sled → bincode → clue-stripped prost for `[start, end]`, one payload per height.
 #[cfg(feature = "fhe-omr")]
+#[allow(clippy::result_large_err)]
 fn load_pir_window_payloads(
     cache: &Cache,
     start: u32,
@@ -940,11 +978,11 @@ async fn load_tip_fact(
     cache: &Cache,
     fetch: &tokio::sync::Mutex<()>,
     rpc: &DarkfidRpcClient,
-    height: u32,
-    hash: [u8; 32],
+    tip: (u32, [u8; 32]),
     fact: TipFact,
     wait: Duration,
 ) -> TipFactValue {
+    let (height, hash) = tip;
     if let Some(hit) = tip_fact_hit(facts, height, hash, fact) {
         return hit;
     }
@@ -974,7 +1012,7 @@ async fn load_tip_fact(
             TipFactValue::BlockTarget(0)
         }
         TipFact::Difficulty => {
-            let difficulty = tokio::time::timeout(wait, rpc.get_difficulty())
+            let difficulty = tokio::time::timeout(wait, rpc.get_difficulty(height))
                 .await
                 .ok()
                 .and_then(Result::ok);
@@ -1006,8 +1044,7 @@ async fn block_target_from(
         cache,
         fetch,
         rpc,
-        height,
-        hash,
+        (height, hash),
         TipFact::BlockTarget,
         wait,
     )
@@ -1041,8 +1078,7 @@ pub struct LightWalletService {
     /// Max raw transaction bytes after envelope strip.
     max_tx_bytes: usize,
     /// Recent SendTransaction peers keyed by tx hash (S12 peer bind).
-    #[allow(clippy::type_complexity)]
-    recent_send_peers: Arc<Mutex<HashMap<[u8; 32], (IpAddr, Instant)>>>,
+    recent_send_peers: Arc<Mutex<SendPeerTable>>,
     /// Recently broadcast raw tx bytes held briefly while the tx is in darkfid's mempool.
     #[allow(clippy::type_complexity)]
     recent_mempool_txs: Arc<Mutex<HashMap<[u8; 32], (Vec<u8>, Instant)>>>,
@@ -1050,6 +1086,8 @@ pub struct LightWalletService {
     tip_notify: tokio::sync::watch::Receiver<u32>,
     /// In-flight block-range streams across every connection.
     block_range_permits: Arc<tokio::sync::Semaphore>,
+    /// Concurrent `SubscribeBlocks` streams across every connection.
+    subscribe_permits: Arc<tokio::sync::Semaphore>,
     /// Limits concurrent FHE digest/registration `spawn_blocking` workers.
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     fhe_permits: Arc<tokio::sync::Semaphore>,
@@ -1062,10 +1100,13 @@ pub struct LightWalletService {
     upload_deadline: Duration,
     /// TCP peers from which `X-Forwarded-For` is trusted (empty = ignore the header).
     trusted_proxies: Vec<String>,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     max_detection_key_bytes: usize,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     max_detection_keys_total_bytes: usize,
     max_send_peer_entries: usize,
     /// In-memory detection keys. Not persisted. Handles are never logged.
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     detection_pool: Arc<Mutex<DetectionKeyPool>>,
     /// Wakes tests observing SubscribeBlocks enqueue attempts.
     tip_notice: Arc<tokio::sync::Notify>,
@@ -1076,9 +1117,11 @@ pub struct LightWalletService {
     #[cfg(feature = "fhe-omr")]
     pir_windows: Arc<Mutex<PirWindowCache>>,
     /// Byte budget for in-flight detection-key uploads (one permit per byte).
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     upload_bytes: Arc<tokio::sync::Semaphore>,
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     upload_slots: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     max_uploads_per_ip: usize,
     /// In-flight FetchPirBatch count per IP.
     #[cfg(feature = "fhe-omr")]
@@ -1087,6 +1130,8 @@ pub struct LightWalletService {
     tip_facts: Arc<Mutex<Option<CachedTipFacts>>>,
     /// Serializes the fallback darkfid read when the poller has not stored facts yet.
     tip_fact_fetch: Arc<tokio::sync::Mutex<()>>,
+    /// Cached 32-byte directory attestation public key (derived once from sled secret).
+    directory_attest_pubkey: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl LightWalletService {
@@ -1111,6 +1156,7 @@ impl LightWalletService {
     }
 
     /// Create a service with custom rate limits and tx size cap.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_limits(
         cache: Arc<Cache>,
         rpc_client: Arc<DarkfidRpcClient>,
@@ -1122,6 +1168,10 @@ impl LightWalletService {
         tip_notify: tokio::sync::watch::Receiver<u32>,
         trusted_proxies: Vec<String>,
     ) -> Self {
+        let directory_attest_pubkey = std::sync::OnceLock::new();
+        if let Ok(pk) = cache.directory_attest_public_key() {
+            let _ = directory_attest_pubkey.set(pk);
+        }
         Self {
             cache,
             rpc_client,
@@ -1149,10 +1199,11 @@ impl LightWalletService {
                 Duration::from_secs(60),
             )),
             max_tx_bytes,
-            recent_send_peers: Arc::new(Mutex::new(HashMap::new())),
+            recent_send_peers: Arc::new(Mutex::new(SendPeerTable::new())),
             recent_mempool_txs: Arc::new(Mutex::new(HashMap::new())),
             tip_notify,
             block_range_permits: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCK_RANGE_STREAMS)),
+            subscribe_permits: Arc::new(tokio::sync::Semaphore::new(MAX_SUBSCRIBE_STREAMS)),
             fhe_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS)),
             pir_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_FHE_PERMITS.max(4))),
             #[cfg(feature = "fhe-omr")]
@@ -1178,6 +1229,7 @@ impl LightWalletService {
             pir_inflight: Arc::new(Mutex::new(HashMap::new())),
             tip_facts: Arc::new(Mutex::new(None)),
             tip_fact_fetch: Arc::new(tokio::sync::Mutex::new(())),
+            directory_attest_pubkey,
         }
     }
 
@@ -1250,33 +1302,70 @@ impl LightWalletService {
     }
 
     fn remember_send_peer(&self, tx_hash: [u8; 32], peer: IpAddr) {
-        if let Ok(mut map) = self.recent_send_peers.lock() {
+        if let Ok(mut table) = self.recent_send_peers.lock() {
             let now = Instant::now();
-            map.retain(|_, (_, t)| now.duration_since(*t) < SEND_PEER_BIND_TTL);
+            if now.duration_since(table.last_gc) >= SEND_PEER_GC_INTERVAL
+                || table.entries.len() >= self.max_send_peer_entries
+            {
+                table
+                    .entries
+                    .retain(|_, (_, t)| now.duration_since(*t) < SEND_PEER_BIND_TTL);
+                table.last_gc = now;
+            }
             // M2: hard-cap to prevent unbounded growth under sustained traffic.
-            if map.len() >= self.max_send_peer_entries {
+            if table.entries.len() >= self.max_send_peer_entries {
                 // Evict oldest entries to make room.
-                let mut entries: Vec<_> = map.iter().map(|(k, (_, t))| (*k, *t)).collect();
+                let mut entries: Vec<_> =
+                    table.entries.iter().map(|(k, (_, t))| (*k, *t)).collect();
                 entries.sort_by_key(|(_, t)| *t);
-                let evict_count = map.len().saturating_sub(self.max_send_peer_entries) + 1;
+                let evict_count = table
+                    .entries
+                    .len()
+                    .saturating_sub(self.max_send_peer_entries)
+                    + 1;
                 for (k, _) in entries.into_iter().take(evict_count) {
-                    map.remove(&k);
+                    table.entries.remove(&k);
                 }
             }
-            map.insert(tx_hash, (peer, now));
+            table.entries.insert(tx_hash, (peer, now));
         }
     }
 
     fn send_peer_matches(&self, tx_hash: &[u8; 32], peer: IpAddr) -> bool {
-        let Ok(mut map) = self.recent_send_peers.lock() else {
+        let Ok(mut table) = self.recent_send_peers.lock() else {
             return false;
         };
         let now = Instant::now();
-        map.retain(|_, (_, t)| now.duration_since(*t) < SEND_PEER_BIND_TTL);
-        match map.get(tx_hash) {
-            Some((bound, _)) => *bound == peer,
+        if now.duration_since(table.last_gc) >= SEND_PEER_GC_INTERVAL {
+            table
+                .entries
+                .retain(|_, (_, t)| now.duration_since(*t) < SEND_PEER_BIND_TTL);
+            table.last_gc = now;
+        }
+        match table.entries.get(tx_hash).copied() {
+            Some((bound, ts)) => {
+                if now.duration_since(ts) >= SEND_PEER_BIND_TTL {
+                    table.entries.remove(tx_hash);
+                    false
+                } else {
+                    bound == peer
+                }
+            }
             None => false,
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn directory_attest_pubkey(&self) -> Result<[u8; 32], Status> {
+        if let Some(&pk) = self.directory_attest_pubkey.get() {
+            return Ok(pk);
+        }
+        let pk = self
+            .cache
+            .directory_attest_public_key()
+            .map_err(cache_status)?;
+        let _ = self.directory_attest_pubkey.set(pk);
+        Ok(*self.directory_attest_pubkey.get().unwrap_or(&pk))
     }
 
     fn remember_mempool_tx(&self, tx_hash: [u8; 32], raw_tx: Vec<u8>) {
@@ -1327,6 +1416,7 @@ impl LightWalletService {
         Ok(false)
     }
 
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     #[allow(clippy::result_large_err)]
     fn check_omr_rate_limit(&self, peer: IpAddr, n: u32) -> Result<(), Status> {
         if self.omr_rate_limiter.check_n(peer, n.max(1)) {
@@ -1374,6 +1464,7 @@ impl LightWalletService {
 
     /// Wait up to 10s for a process-wide block-range slot. The permit must
     /// live until the stream task finishes.
+    #[allow(clippy::result_large_err)]
     async fn acquire_block_range(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
         let sem = Arc::clone(&self.block_range_permits);
         match tokio::time::timeout(BLOCK_RANGE_WAIT, sem.acquire_owned()).await {
@@ -1392,6 +1483,7 @@ impl LightWalletService {
     }
 
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    #[allow(clippy::result_large_err)]
     fn try_slot(
         slots: &Arc<Mutex<HashMap<IpAddr, usize>>>,
         peer: IpAddr,
@@ -1413,8 +1505,12 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     fn reserve_upload(&self, peer: IpAddr, num_keys: u32) -> Result<UploadReservation, Status> {
-        let declared = (num_keys as usize).saturating_mul(self.max_detection_key_bytes);
+        // Total buffered upload bytes are capped at `max_detection_keys_total_bytes`.
+        let declared = (num_keys as usize)
+            .saturating_mul(self.max_detection_key_bytes)
+            .min(self.max_detection_keys_total_bytes);
         let declared = u32::try_from(declared).map_err(|_| {
             Status::resource_exhausted("detection-key upload exceeds the byte budget")
         })?;
@@ -1441,6 +1537,7 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     async fn acquire_fhe_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
         match tokio::time::timeout(
             FHE_PERMIT_WAIT,
@@ -1455,6 +1552,7 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     async fn acquire_pir_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
         match tokio::time::timeout(
             FHE_PERMIT_WAIT,
@@ -1469,6 +1567,7 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     fn begin_pir(&self, peer: IpAddr) -> Result<SlotGuard, Status> {
         Self::try_slot(&self.pir_inflight, peer, MAX_PIR_INFLIGHT_PER_IP).map_err(|_| {
             Status::resource_exhausted(
@@ -1496,8 +1595,7 @@ impl LightWalletService {
             &self.cache,
             &self.tip_fact_fetch,
             &self.rpc_client,
-            height,
-            hash,
+            (height, hash),
             TipFact::Difficulty,
             Duration::from_secs(2),
         )
@@ -1538,6 +1636,37 @@ impl LightWalletService {
         }
     }
 
+    /// Store opaque recipient-encrypted OMR metadata; `true` if this call stored it.
+    ///
+    /// First-writer-wins — an existing metadata entry is never overwritten.
+    fn store_send_metadata_enc(
+        &self,
+        hash: &[u8; 32],
+        metadata_enc: Vec<u8>,
+        output_index: u32,
+    ) -> bool {
+        if self.cache.has_omr_metadata_enc(hash).unwrap_or(false) {
+            tracing::info!(
+                target: "lightwalletd::server",
+                "OMR metadata_enc already present for tx; first-writer-wins, not overwriting"
+            );
+            return false;
+        }
+        match self
+            .cache
+            .store_omr_metadata_enc(hash, metadata_enc, Some(output_index))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    target: "lightwalletd::server",
+                    "Failed to store OMR metadata_enc: {e}"
+                );
+                false
+            }
+        }
+    }
+
     /// Validate a sender-supplied UnifOMR clue (requires `fhe-omr`).
     fn validate_omr_clue(omr_clue: &[u8]) -> Result<(), String> {
         #[cfg(feature = "fhe-omr")]
@@ -1551,6 +1680,8 @@ impl LightWalletService {
         }
     }
 
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    #[allow(clippy::result_large_err)]
     fn pool_lock(&self) -> Result<std::sync::MutexGuard<'_, DetectionKeyPool>, Status> {
         self.detection_pool
             .lock()
@@ -1558,6 +1689,7 @@ impl LightWalletService {
     }
 
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     fn cached_flattened_clues(
         &self,
         start: u32,
@@ -1568,9 +1700,11 @@ impl LightWalletService {
             .get_block_hash(end)
             .map_err(cache_status)?
             .unwrap_or([0u8; 32]);
-        if let Ok(guard) = self.clue_windows.lock() {
-            if let Some(hit) = guard.get(start, end, end_hash) {
-                return Ok(hit);
+        if end_hash != [0u8; 32] {
+            if let Ok(guard) = self.clue_windows.lock() {
+                if let Some(hit) = guard.get(start, end, end_hash) {
+                    return Ok(hit);
+                }
             }
         }
         let notes = self
@@ -1587,8 +1721,10 @@ impl LightWalletService {
             slot_heights_wire,
             truncated,
         });
-        if let Ok(mut guard) = self.clue_windows.lock() {
-            guard.insert(start, end, end_hash, Arc::clone(&window));
+        if end_hash != [0u8; 32] {
+            if let Ok(mut guard) = self.clue_windows.lock() {
+                guard.insert(start, end, end_hash, Arc::clone(&window));
+            }
         }
         Ok(window)
     }
@@ -1598,6 +1734,7 @@ impl LightWalletService {
     /// Does not cache the ciphertext. The flattened clue list for `(start, eval_end)`
     /// is shared across handles via `Arc` without re-parsing or cloning clues.
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     async fn evaluate_detection_keys(
         &self,
         keys: Vec<Arc<Vec<u8>>>,
@@ -1657,6 +1794,7 @@ impl LightWalletService {
     /// Read a detection-key upload. `enforce_range` is false for registration,
     /// which ignores start/end; the digest window is `PoolDigestRequest`.
     #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
     async fn read_detection_key_upload(
         &self,
         mut stream: tonic::Streaming<proto::DetectionKeyChunk>,
@@ -1925,25 +2063,31 @@ impl DarkFiLightWallet for LightWalletService {
         heights.sort_unstable();
         heights.dedup();
 
-        // M6: Single-pass — collect all blocks first (fail early on missing),
-        // then stream the pre-fetched results. Avoids double sled I/O.
-        let mut blocks = Vec::with_capacity(heights.len());
-        for &h in &heights {
-            match self.cache.get_compact_block(h) {
-                Ok(Some(block)) => blocks.push(block),
-                Ok(None) => {
-                    return Err(Status::not_found(format!("Block not found at height {h}")));
+        // Acquire a block-range permit before running blocking sled reads, and
+        // hold it until streaming completes.
+        let permit = self.acquire_block_range().await?;
+        let cache = Arc::clone(&self.cache);
+        #[allow(clippy::result_large_err)]
+        let blocks = tokio::task::spawn_blocking(move || {
+            let mut blocks = Vec::with_capacity(heights.len());
+            for &h in &heights {
+                match cache.get_compact_block(h) {
+                    Ok(Some(block)) => blocks.push(block),
+                    Ok(None) => {
+                        return Err(Status::not_found(format!("Block not found at height {h}")));
+                    }
+                    Err(e) => return Err(cache_status(e)),
                 }
-                Err(e) => return Err(cache_status(e)),
             }
-        }
-
-        for w in blocks.windows(2) {
-            check_adjacent_pair(&w[0], &w[1])?;
-        }
+            for w in blocks.windows(2) {
+                check_adjacent_pair(&w[0], &w[1])?;
+            }
+            Ok::<Vec<CompactBlock>, Status>(blocks)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("block fetch worker join error: {e}")))??;
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let permit = self.acquire_block_range().await?;
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -2001,6 +2145,11 @@ impl DarkFiLightWallet for LightWalletService {
         request: Request<proto::Empty>,
     ) -> Result<Response<Self::SubscribeBlocksStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
+        let permit = Arc::clone(&self.subscribe_permits)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted("too many active SubscribeBlocks streams; retry later")
+            })?;
         let cache = Arc::clone(&self.cache);
         let rpc = Arc::clone(&self.rpc_client);
         let tip_facts = Arc::clone(&self.tip_facts);
@@ -2010,6 +2159,7 @@ impl DarkFiLightWallet for LightWalletService {
         let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_TIP_BUFFER);
 
         tokio::spawn(async move {
+            let _permit = permit;
             loop {
                 tokio::select! {
                     biased;
@@ -2170,14 +2320,14 @@ impl DarkFiLightWallet for LightWalletService {
             )));
         }
 
-        // Pre-compute tx hash so we can index the OMR clue before the block lands.
+        // Pre-compute tx hash so we can index OMR clues & metadata before the block lands.
         let tx_hash_for_clue = darkfi_serial::deserialize::<darkfi::tx::Transaction>(&tx_data)
             .ok()
             .map(|tx| *tx.hash().inner());
 
-        // S22: surface whether the attached clue was accepted (tx may still succeed).
-        let mut clue_accepted = false;
-        if !omr_clue.is_empty() {
+        // Validate primary clue, extra clues (even if primary is empty), and metadata up front.
+        let primary_clue_present = !omr_clue.is_empty();
+        if primary_clue_present {
             // S12: validate on SendTransaction the same as RegisterOmrClue.
             if let Err(e) = Self::validate_omr_clue(&omr_clue) {
                 tracing::warn!(
@@ -2185,58 +2335,104 @@ impl DarkFiLightWallet for LightWalletService {
                     "Rejecting OMR clue on SendTransaction: {e}"
                 );
                 omr_clue.clear();
-            } else if let Some(hash) = tx_hash_for_clue {
-                // Stored before broadcast: the tx can be mined (and the block
-                // indexed) before broadcast_tx returns.
+            }
+        }
+
+        let mut pending_extra_clues: Vec<(u32, Vec<u8>)> = Vec::new();
+        for extra in &req.extra_omr_clues {
+            if extra.omr_clue.is_empty() {
+                continue;
+            }
+            if let Err(e) = Self::validate_omr_clue(&extra.omr_clue) {
+                tracing::warn!(
+                    target: "lightwalletd::server",
+                    "Rejecting extra OMR clue on SendTransaction: {e}"
+                );
+                continue;
+            }
+            pending_extra_clues.push((extra.output_index, extra.omr_clue.clone()));
+        }
+
+        let mut pending_metadata_enc = if req.omr_metadata_enc.len() > MAX_OMR_METADATA_ENC_BYTES {
+            tracing::warn!(
+                target: "lightwalletd::server",
+                "Rejecting omr_metadata_enc: {} bytes (max {MAX_OMR_METADATA_ENC_BYTES})",
+                req.omr_metadata_enc.len()
+            );
+            Vec::new()
+        } else {
+            std::mem::take(&mut req.omr_metadata_enc)
+        };
+
+        // S22: surface whether the attached clue was accepted (tx may still succeed).
+        let mut clue_accepted = false;
+        let mut stored_clues_pre_broadcast = false;
+        let mut stored_metadata_pre_broadcast = false;
+
+        if let Some(hash) = tx_hash_for_clue {
+            // Stored before broadcast: the tx can be mined (and the block
+            // indexed) before broadcast_tx returns.
+            if !omr_clue.is_empty() {
                 clue_accepted = self.store_send_clue_hint(
                     &hash,
                     std::mem::take(&mut omr_clue),
                     req.omr_clue_output_index,
                 );
-                for extra in &req.extra_omr_clues {
-                    if extra.omr_clue.is_empty() {
-                        continue;
+                stored_clues_pre_broadcast |= clue_accepted;
+            }
+            for (idx, clue) in std::mem::take(&mut pending_extra_clues) {
+                if self.store_send_clue_hint(&hash, clue, idx) {
+                    stored_clues_pre_broadcast = true;
+                    if !primary_clue_present {
+                        clue_accepted = true;
                     }
-                    if let Err(e) = Self::validate_omr_clue(&extra.omr_clue) {
-                        tracing::warn!(
-                            target: "lightwalletd::server",
-                            "Rejecting extra OMR clue on SendTransaction: {e}"
-                        );
-                        continue;
-                    }
-                    let _ = self.store_send_clue_hint(
-                        &hash,
-                        extra.omr_clue.clone(),
-                        extra.output_index,
-                    );
                 }
+            }
+            if !pending_metadata_enc.is_empty() {
+                stored_metadata_pre_broadcast = self.store_send_metadata_enc(
+                    &hash,
+                    std::mem::take(&mut pending_metadata_enc),
+                    req.omr_clue_output_index,
+                );
             }
         }
 
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.rpc_client.broadcast_tx(&tx_data),
-        )
-        .await
+        let cleanup_pre_broadcast = |hash: &[u8; 32]| {
+            if stored_clues_pre_broadcast {
+                if let Err(e) = self.cache.remove_omr_clue_hint(hash) {
+                    tracing::warn!(
+                        target: "lightwalletd::server",
+                        "Failed to drop OMR clue hint for rejected tx: {e}"
+                    );
+                }
+            }
+            if stored_metadata_pre_broadcast {
+                if let Err(e) = self.cache.remove_omr_metadata_enc(hash) {
+                    tracing::warn!(
+                        target: "lightwalletd::server",
+                        "Failed to drop OMR metadata_enc for rejected tx: {e}"
+                    );
+                }
+            }
+        };
+
+        let broadcast_timeout = self.rpc_client.timeout();
+        match tokio::time::timeout(broadcast_timeout, self.rpc_client.broadcast_tx(&tx_data)).await
         {
             Ok(Ok(tx_hash)) => {
                 let confirmed = match self.confirm_tx_in_mempool_or_chain(&tx_hash).await {
                     Ok(found) => found,
                     Err(e) if e.is_connection() => {
-                        if clue_accepted {
-                            if let Some(hash) = tx_hash_for_clue {
-                                let _ = self.cache.remove_omr_clue_hint(&hash);
-                            }
+                        if let Some(hash) = tx_hash_for_clue {
+                            cleanup_pre_broadcast(&hash);
                         }
                         return Err(backend_unavailable());
                     }
                     Err(_) => false,
                 };
                 if !confirmed {
-                    if clue_accepted {
-                        if let Some(hash) = tx_hash_for_clue {
-                            let _ = self.cache.remove_omr_clue_hint(&hash);
-                        }
+                    if let Some(hash) = tx_hash_for_clue {
+                        cleanup_pre_broadcast(&hash);
                     }
                     return Ok(Response::new(proto::SendResponse {
                         tx_hash: Vec::new(),
@@ -2275,51 +2471,24 @@ impl DarkFiLightWallet for LightWalletService {
                     self.remember_send_peer(hash, peer);
                 }
 
-                // Validated clue whose hash only darkfid could tell us.
+                // Store any validated clues / metadata whose tx hash only darkfid could tell us
+                // (already taken above if `tx_hash_for_clue` was `Some`, so never stored twice).
                 if let Some(hash) = hash {
                     if !omr_clue.is_empty() {
                         clue_accepted =
                             self.store_send_clue_hint(&hash, omr_clue, req.omr_clue_output_index);
                     }
-                    for extra in &req.extra_omr_clues {
-                        if extra.omr_clue.is_empty() {
-                            continue;
+                    for (idx, clue) in pending_extra_clues {
+                        if self.store_send_clue_hint(&hash, clue, idx) && !primary_clue_present {
+                            clue_accepted = true;
                         }
-                        if Self::validate_omr_clue(&extra.omr_clue).is_err() {
-                            continue;
-                        }
-                        let _ = self.store_send_clue_hint(
-                            &hash,
-                            extra.omr_clue.clone(),
-                            extra.output_index,
-                        );
                     }
-                }
-
-                // Store recipient-encrypted OMR metadata (opaque to LWD).
-                if !req.omr_metadata_enc.is_empty() {
-                    if req.omr_metadata_enc.len() > MAX_OMR_METADATA_ENC_BYTES {
-                        tracing::warn!(
-                            target: "lightwalletd::server",
-                            "Rejecting omr_metadata_enc: {} bytes (max {MAX_OMR_METADATA_ENC_BYTES})",
-                            req.omr_metadata_enc.len()
-                        );
-                    } else if let Some(hash) = hash {
-                        if self.cache.has_omr_metadata_enc(&hash).unwrap_or(false) {
-                            tracing::info!(
-                                target: "lightwalletd::server",
-                                "OMR metadata_enc already present for tx; first-writer-wins, not overwriting"
-                            );
-                        } else if let Err(e) = self.cache.store_omr_metadata_enc(
+                    if !pending_metadata_enc.is_empty() {
+                        let _ = self.store_send_metadata_enc(
                             &hash,
-                            req.omr_metadata_enc,
-                            Some(req.omr_clue_output_index),
-                        ) {
-                            tracing::warn!(
-                                target: "lightwalletd::server",
-                                "Failed to store OMR metadata_enc: {e}"
-                            );
-                        }
+                            pending_metadata_enc,
+                            req.omr_clue_output_index,
+                        );
                     }
                 }
 
@@ -2334,16 +2503,9 @@ impl DarkFiLightWallet for LightWalletService {
                     target: "lightwalletd::server",
                     "Transaction broadcast failed: {e}"
                 );
-                // Rejected txs must not park clue hints for the full TTL.
-                if clue_accepted {
-                    if let Some(hash) = tx_hash_for_clue {
-                        if let Err(e) = self.cache.remove_omr_clue_hint(&hash) {
-                            tracing::warn!(
-                                target: "lightwalletd::server",
-                                "Failed to drop OMR clue hint for rejected tx: {e}"
-                            );
-                        }
-                    }
+                // Rejected txs must not park clue hints or metadata for the full TTL.
+                if let Some(hash) = tx_hash_for_clue {
+                    cleanup_pre_broadcast(&hash);
                 }
                 Ok(Response::new(proto::SendResponse {
                     tx_hash: Vec::new(),
@@ -2352,13 +2514,14 @@ impl DarkFiLightWallet for LightWalletService {
                 }))
             }
             Err(_elapsed) => {
+                let secs = broadcast_timeout.as_secs();
                 tracing::error!(
                     target: "lightwalletd::server",
-                    "Transaction broadcast timed out after 10 seconds"
+                    "Transaction broadcast timed out after {secs} seconds"
                 );
-                Err(Status::deadline_exceeded(
-                    "Transaction broadcast timeout after 10s",
-                ))
+                Err(Status::deadline_exceeded(format!(
+                    "Transaction broadcast timeout after {secs}s"
+                )))
             }
         }
     }
@@ -2431,6 +2594,7 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::BlockHeight>,
     ) -> Result<Response<proto::TreeState>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         let height = request.into_inner().height;
         let tip = self
             .cache
@@ -2454,8 +2618,8 @@ impl DarkFiLightWallet for LightWalletService {
                 ))),
                 None => {
                     if tip == 0 {
-                        // Nothing indexed yet: not a retained snapshot row.
-                        let tree = darkfi_sdk::crypto::MerkleTree::new(100);
+                        // Nothing indexed yet: match Cache::empty_tip_tree() sentinel leaf.
+                        let tree = Cache::empty_tip_tree();
                         let tree_data = darkfi_serial::serialize(&tree);
                         let state_root = blake3::hash(&tree_data).as_bytes().to_vec();
                         Ok(Response::new(proto::TreeState {
@@ -2502,6 +2666,7 @@ impl DarkFiLightWallet for LightWalletService {
     ) -> Result<Response<Self::GetCheckpointSnapshotStream>, Status> {
         self.check_rpc_rate_limit(&request)?;
         let preferred = request.into_inner().preferred_height;
+        let permit = self.acquire_block_range().await?;
         let found = if preferred == 0 {
             self.cache.latest_snapshot().map_err(cache_status)?
         } else {
@@ -2523,11 +2688,12 @@ impl DarkFiLightWallet for LightWalletService {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         tokio::spawn(async move {
+            let _permit = permit;
             const CHUNK_SIZE: usize = 1024 * 1024;
             let total_chunks = if tree_data.is_empty() {
                 1
             } else {
-                (tree_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE
+                tree_data.len().div_ceil(CHUNK_SIZE)
             };
 
             for i in 0..total_chunks {
@@ -2617,11 +2783,7 @@ impl DarkFiLightWallet for LightWalletService {
                 env!("CARGO_PKG_VERSION"),
                 option_env!("GIT_HASH").unwrap_or("unknown")
             ),
-            directory_attest_pubkey: self
-                .cache
-                .directory_attest_public_key()
-                .map_err(cache_status)?
-                .to_vec(),
+            directory_attest_pubkey: self.directory_attest_pubkey()?.to_vec(),
             proto_version: LIGHTWALLET_PROTO_VERSION.to_string(),
             tip_fetched_unix: self.cache.tip_fetched_unix().map_err(cache_status)?,
         }))
@@ -2634,8 +2796,9 @@ impl DarkFiLightWallet for LightWalletService {
     /// the experimental scheme.
     async fn get_omr_capabilities(
         &self,
-        _request: Request<proto::Empty>,
+        request: Request<proto::Empty>,
     ) -> Result<Response<proto::OmrCapabilities>, Status> {
+        self.check_rpc_rate_limit(&request)?;
         #[cfg(feature = "fhe-omr")]
         {
             Ok(Response::new(proto::OmrCapabilities {
@@ -2678,13 +2841,23 @@ impl DarkFiLightWallet for LightWalletService {
                 req.tx_hash.len()
             )));
         }
-        if req.omr_clue.is_empty() {
-            return Err(Status::invalid_argument("omr_clue cannot be empty"));
+        if req.omr_clue.is_empty() && req.omr_metadata_enc.is_empty() {
+            return Err(Status::invalid_argument(
+                "omr_clue and omr_metadata_enc cannot both be empty",
+            ));
+        }
+        if req.omr_metadata_enc.len() > MAX_OMR_METADATA_ENC_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "omr_metadata_enc too large: {} bytes (max {MAX_OMR_METADATA_ENC_BYTES})",
+                req.omr_metadata_enc.len()
+            )));
         }
 
         // Reject poison / oversized clues before they enter the sled hint cache (S12).
-        if let Err(e) = Self::validate_omr_clue(&req.omr_clue) {
-            return Err(Status::invalid_argument(format!("omr_clue rejected: {e}")));
+        if !req.omr_clue.is_empty() {
+            if let Err(e) = Self::validate_omr_clue(&req.omr_clue) {
+                return Err(Status::invalid_argument(format!("omr_clue rejected: {e}")));
+            }
         }
 
         let mut hash = [0u8; 32];
@@ -2701,23 +2874,43 @@ impl DarkFiLightWallet for LightWalletService {
             ));
         }
 
-        if self
-            .cache
-            .omr_clue_index_taken(&hash, req.omr_clue_output_index)
-            .unwrap_or(false)
-        {
-            // S3: first-writer-wins per output index — do not overwrite.
-            tracing::info!(
-                target: "lightwalletd::server",
-                "OMR clue already present for RegisterOmrClue output {}; first-writer-wins",
-                req.omr_clue_output_index
-            );
-            return Ok(Response::new(proto::Empty {}));
+        if !req.omr_clue.is_empty() {
+            if self
+                .cache
+                .omr_clue_index_taken(&hash, req.omr_clue_output_index)
+                .unwrap_or(false)
+            {
+                // S3: first-writer-wins per output index — do not overwrite.
+                tracing::info!(
+                    target: "lightwalletd::server",
+                    "OMR clue already present for RegisterOmrClue output {}; first-writer-wins",
+                    req.omr_clue_output_index
+                );
+            } else {
+                self.cache
+                    .store_omr_clue_hint(&hash, req.omr_clue, Some(req.omr_clue_output_index))
+                    .map_err(|e| Status::internal(format!("Failed to store OMR clue: {e}")))?;
+            }
         }
 
-        self.cache
-            .store_omr_clue_hint(&hash, req.omr_clue, Some(req.omr_clue_output_index))
-            .map_err(|e| Status::internal(format!("Failed to store OMR clue: {e}")))?;
+        if !req.omr_metadata_enc.is_empty() {
+            if self.cache.has_omr_metadata_enc(&hash).unwrap_or(false) {
+                tracing::info!(
+                    target: "lightwalletd::server",
+                    "OMR metadata_enc already present for RegisterOmrClue; first-writer-wins"
+                );
+            } else {
+                self.cache
+                    .store_omr_metadata_enc(
+                        &hash,
+                        req.omr_metadata_enc,
+                        Some(req.omr_clue_output_index),
+                    )
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to store OMR metadata_enc: {e}"))
+                    })?;
+            }
+        }
 
         Ok(Response::new(proto::Empty {}))
     }
@@ -2831,45 +3024,45 @@ impl DarkFiLightWallet for LightWalletService {
         &self,
         request: Request<proto::PoolDigestRequest>,
     ) -> Result<Response<proto::OmrDigestResponse>, Status> {
-        let peer = self.peer_ip(&request);
-        let req = request.into_inner();
-        if req.handle.len() != 32 {
-            return Err(Status::invalid_argument(
-                "detection key handle must be 32 bytes",
-            ));
-        }
-        let mut handle = [0u8; 32];
-        handle.copy_from_slice(&req.handle);
-        // Same OMR limiter as GetUnifOmrDigest. A miss still costs one credit
-        // so handle scanning cannot skip the limiter. Do not log the handle.
-        self.check_omr_rate_limit(peer, 1)?;
-        let pooled = {
-            let mut pool = self.pool_lock()?;
-            pool.lookup(&handle, detection_pool::unix_now())
-        };
-        let Some(pooled) = pooled else {
-            return Err(Status::not_found(
-                "detection key handle not found or expired",
-            ));
-        };
-        if pooled.network_byte != self.network_byte {
-            return Err(Status::invalid_argument(
-                "detection key network does not match this server",
-            ));
-        }
-        let extra = (pooled.keys.len() as u32).saturating_sub(1);
-        if extra > 0 {
-            self.check_omr_rate_limit(peer, extra)?;
-        }
         #[cfg(not(feature = "fhe-omr"))]
         {
-            let _ = (pooled, req);
+            let _ = request;
             return Err(Status::unimplemented(
                 "UnifOMR requires the fhe-omr feature",
             ));
         }
         #[cfg(feature = "fhe-omr")]
         {
+            let peer = self.peer_ip(&request);
+            let req = request.into_inner();
+            if req.handle.len() != 32 {
+                return Err(Status::invalid_argument(
+                    "detection key handle must be 32 bytes",
+                ));
+            }
+            let mut handle = [0u8; 32];
+            handle.copy_from_slice(&req.handle);
+            // Same OMR limiter as GetUnifOmrDigest. A miss still costs one credit
+            // so handle scanning cannot skip the limiter. Do not log the handle.
+            self.check_omr_rate_limit(peer, 1)?;
+            let pooled = {
+                let mut pool = self.pool_lock()?;
+                pool.lookup(&handle, detection_pool::unix_now())
+            };
+            let Some(pooled) = pooled else {
+                return Err(Status::not_found(
+                    "detection key handle not found or expired",
+                ));
+            };
+            if pooled.network_byte != self.network_byte {
+                return Err(Status::invalid_argument(
+                    "detection key network does not match this server",
+                ));
+            }
+            let extra = (pooled.keys.len() as u32).saturating_sub(1);
+            if extra > 0 {
+                self.check_omr_rate_limit(peer, extra)?;
+            }
             let permit = self.acquire_fhe_permit().await?;
             let response = self
                 .evaluate_detection_keys(pooled.keys, req.start_height, req.end_height, permit)
@@ -3001,8 +3194,20 @@ impl DarkFiLightWallet for LightWalletService {
         if req.clue_public_key.is_empty() {
             return Err(Status::invalid_argument("clue_public_key required"));
         }
+        if req.clue_public_key.len() > MAX_CLUE_PUBLIC_KEY_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "clue_public_key too large: {} bytes (max {MAX_CLUE_PUBLIC_KEY_BYTES})",
+                req.clue_public_key.len()
+            )));
+        }
         if req.ownership_proof.is_empty() {
             return Err(Status::invalid_argument("ownership_proof required"));
+        }
+        if req.ownership_proof.len() > MAX_OWNERSHIP_PROOF_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "ownership_proof too large: {} bytes (max {MAX_OWNERSHIP_PROOF_BYTES})",
+                req.ownership_proof.len()
+            )));
         }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&req.payment_pubkey);
@@ -3029,7 +3234,14 @@ impl DarkFiLightWallet for LightWalletService {
                 req.key_version,
                 &req.ownership_proof,
             )
-            .map_err(|e| Status::invalid_argument(format!("Failed to store clue pk: {e}")))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("registry is full") {
+                    Status::resource_exhausted("clue public key registry is full")
+                } else {
+                    Status::invalid_argument(format!("Failed to store clue pk: {e}"))
+                }
+            })?;
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -3130,13 +3342,13 @@ mod tests {
     #[cfg(not(feature = "fhe-omr"))]
     #[test]
     fn trial_decrypt_is_the_default_build() {
-        assert!(!cfg!(feature = "fhe-omr"));
+        const { assert!(!cfg!(feature = "fhe-omr")) };
     }
 
     #[cfg(feature = "fhe-omr")]
     #[test]
     fn unifomr_stays_behind_an_explicit_feature() {
-        assert!(cfg!(feature = "fhe-omr"));
+        const { assert!(cfg!(feature = "fhe-omr")) };
     }
 
     #[test]
@@ -3485,6 +3697,7 @@ mod tests {
         assert_eq!(missing.code(), tonic::Code::NotFound);
     }
 
+    #[cfg(feature = "fhe-omr")]
     #[tokio::test]
     async fn pool_digest_missing_and_expired_handles_are_not_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -3918,5 +4131,270 @@ mod tests {
             .into_inner();
         assert!(!send_resp.error.is_empty());
         assert!(send_resp.tx_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_tree_state_and_omr_capabilities_enforce_rpc_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let endpoint = url::Url::parse("http://127.0.0.1:9").unwrap();
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(endpoint));
+        // Allow only 2 RPC calls per minute per peer.
+        let svc = LightWalletService::with_limits(
+            cache,
+            rpc,
+            "test".into(),
+            0x01,
+            10,
+            2,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+
+        let state =
+            DarkFiLightWallet::get_tree_state(&svc, Request::new(proto::BlockHeight { height: 0 }))
+                .await
+                .unwrap()
+                .into_inner();
+        // Empty tip fallback must match Cache::empty_tip_tree() sentinel leaf.
+        assert_eq!(
+            state.tree_data,
+            darkfi_serial::serialize(&Cache::empty_tip_tree())
+        );
+
+        let _caps = DarkFiLightWallet::get_omr_capabilities(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap();
+
+        // 3rd call from the same peer must be rate-limited on both endpoints.
+        let err_tree =
+            DarkFiLightWallet::get_tree_state(&svc, Request::new(proto::BlockHeight { height: 0 }))
+                .await
+                .unwrap_err();
+        assert_eq!(err_tree.code(), tonic::Code::ResourceExhausted);
+
+        let err_caps = DarkFiLightWallet::get_omr_capabilities(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err_caps.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[cfg(not(feature = "fhe-omr"))]
+    #[tokio::test]
+    async fn pool_digest_returns_unimplemented_without_fhe_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (svc, _) = test_service(cache);
+        let err = DarkFiLightWallet::get_unif_omr_digest_from_pool(
+            &svc,
+            Request::new(proto::PoolDigestRequest {
+                handle: vec![1, 2, 3],
+                start_height: 0,
+                end_height: 10,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn subscribe_blocks_enforces_dedicated_semaphore_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (mut svc, _) = test_service(cache);
+        svc.subscribe_permits = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let s1 = DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap();
+        let _s2 = DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap();
+        let err = DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        // Dropping an active stream frees a slot once its task observes tx.closed().
+        drop(s1);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            DarkFiLightWallet::subscribe_blocks(&svc, Request::new(proto::Empty {}))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn register_omr_clue_wires_and_bounds_metadata_enc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let (svc, _) = test_service(Arc::clone(&cache));
+        let tx_hash = [0x55u8; 32];
+        let peer = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        svc.remember_send_peer(tx_hash, peer);
+
+        // Oversized metadata is rejected before storage.
+        let too_big = DarkFiLightWallet::register_omr_clue(
+            &svc,
+            Request::new(proto::OmrClueRegistration {
+                tx_hash: tx_hash.to_vec(),
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: vec![0xAB; MAX_OMR_METADATA_ENC_BYTES + 1],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(too_big.code(), tonic::Code::InvalidArgument);
+
+        // Valid metadata-only registration succeeds for bound peer.
+        let memo = b"encrypted-memo".to_vec();
+        DarkFiLightWallet::register_omr_clue(
+            &svc,
+            Request::new(proto::OmrClueRegistration {
+                tx_hash: tx_hash.to_vec(),
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: memo.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(cache.has_omr_metadata_enc(&tx_hash).unwrap());
+    }
+
+    #[tokio::test]
+    async fn send_transaction_cleans_up_pre_broadcast_metadata_on_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let tx = darkfi::tx::Transaction {
+            calls: vec![],
+            proofs: vec![],
+            signatures: vec![],
+        };
+        let tx_hash = *tx.hash().inner();
+        let raw_tx = darkfi_serial::serialize(&tx);
+        let url_str = spawn_mock_darkfid(false, hex::encode(tx_hash)).await;
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(
+            url::Url::parse(&url_str).unwrap(),
+        ));
+        let svc = LightWalletService::with_limits(
+            Arc::clone(&cache),
+            rpc,
+            "test".into(),
+            0x01,
+            10_000,
+            10_000,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+
+        let resp = DarkFiLightWallet::send_transaction(
+            &svc,
+            Request::new(proto::RawTransaction {
+                data: raw_tx,
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: b"memo-for-rejected-tx".to_vec(),
+                extra_omr_clues: vec![],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!resp.error.is_empty());
+        assert!(
+            !cache.has_omr_metadata_enc(&tx_hash).unwrap(),
+            "rejected tx must not retain pre-broadcast metadata_enc"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_clue_public_key_enforces_payload_and_entry_caps() {
+        use darkfi::util::pcg::Pcg32;
+        use darkfi_sdk::crypto::Keypair;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        cache.set_max_clue_pubkey_entries(1);
+        let (svc, _) = test_service(Arc::clone(&cache));
+
+        let kp1 = Keypair::random(&mut Pcg32::new(1));
+        let pk1 = kp1.public.to_bytes();
+
+        // Oversized clue_public_key rejected before ownership verification.
+        let err_pk = DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: vec![0xAA; MAX_CLUE_PUBLIC_KEY_BYTES + 1],
+                ownership_proof: vec![0xBB; 64],
+                key_version: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_pk.code(), tonic::Code::InvalidArgument);
+
+        // Oversized ownership_proof rejected before ownership verification.
+        let err_proof = DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: vec![0xAA; 32],
+                ownership_proof: vec![0xBB; MAX_OWNERSHIP_PROOF_BYTES + 1],
+                key_version: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_proof.code(), tonic::Code::InvalidArgument);
+
+        // Entry cap enforced (using valid key bytes when fhe-omr is enabled).
+        #[cfg(feature = "fhe-omr")]
+        let clue_bytes = {
+            let (_, cpk) = crate::unifomr::clue_keypair_from_wallet(&[0x11u8; 32], 0x01).unwrap();
+            crate::unifomr::serialize_public_key(&cpk)
+        };
+        #[cfg(not(feature = "fhe-omr"))]
+        let clue_bytes = vec![0xCCu8; 32];
+
+        let proof1 =
+            crate::clue_ownership::sign_clue_pk_ownership(&kp1.secret, 0x01, 1, &pk1, &clue_bytes);
+        DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk1.to_vec(),
+                clue_public_key: clue_bytes.clone(),
+                ownership_proof: proof1,
+                key_version: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let kp2 = Keypair::random(&mut Pcg32::new(2));
+        let pk2 = kp2.public.to_bytes();
+        let proof2 =
+            crate::clue_ownership::sign_clue_pk_ownership(&kp2.secret, 0x01, 1, &pk2, &clue_bytes);
+        let full = DarkFiLightWallet::register_clue_public_key(
+            &svc,
+            Request::new(proto::CluePublicKeyRegistration {
+                payment_pubkey: pk2.to_vec(),
+                clue_public_key: clue_bytes,
+                ownership_proof: proof2,
+                key_version: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(full.code(), tonic::Code::ResourceExhausted);
     }
 }

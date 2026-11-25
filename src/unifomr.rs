@@ -1117,15 +1117,17 @@ pub fn pack_slot_heights(slot_heights: &[u32]) -> Vec<u8> {
 
 /// Parse a packed little-endian `u32` slot → height map.
 pub fn unpack_slot_heights(bytes: &[u8]) -> Result<Vec<u32>, String> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "slot_heights length {} not a multiple of 4",
             bytes.len()
         ));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 
@@ -1324,7 +1326,7 @@ mod tests {
         assert_eq!(chunk_count, 1);
         let mut off = 5usize;
         let t = client.params.plaintext();
-        for bit in 0..CLUE_PLAINTEXT_BITS {
+        for (bit, &expected_err) in err.iter().enumerate().take(CLUE_PLAINTEXT_BITS) {
             let len = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
             let ct = Ciphertext::from_bytes(&digest[off..off + len], &client.params).unwrap();
@@ -1344,7 +1346,7 @@ mod tests {
                 raw as i64
             };
             assert_eq!(
-                centered, err[bit],
+                centered, expected_err,
                 "digest slot bit {bit} disagrees with direct partial decrypt"
             );
         }
@@ -1401,7 +1403,7 @@ mod tests {
         // Height 1 fills all but the last 15 slots; height 2 straddles the cap
         // so it is dropped whole, leaving only height 1.
         let mut slot_heights = vec![1u32; MAX_OMR_MESSAGES - 5];
-        slot_heights.extend(std::iter::repeat(2u32).take(15));
+        slot_heights.extend(std::iter::repeat_n(2u32, 15));
         assert_eq!(slot_heights.len(), n);
         let truncated = cap_messages_to_whole_heights(&mut messages, &mut slot_heights);
         assert!(truncated, "over-cap window must truncate");
@@ -1464,8 +1466,8 @@ mod tests {
             let chunk_count = u32::from_le_bytes(digest[1..5].try_into().unwrap()) as usize;
             assert_eq!(chunk_count, 1);
             let mut off = 5usize;
-            let mut bit_in_range = vec![[false; CLUE_PLAINTEXT_BITS]; degree];
-            for bit in 0..CLUE_PLAINTEXT_BITS {
+            let mut bit_in_range = vec![vec![false; degree]; CLUE_PLAINTEXT_BITS];
+            for bit_flags in &mut bit_in_range {
                 let len = u32::from_le_bytes(digest[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
                 let ct =
@@ -1481,13 +1483,13 @@ mod tests {
                     };
                     if centered.unsigned_abs() <= R_PRIME {
                         per_coeff_hits += 1;
-                        bit_in_range[i][bit] = true;
+                        bit_flags[i] = true;
                     }
                 }
             }
-            for flags in &bit_in_range {
+            for i in 0..degree {
                 total += 1;
-                if flags.iter().all(|&x| x) {
+                if bit_in_range.iter().all(|bit_flags| bit_flags[i]) {
                     fp += 1;
                 }
             }

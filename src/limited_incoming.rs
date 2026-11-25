@@ -118,12 +118,10 @@ impl futures::Stream for LimitedTcpIncoming {
                 AcceptState::Idle => {
                     let permits = Arc::clone(&this.permits);
                     this.accept_state = AcceptState::WaitingPermit(Box::pin(async move {
-                        permits.acquire_owned().await.map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "connection limiter closed",
-                            )
-                        })
+                        permits
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| std::io::Error::other("connection limiter closed"))
                     }));
                 }
                 AcceptState::WaitingPermit(_) => {

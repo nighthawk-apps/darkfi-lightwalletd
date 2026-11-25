@@ -185,7 +185,7 @@ impl ChainPoller {
                 return;
             }
         };
-        let difficulty = match self.rpc_client.get_difficulty().await {
+        let difficulty = match self.rpc_client.get_difficulty(height).await {
             Ok(difficulty) => difficulty,
             Err(e) => {
                 warn!(
@@ -301,7 +301,7 @@ impl ChainPoller {
                 target: "lightwalletd::chain_poller",
                 "Sleeping {sleep_secs}s before next poll"
             );
-            smol::Timer::after(Duration::from_secs(sleep_secs)).await;
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
     }
 
@@ -346,8 +346,13 @@ impl ChainPoller {
             Some((h, _)) if h == remote_height => Some(remote_hash_bytes),
             Some((h, _)) => match self.rpc_client.get_block(h).await {
                 Ok(block) => Some(*block.hash().inner()),
-                // zcash/lightwalletd BlockIngestor: a failed getblock is
-                // retried. It is not evidence of a fork.
+                // When darkfid is behind our cached tip (IBD or shorter-chain reorg),
+                // `-32121` ("Did not find block height") means darkfid does not have `h`,
+                // not a transport failure. Let `classify_tips(..., None)` decide between
+                // holding for catchup vs rewinding a shorter fork.
+                Err(ref e) if remote_height < h && is_missing_block_height_error(e) => None,
+                // zcash/lightwalletd BlockIngestor: transport/timeout/unexpected
+                // getblock errors are retried. They are not evidence of a fork.
                 Err(e) => {
                     warn!(
                         target: "lightwalletd::chain_poller",
@@ -482,6 +487,18 @@ impl ChainPoller {
     }
 }
 
+fn is_missing_block_height_error(err: &crate::error::LightWalletError) -> bool {
+    if err.is_not_found() {
+        return true;
+    }
+    match err {
+        crate::error::LightWalletError::RpcError(msg) => {
+            msg.contains("-32121") || msg.contains("Did not find block height")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +570,223 @@ mod tests {
     fn classify_in_sync() {
         let action = classify_tips(Some((10, h(1))), 10, h(1), Some(h(1)), Some(h(1)));
         assert_eq!(action, TipAction::Idle);
+    }
+
+    fn make_mock_block_info(height: u32, prev: [u8; 32], ts: u64) -> darkfi::blockchain::BlockInfo {
+        use darkfi::blockchain::{BlockInfo, Header, HeaderHash};
+        use darkfi::util::time::Timestamp;
+        use darkfi_sdk::crypto::schnorr::Signature;
+        BlockInfo {
+            header: Header::new(HeaderHash::new(prev), height, 0, Timestamp::from_u64(ts)),
+            txs: vec![],
+            signature: Signature::dummy(),
+        }
+    }
+
+    async fn spawn_mock_poller_darkfid(
+        remote_tip: (u32, String),
+        blocks: std::collections::HashMap<u32, Option<String>>,
+        drop_get_block_height: Option<u32>,
+    ) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let remote_tip = remote_tip.clone();
+                let blocks = blocks.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut reader = BufReader::new(r);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let parsed: tinyjson::JsonValue = line.parse().unwrap();
+                    let obj = parsed
+                        .get::<std::collections::HashMap<String, tinyjson::JsonValue>>()
+                        .unwrap();
+                    let method = obj
+                        .get("method")
+                        .and_then(|v| v.get::<String>())
+                        .cloned()
+                        .unwrap_or_default();
+                    let id = obj
+                        .get("id")
+                        .and_then(|v| v.get::<f64>())
+                        .copied()
+                        .unwrap_or(1.0) as i64;
+                    let resp = match method.as_str() {
+                        "blockchain.last_confirmed_block" => {
+                            format!(
+                                r#"{{"jsonrpc":"2.0","result":[{},"{}"],"id":{id}}}"#,
+                                remote_tip.0, remote_tip.1
+                            ) + "\n"
+                        }
+                        "blockchain.get_block" => {
+                            let req_h = obj
+                                .get("params")
+                                .and_then(|v| v.get::<Vec<tinyjson::JsonValue>>())
+                                .and_then(|p| p.first())
+                                .and_then(|v| v.get::<f64>())
+                                .copied()
+                                .unwrap_or(0.0) as u32;
+                            if drop_get_block_height == Some(req_h) {
+                                // Simulate transport drop without response.
+                                return;
+                            }
+                            match blocks.get(&req_h) {
+                                Some(Some(b64)) => {
+                                    format!(r#"{{"jsonrpc":"2.0","result":"{b64}","id":{id}}}"#)
+                                        + "\n"
+                                }
+                                _ => {
+                                    format!(
+                                        r#"{{"jsonrpc":"2.0","error":{{"code":-32121,"message":"Did not find block height"}},"id":{id}}}"#
+                                    ) + "\n"
+                                }
+                            }
+                        }
+                        "blockchain.block_target" => {
+                            format!(r#"{{"jsonrpc":"2.0","result":20,"id":{id}}}"#) + "\n"
+                        }
+                        "blockchain.get_difficulty" => {
+                            format!(r#"{{"jsonrpc":"2.0","result":[100,200],"id":{id}}}"#) + "\n"
+                        }
+                        _ => format!(r#"{{"jsonrpc":"2.0","result":null,"id":{id}}}"#) + "\n",
+                    };
+                    let _ = w.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("tcp://{addr}")
+    }
+
+    #[tokio::test]
+    async fn poll_once_holds_cache_during_ibd_on_32121() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+
+        // Populate cache heights 0..=4 on chain A.
+        let mut prev = [0u8; 32];
+        let mut chain_a_hashes = Vec::new();
+        for height in 0..=4u32 {
+            let blk = make_mock_block_info(height, prev, 1000 + height as u64);
+            let compact = block_processor::process_block(&blk).await.unwrap();
+            prev = compact.hash;
+            chain_a_hashes.push(compact.hash);
+            cache.insert_compact_block(&compact).unwrap();
+        }
+
+        // Backend is at height 2 with the SAME hash (IBD catchup), and returns -32121 for height 4.
+        let remote_hash_hex = blake3::Hash::from(chain_a_hashes[2]).to_hex().to_string();
+        let url_str =
+            spawn_mock_poller_darkfid((2, remote_hash_hex), Default::default(), None).await;
+        let (tip_tx, _) = tokio::sync::watch::channel(4u32);
+        let poller = ChainPoller::new(
+            Arc::new(DarkfidRpcClient::new_simple(
+                url::Url::parse(&url_str).unwrap(),
+            )),
+            Arc::clone(&cache),
+            ChainPollerConfig::default(),
+            tip_tx,
+        );
+
+        let processed = poller.poll_once().await.unwrap();
+        assert_eq!(processed, 0);
+        // Cache tip must remain held at height 4 (not rewound or wedged).
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, 4);
+    }
+
+    #[tokio::test]
+    async fn poll_once_rewinds_shorter_chain_reorg_on_32121() {
+        use darkfi::util::encoding::base64;
+        use darkfi_serial::serialize_async;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+
+        // Populate cache heights 0..=4 on chain A.
+        let mut prev = [0u8; 32];
+        let mut chain_a_blocks = Vec::new();
+        for height in 0..=4u32 {
+            let blk = make_mock_block_info(height, prev, 1000 + height as u64);
+            let compact = block_processor::process_block(&blk).await.unwrap();
+            prev = compact.hash;
+            chain_a_blocks.push(blk);
+            cache.insert_compact_block(&compact).unwrap();
+        }
+
+        // Fork at height 2: backend has chain A for 0..=1, and a different block at height 2 (tip=2 < 4).
+        let fork_b2 = make_mock_block_info(2, *chain_a_blocks[1].hash().inner(), 9999);
+        let fork_b2_hash_hex = blake3::Hash::from(*fork_b2.hash().inner())
+            .to_hex()
+            .to_string();
+
+        let mut remote_blocks = std::collections::HashMap::new();
+        remote_blocks.insert(
+            0,
+            Some(base64::encode(&serialize_async(&chain_a_blocks[0]).await).to_string()),
+        );
+        remote_blocks.insert(
+            1,
+            Some(base64::encode(&serialize_async(&chain_a_blocks[1]).await).to_string()),
+        );
+        remote_blocks.insert(
+            2,
+            Some(base64::encode(&serialize_async(&fork_b2).await).to_string()),
+        );
+
+        let url_str = spawn_mock_poller_darkfid((2, fork_b2_hash_hex), remote_blocks, None).await;
+        let (tip_tx, _) = tokio::sync::watch::channel(4u32);
+        let poller = ChainPoller::new(
+            Arc::new(DarkfidRpcClient::new_simple(
+                url::Url::parse(&url_str).unwrap(),
+            )),
+            Arc::clone(&cache),
+            ChainPollerConfig::default(),
+            tip_tx,
+        );
+
+        let processed = poller.poll_once().await.unwrap();
+        assert_eq!(processed, 0);
+        // Must rewind to common ancestor height 1.
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, 1);
+        assert!(cache.get_compact_block(2).unwrap().is_none());
+        assert!(cache.get_compact_block(4).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_transport_error_as_err_when_remote_shorter() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+
+        let mut prev = [0u8; 32];
+        let mut chain_a_hashes = Vec::new();
+        for height in 0..=4u32 {
+            let blk = make_mock_block_info(height, prev, 1000 + height as u64);
+            let compact = block_processor::process_block(&blk).await.unwrap();
+            prev = compact.hash;
+            chain_a_hashes.push(compact.hash);
+            cache.insert_compact_block(&compact).unwrap();
+        }
+
+        // Backend drops connection when asked for height 4 -> must error, NOT treat as None.
+        let remote_hash_hex = blake3::Hash::from(chain_a_hashes[2]).to_hex().to_string();
+        let url_str =
+            spawn_mock_poller_darkfid((2, remote_hash_hex), Default::default(), Some(4)).await;
+        let (tip_tx, _) = tokio::sync::watch::channel(4u32);
+        let poller = ChainPoller::new(
+            Arc::new(DarkfidRpcClient::new_simple(
+                url::Url::parse(&url_str).unwrap(),
+            )),
+            Arc::clone(&cache),
+            ChainPollerConfig::default(),
+            tip_tx,
+        );
+
+        let err = poller.poll_once().await.unwrap_err();
+        assert!(err.is_connection(), "expected connection error, got {err}");
+        assert_eq!(cache.get_tip().unwrap().unwrap().0, 4);
     }
 }

@@ -56,6 +56,7 @@ pub mod server;
 #[cfg(feature = "fhe-omr")]
 pub mod unifomr;
 /// Generated protobuf types
+#[allow(clippy::result_large_err)]
 pub mod proto {
     // This will be populated by tonic-build or a checked-in generated file.
     // For now, we include a stub module.

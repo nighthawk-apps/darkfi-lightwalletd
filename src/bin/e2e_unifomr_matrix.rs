@@ -115,6 +115,7 @@ async fn lookup(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expect_registered_clue(
     found: bool,
     clue_pk: &[u8],
@@ -176,6 +177,7 @@ fn expect_registered_clue(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expect_decoy_no_leak(
     found: bool,
     clue_pk: &[u8],

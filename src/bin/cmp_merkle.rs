@@ -204,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&coin);
                 let Some(node) = MerkleNode::from_bytes(arr) else {
-                    println!("bad coin at height {h}: {}", hex::encode(&arr));
+                    println!("bad coin at height {h}: {}", hex::encode(arr));
                     continue;
                 };
                 tree.append(node);
