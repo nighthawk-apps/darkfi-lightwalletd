@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.14.** Hardens HTTP/2 multi-header `X-Forwarded-For` peer extraction behind trusted proxies, adds atomic capacity enforcement (`100,000` entries) and decoy `key_version` coverage for clue keys, clarifies `func_code = 0` (`FeeV1`) semantics, adds `cargo-deny` CI gating (`deny.toml`), adds saturating poller backoff, lock-free 60s `lightwalletd::metrics` logging, and [docs/OPERATIONS.md](docs/OPERATIONS.md). Aligns with Nighthawk Android/iOS 3.01.21, desktop 3.1.21, and Moonshine 3.1.21. DarkFi pin for wallets is `b87318e80`.
+**0.3.15.** Keeps a payment clue when confirmation loses the connection after a successful broadcast, and caps encrypted metadata at 100,000 rows. Aligns with Nighthawk Android/iOS 3.01.23, desktop 3.1.23, and Moonshine 3.1.23. DarkFi pin for wallets is `b87318e80`.
 
 ## Contents
 

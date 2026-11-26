@@ -69,6 +69,11 @@ pub type CluePublicKeyEntry = (u64, Vec<u8>, Vec<u8>);
 /// Hard cap on registered entries in `omr_clue_pubkeys` to bound sled disk growth.
 pub const MAX_CLUE_PUBKEY_ENTRIES: usize = 100_000;
 
+/// Hard cap on pending `omr_metadata_enc` rows. Same order as
+/// [`MAX_CLUE_PUBKEY_ENTRIES`]. A new tx hash is refused when the registry is
+/// full; an existing hash may still be replaced.
+pub const MAX_OMR_METADATA_ENC_ENTRIES: usize = 100_000;
+
 /// On-disk cache layout version. Bump when compact-block bincode or tree
 /// names change incompatibly. Missing key is treated as a pre-versioned
 /// store and stamped in place (no wipe). A mismatch clears derived block
@@ -157,6 +162,10 @@ pub struct Cache {
     clue_pubkey_count: AtomicUsize,
     /// Maximum number of distinct payment pubkeys permitted in `omr_clue_pubkeys`.
     max_clue_pubkey_entries: AtomicUsize,
+    /// Approximate live entry count in `omr_metadata_enc`.
+    omr_metadata_enc_count: AtomicUsize,
+    /// Maximum number of distinct tx hashes permitted in `omr_metadata_enc`.
+    max_omr_metadata_enc_entries: AtomicUsize,
 }
 
 impl Cache {
@@ -203,6 +212,8 @@ impl Cache {
             omr_hint_sweep_unix: AtomicU64::new(0),
             clue_pubkey_count: AtomicUsize::new(0),
             max_clue_pubkey_entries: AtomicUsize::new(MAX_CLUE_PUBKEY_ENTRIES),
+            omr_metadata_enc_count: AtomicUsize::new(0),
+            max_omr_metadata_enc_entries: AtomicUsize::new(MAX_OMR_METADATA_ENC_ENTRIES),
         };
         cache.retire_obsolete_names()?;
         cache
@@ -217,7 +228,12 @@ impl Cache {
         cache.index_existing_tip_snapshot()?;
         // Restart must append to the persisted tip, not an empty sentinel.
         cache.load_live_tip_from_disk()?;
+        // Count ciphertext rows before the startup sweep decrements for each delete.
+        cache
+            .omr_metadata_enc_count
+            .store(cache.omr_metadata_enc.len(), Ordering::Relaxed);
         // Best-effort prune of orphan hints left from previous runs (S21).
+        // Also drops legacy omr_metadata_enc rows that have no TTL meta.
         let _ = cache.prune_expired_omr_clue_hints();
         Ok(cache)
     }
@@ -611,6 +627,10 @@ impl Cache {
     /// and shares its 24h TTL (`OMR_CLUE_HINT_TTL_SECS`) so memos survive reorgs
     /// without unbounded growth. LWD cannot decrypt this — it's encrypted with
     /// the recipient's pubkey.
+    ///
+    /// New tx hashes are refused once [`MAX_OMR_METADATA_ENC_ENTRIES`] live rows
+    /// exist, matching clue-pubkey admission. Replacing an existing hash does
+    /// not consume another slot.
     pub fn store_omr_metadata_enc(
         &self,
         tx_hash: &[u8; 32],
@@ -629,15 +649,49 @@ impl Cache {
         self.prune_expired_omr_clue_hints()?;
         self.drop_omr_metadata_enc_if_expired(tx_hash)?;
 
+        let existing = self.omr_metadata_enc.get(tx_hash.as_slice())?;
+        let mut reserved_slot = false;
+        if existing.is_none() {
+            self.reserve_omr_metadata_enc_slot()?;
+            reserved_slot = true;
+        }
+
+        let now = omr_hint_unix_now();
+        // TTL meta is written before ciphertext so a concurrent sweep cannot
+        // treat this insert as a legacy row that has no TTL.
+        if let Err(e) = self
+            .omr_metadata_enc_meta
+            .insert(tx_hash.as_slice(), &now.to_le_bytes())
+        {
+            if reserved_slot {
+                self.release_omr_metadata_enc_slot();
+            }
+            return Err(e.into());
+        }
+
         let mut stored = Vec::with_capacity(4 + metadata_enc.len());
         let idx = output_index.unwrap_or(u32::MAX);
         stored.extend_from_slice(&idx.to_le_bytes());
         stored.extend_from_slice(&metadata_enc);
-        self.omr_metadata_enc
-            .insert(tx_hash.as_slice(), stored.as_slice())?;
-        let now = omr_hint_unix_now();
-        self.omr_metadata_enc_meta
-            .insert(tx_hash.as_slice(), &now.to_le_bytes())?;
+        let prev = match self
+            .omr_metadata_enc
+            .insert(tx_hash.as_slice(), stored.as_slice())
+        {
+            Ok(prev) => prev,
+            Err(e) => {
+                if reserved_slot {
+                    let _ = self.omr_metadata_enc_meta.remove(tx_hash.as_slice());
+                    self.release_omr_metadata_enc_slot();
+                }
+                return Err(e.into());
+            }
+        };
+        if reserved_slot && prev.is_some() {
+            // Raced with a concurrent insert of the same key; release our extra count.
+            self.release_omr_metadata_enc_slot();
+        } else if !reserved_slot && prev.is_none() {
+            self.omr_metadata_enc_count.fetch_add(1, Ordering::AcqRel);
+        }
         debug!(
             target: "lightwalletd::cache",
             "Stored OMR metadata_enc for tx {} ({} bytes, output_index={:?})",
@@ -646,6 +700,41 @@ impl Cache {
             output_index,
         );
         Ok(())
+    }
+
+    /// Reserve one `omr_metadata_enc` slot. Same compare-exchange admission as
+    /// [`Self::store_clue_public_key`].
+    fn reserve_omr_metadata_enc_slot(&self) -> Result<()> {
+        let cap = self.max_omr_metadata_enc_entries.load(Ordering::Relaxed);
+        let mut cur = self.omr_metadata_enc_count.load(Ordering::Acquire);
+        loop {
+            if cur >= cap {
+                return Err(LightWalletError::CacheError(
+                    "omr metadata registry is full".into(),
+                ));
+            }
+            match self.omr_metadata_enc_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release_omr_metadata_enc_slot(&self) {
+        // Saturating: a stale count must not wrap and lock the registry.
+        // `try_update` is the newer name. This crate's MSRV is 1.88, which
+        // still calls the operation `fetch_update`.
+        #[allow(deprecated)]
+        let _ =
+            self.omr_metadata_enc_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    cur.checked_sub(1)
+                });
     }
 
     /// True if unexpired recipient-encrypted OMR metadata is already stored for this tx.
@@ -659,9 +748,20 @@ impl Cache {
 
     /// Drop pending recipient-encrypted OMR metadata (e.g. its transaction was rejected).
     pub fn remove_omr_metadata_enc(&self, tx_hash: &[u8; 32]) -> Result<()> {
-        self.omr_metadata_enc.remove(tx_hash.as_slice())?;
-        self.omr_metadata_enc_meta.remove(tx_hash.as_slice())?;
+        self.delete_omr_metadata_enc(tx_hash.as_slice())?;
         Ok(())
+    }
+
+    /// Remove ciphertext and TTL meta. Returns whether a ciphertext row was present.
+    fn delete_omr_metadata_enc(&self, key: &[u8]) -> Result<bool> {
+        let removed = self.omr_metadata_enc.remove(key)?;
+        self.omr_metadata_enc_meta.remove(key)?;
+        if removed.is_some() {
+            self.release_omr_metadata_enc_slot();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// True if a clue hint is already stored for this tx (e.g. from SendTransaction).
@@ -794,6 +894,12 @@ impl Cache {
     #[cfg(test)]
     pub(crate) fn set_max_clue_pubkey_entries(&self, max: usize) {
         self.max_clue_pubkey_entries.store(max, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_omr_metadata_enc_entries(&self, max: usize) {
+        self.max_omr_metadata_enc_entries
+            .store(max, Ordering::Relaxed);
     }
 
     /// Parse stored clue-directory value → `(key_version, ownership_proof, clue_pk)`.
@@ -952,13 +1058,29 @@ impl Cache {
         let mut expired_meta = Vec::new();
         for item in self.omr_metadata_enc_meta.iter() {
             let (key, value) = item?;
-            if omr_hint_meta_expired(value.as_ref(), now) {
+            if omr_metadata_enc_row_expired(Some(value.as_ref()), now) {
                 expired_meta.push(key.to_vec());
             }
         }
         for key in expired_meta {
-            self.omr_metadata_enc.remove(key.as_slice())?;
-            self.omr_metadata_enc_meta.remove(key.as_slice())?;
+            self.delete_omr_metadata_enc(key.as_slice())?;
+        }
+
+        // 0.3.12 stored ciphertext with no TTL meta. Those rows never expire
+        // on their own; drop them instead of backfilling a timestamp.
+        let mut legacy = Vec::new();
+        for item in self.omr_metadata_enc.iter() {
+            let (key, _) = item?;
+            if self.omr_metadata_enc_meta.get(key.as_ref())?.is_none() {
+                legacy.push(key.to_vec());
+            }
+        }
+        for key in legacy {
+            // A store may have written TTL meta after this key was queued.
+            if self.omr_metadata_enc_meta.get(key.as_slice())?.is_some() {
+                continue;
+            }
+            self.delete_omr_metadata_enc(key.as_slice())?;
         }
         Ok(())
     }
@@ -976,17 +1098,23 @@ impl Cache {
         Ok(true)
     }
 
-    /// Drop this tx's encrypted OMR metadata when its meta row is expired.
+    /// Drop this tx's encrypted OMR metadata when its TTL has elapsed.
+    ///
+    /// A ciphertext row with no meta record is a legacy 0.3.12 insert. It has
+    /// no TTL, so it is deleted rather than kept.
     fn drop_omr_metadata_enc_if_expired(&self, tx_hash: &[u8; 32]) -> Result<bool> {
-        let Some(value) = self.omr_metadata_enc_meta.get(tx_hash.as_slice())? else {
-            return Ok(false);
-        };
-        if !omr_hint_meta_expired(value.as_ref(), omr_hint_unix_now()) {
-            return Ok(false);
+        let now = omr_hint_unix_now();
+        match self.omr_metadata_enc_meta.get(tx_hash.as_slice())? {
+            Some(value) if !omr_metadata_enc_row_expired(Some(value.as_ref()), now) => Ok(false),
+            Some(_) => self.delete_omr_metadata_enc(tx_hash.as_slice()),
+            None => {
+                if self.omr_metadata_enc.get(tx_hash.as_slice())?.is_some() {
+                    self.delete_omr_metadata_enc(tx_hash.as_slice())
+                } else {
+                    Ok(false)
+                }
+            }
         }
-        self.omr_metadata_enc.remove(tx_hash.as_slice())?;
-        self.omr_metadata_enc_meta.remove(tx_hash.as_slice())?;
-        Ok(true)
     }
 
     /// Merge pending OMR clues into compact block outputs.
@@ -1044,8 +1172,7 @@ impl Cache {
                 if let Some(stored_meta) = self.omr_metadata_enc.get(tx_hash.as_slice())? {
                     let (output_index, meta_enc) = parse_stored_omr_clue_hint(&stored_meta);
                     if meta_enc.is_empty() {
-                        self.omr_metadata_enc.remove(tx_hash.as_slice())?;
-                        self.omr_metadata_enc_meta.remove(tx_hash.as_slice())?;
+                        self.delete_omr_metadata_enc(tx_hash.as_slice())?;
                     } else if output_index.is_some()
                         || !tx.outputs.iter().any(|o| o.omr_metadata_enc == meta_enc)
                     {
@@ -1913,6 +2040,14 @@ fn omr_hint_meta_expired(value: &[u8], now: u64) -> bool {
     buf.copy_from_slice(&value[..8]);
     let stored_at = u64::from_le_bytes(buf);
     now.saturating_sub(stored_at) > OMR_CLUE_HINT_TTL_SECS
+}
+
+/// `None` is a legacy ciphertext row with no TTL meta. Those are not kept.
+fn omr_metadata_enc_row_expired(meta: Option<&[u8]>, now: u64) -> bool {
+    match meta {
+        Some(value) => omr_hint_meta_expired(value, now),
+        None => true,
+    }
 }
 
 fn height_from_snapshot_key(key: &[u8]) -> Option<u32> {
@@ -2908,6 +3043,105 @@ mod tests {
             .get(tx_hash.as_slice())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn omr_metadata_enc_row_without_ttl_counts_as_expired() {
+        let now = 1_000_000u64;
+        assert!(!omr_metadata_enc_row_expired(Some(&now.to_le_bytes()), now));
+        let still_live = now - OMR_CLUE_HINT_TTL_SECS;
+        assert!(!omr_metadata_enc_row_expired(
+            Some(&still_live.to_le_bytes()),
+            now
+        ));
+        let expired = still_live - 1;
+        assert!(omr_metadata_enc_row_expired(
+            Some(&expired.to_le_bytes()),
+            now
+        ));
+        assert!(omr_metadata_enc_row_expired(Some(&[1, 2, 3]), now));
+        assert!(omr_metadata_enc_row_expired(None, now));
+    }
+
+    #[test]
+    fn omr_metadata_enc_rejects_a_new_tx_when_entry_cap_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        cache.set_max_omr_metadata_enc_entries(1);
+
+        let first = [0x31u8; 32];
+        let second = [0x32u8; 32];
+        cache
+            .store_omr_metadata_enc(&first, b"memo-1".to_vec(), Some(0))
+            .unwrap();
+        let err = cache
+            .store_omr_metadata_enc(&second, b"memo-2".to_vec(), Some(0))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("omr metadata registry is full"),
+            "{err}"
+        );
+        assert!(cache.has_omr_metadata_enc(&first).unwrap());
+        assert!(!cache.has_omr_metadata_enc(&second).unwrap());
+
+        // Replacing the live hash does not need a free slot.
+        cache
+            .store_omr_metadata_enc(&first, b"memo-1b".to_vec(), Some(1))
+            .unwrap();
+        assert!(cache.has_omr_metadata_enc(&first).unwrap());
+        assert!(!cache.has_omr_metadata_enc(&second).unwrap());
+    }
+
+    #[test]
+    fn legacy_omr_metadata_enc_without_meta_does_not_survive_startup_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let legacy = [0x11u8; 32];
+        let live = [0x22u8; 32];
+        {
+            let db = sled::open(path).unwrap();
+            let data = db.open_tree(OMR_METADATA_ENC_TREE).unwrap();
+            let meta = db.open_tree(OMR_METADATA_ENC_META_TREE).unwrap();
+            let mut legacy_row = 0u32.to_le_bytes().to_vec();
+            legacy_row.extend_from_slice(b"legacy-memo");
+            data.insert(legacy, legacy_row).unwrap();
+            let mut live_row = 0u32.to_le_bytes().to_vec();
+            live_row.extend_from_slice(b"live-memo");
+            data.insert(live, live_row).unwrap();
+            meta.insert(live, &omr_hint_unix_now().to_le_bytes())
+                .unwrap();
+            db.flush().unwrap();
+        }
+
+        let cache = reopen_cache(path);
+        assert!(
+            cache.omr_metadata_enc.get(legacy).unwrap().is_none(),
+            "legacy ciphertext with no TTL must be deleted on startup sweep"
+        );
+        assert!(cache.omr_metadata_enc_meta.get(legacy).unwrap().is_none());
+        assert!(
+            cache.has_omr_metadata_enc(&live).unwrap(),
+            "a row with a fresh TTL survives the same sweep"
+        );
+    }
+
+    #[test]
+    fn legacy_omr_metadata_enc_without_meta_is_dropped_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_str().unwrap()).unwrap();
+        let legacy = [0x44u8; 32];
+        let mut row = 0u32.to_le_bytes().to_vec();
+        row.extend_from_slice(b"legacy-memo");
+        cache.omr_metadata_enc.insert(legacy, row).unwrap();
+
+        assert!(!cache.has_omr_metadata_enc(&legacy).unwrap());
+        assert!(cache.omr_metadata_enc.get(legacy).unwrap().is_none());
+
+        // The uncounted delete must not wrap the admission counter.
+        cache
+            .store_omr_metadata_enc(&legacy, b"fresh".to_vec(), Some(0))
+            .unwrap();
+        assert!(cache.has_omr_metadata_enc(&legacy).unwrap());
     }
 
     #[test]

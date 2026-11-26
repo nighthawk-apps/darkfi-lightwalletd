@@ -428,6 +428,31 @@ fn backend_unavailable() -> Status {
     Status::unavailable("backend unavailable")
 }
 
+/// Outcome of `broadcast_tx` plus the mempool/chain confirm that follows a success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreBroadcastFollowup {
+    /// `broadcast_tx` itself failed. The transaction was not accepted.
+    BroadcastFailed,
+    /// The node answered, and the tx is not in the mempool or on chain.
+    NotConfirmed,
+    /// The node answered, and the tx is in the mempool or on chain.
+    Confirmed,
+    /// Confirm lost the connection after `broadcast_tx` returned a hash.
+    /// The transaction may already have propagated.
+    ConfirmConnectionError,
+}
+
+/// Whether clue hints and encrypted metadata stored before broadcast should be deleted.
+///
+/// A connection error after a successful broadcast keeps the rows. The 24h TTL
+/// reaps them. Broadcast failure and a negative confirm still drop them.
+fn drop_pre_broadcast_rows(followup: PreBroadcastFollowup) -> bool {
+    matches!(
+        followup,
+        PreBroadcastFollowup::BroadcastFailed | PreBroadcastFollowup::NotConfirmed
+    )
+}
+
 /// Stream compact blocks one sled read at a time; abort on holes, mixed forks,
 /// or client disconnect (do not materialize the whole window).
 async fn send_stream<T: Send>(
@@ -2565,20 +2590,23 @@ impl DarkFiLightWallet for LightWalletService {
         match tokio::time::timeout(broadcast_timeout, self.rpc_client.broadcast_tx(&tx_data)).await
         {
             Ok(Ok(tx_hash)) => {
-                let confirmed = match self.confirm_tx_in_mempool_or_chain(&tx_hash).await {
-                    Ok(found) => found,
-                    Err(e) if e.is_connection() => {
-                        if let Some(hash) = tx_hash_for_clue {
-                            cleanup_pre_broadcast(&hash);
-                        }
-                        return Err(backend_unavailable());
-                    }
-                    Err(_) => false,
+                let followup = match self.confirm_tx_in_mempool_or_chain(&tx_hash).await {
+                    Ok(true) => PreBroadcastFollowup::Confirmed,
+                    Ok(false) => PreBroadcastFollowup::NotConfirmed,
+                    Err(e) if e.is_connection() => PreBroadcastFollowup::ConfirmConnectionError,
+                    Err(_) => PreBroadcastFollowup::NotConfirmed,
                 };
-                if !confirmed {
+                // Connection loss after `Ok(tx_hash)` keeps the clue. The node
+                // may already have the transaction; the 24h TTL reaps the rows.
+                if drop_pre_broadcast_rows(followup) {
                     if let Some(hash) = tx_hash_for_clue {
                         cleanup_pre_broadcast(&hash);
                     }
+                }
+                if followup == PreBroadcastFollowup::ConfirmConnectionError {
+                    return Err(backend_unavailable());
+                }
+                if followup != PreBroadcastFollowup::Confirmed {
                     return Ok(Response::new(proto::SendResponse {
                         tx_hash: Vec::new(),
                         error: "Transaction was not confirmed in lightwalletd mempool".to_string(),
@@ -2649,8 +2677,10 @@ impl DarkFiLightWallet for LightWalletService {
                     "Transaction broadcast failed: {e}"
                 );
                 // Rejected txs must not park clue hints or metadata for the full TTL.
-                if let Some(hash) = tx_hash_for_clue {
-                    cleanup_pre_broadcast(&hash);
+                if drop_pre_broadcast_rows(PreBroadcastFollowup::BroadcastFailed) {
+                    if let Some(hash) = tx_hash_for_clue {
+                        cleanup_pre_broadcast(&hash);
+                    }
                 }
                 Ok(Response::new(proto::SendResponse {
                     tx_hash: Vec::new(),
@@ -4209,6 +4239,37 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Broadcast returns a hash, then the listener is closed so confirm cannot connect.
+    async fn spawn_mock_darkfid_broadcast_ok_then_refuse(hash_hex: String) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            // Later confirm RPCs must fail to connect. Drop the listener before
+            // the broadcast response is written so the client cannot sneak in.
+            drop(listener);
+            let (r, mut w) = stream.into_split();
+            let mut reader = BufReader::new(r);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let id = line
+                .parse::<tinyjson::JsonValue>()
+                .ok()
+                .and_then(|v| v.get::<HashMap<String, tinyjson::JsonValue>>().cloned())
+                .and_then(|m| m.get("id").and_then(|i| i.get::<f64>().copied()))
+                .unwrap_or(1.0) as i64;
+            let resp = format!(r#"{{"jsonrpc":"2.0","result":"{hash_hex}","id":{id}}}"#) + "\n";
+            let _ = w.write_all(resp.as_bytes()).await;
+            let _ = w.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn send_transaction_confirms_mempool_and_get_transaction_serves_it() {
         use proto::dark_fi_light_wallet_server::DarkFiLightWallet;
@@ -4478,6 +4539,65 @@ mod tests {
         assert!(
             !cache.has_omr_metadata_enc(&tx_hash).unwrap(),
             "rejected tx must not retain pre-broadcast metadata_enc"
+        );
+    }
+
+    #[test]
+    fn confirm_connection_error_keeps_pre_broadcast_rows() {
+        assert!(!drop_pre_broadcast_rows(
+            PreBroadcastFollowup::ConfirmConnectionError
+        ));
+        assert!(!drop_pre_broadcast_rows(PreBroadcastFollowup::Confirmed));
+        assert!(drop_pre_broadcast_rows(PreBroadcastFollowup::NotConfirmed));
+        assert!(drop_pre_broadcast_rows(
+            PreBroadcastFollowup::BroadcastFailed
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_transaction_keeps_pre_broadcast_metadata_on_confirm_connection_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+        let tx = darkfi::tx::Transaction {
+            calls: vec![],
+            proofs: vec![],
+            signatures: vec![],
+        };
+        let tx_hash = *tx.hash().inner();
+        let raw_tx = darkfi_serial::serialize(&tx);
+        let url_str = spawn_mock_darkfid_broadcast_ok_then_refuse(hex::encode(tx_hash)).await;
+        let (_tx, rx) = tokio::sync::watch::channel(0u32);
+        let rpc = Arc::new(crate::rpc_client::DarkfidRpcClient::new_simple(
+            url::Url::parse(&url_str).unwrap(),
+        ));
+        let svc = LightWalletService::with_limits(
+            Arc::clone(&cache),
+            rpc,
+            "test".into(),
+            0x01,
+            10_000,
+            10_000,
+            DEFAULT_MAX_TX_BYTES,
+            rx,
+            Vec::new(),
+        );
+
+        let err = DarkFiLightWallet::send_transaction(
+            &svc,
+            Request::new(proto::RawTransaction {
+                data: raw_tx,
+                omr_clue: vec![],
+                omr_clue_output_index: 0,
+                omr_metadata_enc: b"memo-for-unconfirmed-transport".to_vec(),
+                extra_omr_clues: vec![],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            cache.has_omr_metadata_enc(&tx_hash).unwrap(),
+            "confirm connection error must keep pre-broadcast metadata until the TTL"
         );
     }
 

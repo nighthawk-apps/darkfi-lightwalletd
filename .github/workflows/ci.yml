@@ -58,7 +58,6 @@ jobs:
 
       - name: Dependency advisory check (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
-        continue-on-error: true
         with:
           command: check advisories sources
           manifest-path: darkfi-lightwalletd/Cargo.toml
