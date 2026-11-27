@@ -1147,3 +1147,65 @@ fn open_reconciles_tip_merkle_mismatch_and_empty_reset_clears_merkle() {
     assert!(empty.get_tip_tree_state().unwrap().is_none());
     assert!(empty.latest_snapshot().unwrap().is_none());
 }
+
+#[test]
+fn reconcile_rebuilds_legacy_sentinel_missing_merkle_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let (expected_h0, expected_tip) = {
+        let cache = Cache::new(&path).unwrap();
+        cache.insert_compact_block(&make_empty_block(0)).unwrap();
+        cache.insert_compact_block(&make_test_block(1)).unwrap();
+        cache.insert_compact_block(&make_test_block(2)).unwrap();
+
+        let expected_h0 = darkfi_serial::serialize(&Cache::empty_tip_tree());
+        let expected_tip = cache.get_tip_tree_state().unwrap().unwrap();
+
+        // Simulate a legacy pre-sentinel cache: overwrite h=0 snapshot and tip
+        // tree with a sentinel-less tree and remove META_TIP_MERKLE_SCHEMA.
+        let sentinel_less =
+            darkfi_serial::serialize(&darkfi_sdk::crypto::MerkleTree::new(TIP_TREE_CHECKPOINTS));
+        cache
+            .merkle_snapshots
+            .insert(0u32.to_be_bytes(), sentinel_less.as_slice())
+            .unwrap();
+        cache
+            .meta
+            .insert(META_TIP_MERKLE_TREE, sentinel_less.as_slice())
+            .unwrap();
+        cache.meta.remove(META_TIP_MERKLE_SCHEMA).unwrap();
+        cache.flush().unwrap();
+        (expected_h0, expected_tip)
+    };
+
+    let reopened = reopen_cache(&path);
+    assert_eq!(
+        reopened.tip_merkle_schema().unwrap(),
+        TIP_MERKLE_SCHEMA_VERSION
+    );
+    let h0_bytes = reopened.merkle_snapshot(0).unwrap().unwrap();
+    let h0_tree: darkfi_sdk::crypto::MerkleTree = darkfi_serial::deserialize(&h0_bytes).unwrap();
+    assert_eq!(
+        h0_tree.root(0),
+        Cache::empty_tip_tree().root(0),
+        "height 0 snapshot must be rebuilt with the ZERO sentinel leaf"
+    );
+    assert_eq!(h0_bytes, expected_h0);
+    assert_eq!(
+        reopened.get_tip_tree_state().unwrap().unwrap(),
+        expected_tip,
+        "tip Merkle tree must be rebuilt from cached coins with the ZERO sentinel leaf"
+    );
+    drop(reopened);
+
+    // Second reopen preserves the repaired root without errors.
+    let reopened_again = reopen_cache(&path);
+    assert_eq!(
+        reopened_again.tip_merkle_schema().unwrap(),
+        TIP_MERKLE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        reopened_again.get_tip_tree_state().unwrap().unwrap(),
+        expected_tip
+    );
+}

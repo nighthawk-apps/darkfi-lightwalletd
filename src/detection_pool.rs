@@ -227,6 +227,7 @@ impl DetectionKeyPool {
         Ok(handle)
     }
 
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     fn remove_handle(&mut self, handle: &[u8; 32]) {
         if let Some(old) = self.entries.remove(handle) {
             self.total_bytes = self.total_bytes.saturating_sub(retained_bytes(&old));
@@ -359,5 +360,36 @@ mod tests {
         assert!(pool.lookup(&first, 6).is_none());
         pool.insert(key_expiring(100), 1024, 6).unwrap();
         assert_eq!(pool.total_bytes, 2);
+    }
+
+    #[test]
+    fn insert_for_peer_enforces_per_peer_cap_and_can_accept_for_peer() {
+        let mut pool = DetectionKeyPool::with_limits(16, 1024);
+        assert!(matches!(
+            pool.can_accept_for_peer(0, 512, 0),
+            Err(PoolReject::Empty)
+        ));
+        assert!(matches!(
+            pool.can_accept_for_peer(600, 512, 0),
+            Err(PoolReject::TooLarge)
+        ));
+        assert!(pool.can_accept_for_peer(2, 512, 0).is_ok());
+
+        let peer: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..=MAX_DETECTION_HANDLES_PER_PEER {
+            let handle = pool
+                .insert_for_peer(peer, key_expiring(100), 512, 0)
+                .unwrap();
+            handles.push(handle);
+        }
+        assert_eq!(pool.len(), MAX_DETECTION_HANDLES_PER_PEER);
+        assert!(
+            pool.lookup(&handles[0], 0).is_none(),
+            "oldest handle for the peer must be evicted once per-peer cap is exceeded"
+        );
+        for handle in &handles[1..] {
+            assert!(pool.lookup(handle, 0).is_some());
+        }
     }
 }

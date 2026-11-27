@@ -148,6 +148,12 @@ impl Cache {
         self.meta.remove(META_TIP_HASH).map_err(io)?;
         self.meta.remove(META_TIP_MERKLE_TREE).map_err(io)?;
         self.meta.remove(META_TIP_MERKLE_HEIGHT).map_err(io)?;
+        self.meta
+            .insert(
+                META_TIP_MERKLE_SCHEMA,
+                &TIP_MERKLE_SCHEMA_VERSION.to_be_bytes(),
+            )
+            .map_err(io)?;
         self.meta.remove(META_TIP_CHAIN_FACTS).map_err(io)?;
         if let Ok(mut tip) = self.tip_tree.lock() {
             tip.height = None;
@@ -228,31 +234,99 @@ impl Cache {
         Ok(Some(u32::from_be_bytes(bytes.as_ref().try_into().unwrap())))
     }
 
+    pub(super) fn tip_merkle_schema(&self) -> Result<u32> {
+        let Some(bytes) = self.meta.get(META_TIP_MERKLE_SCHEMA)? else {
+            return Ok(0);
+        };
+        if bytes.len() != 4 {
+            return Ok(0);
+        }
+        Ok(u32::from_be_bytes(bytes.as_ref().try_into().unwrap()))
+    }
+
+    pub(super) fn snapshot_missing_sentinel(&self, height: u32) -> Result<bool> {
+        let Some(bytes) = self.merkle_snapshots.get(height.to_be_bytes())? else {
+            return Ok(false);
+        };
+        Ok(
+            match darkfi_serial::deserialize::<darkfi_sdk::crypto::MerkleTree>(&bytes) {
+                Ok(tree) => tree.root(0).is_none(),
+                Err(_) => true,
+            },
+        )
+    }
+
     /// Reconcile `META_TIP_HEIGHT` and `META_TIP_MERKLE_HEIGHT` on startup.
     ///
     /// A crash between writing the tip height and persisting the updated tip
     /// Merkle tree can leave `tip_height != tip_merkle_height`, or leave stale
-    /// Merkle metadata after an empty reset. Rebuild or clear immediately so
-    /// `GetTreeState` does not stay wedged until the next block arrives.
+    /// Merkle metadata after an empty reset, or retain legacy pre-sentinel
+    /// snapshots missing the `ZERO` sentinel leaf. Rebuild or clear immediately
+    /// so `GetTreeState` does not stay wedged until the next block arrives.
     pub(super) fn reconcile_tip_merkle(&self) -> Result<()> {
         match self.get_tip()? {
             None => {
                 let has_merkle_meta = self.meta.get(META_TIP_MERKLE_HEIGHT)?.is_some()
                     || self.meta.get(META_TIP_MERKLE_TREE)?.is_some()
                     || !self.merkle_snapshots.is_empty();
+                let mut flushed = false;
                 if has_merkle_meta {
                     warn!(
                         target: "lightwalletd::cache",
                         "Cache has no tip but retained Merkle metadata/snapshots; clearing"
                     );
                     self.reset_tip_merkle_state()?;
+                    flushed = true;
+                }
+                if self.tip_merkle_schema()? != TIP_MERKLE_SCHEMA_VERSION {
+                    self.meta.insert(
+                        META_TIP_MERKLE_SCHEMA,
+                        &TIP_MERKLE_SCHEMA_VERSION.to_be_bytes(),
+                    )?;
+                    flushed = true;
+                }
+                if flushed {
                     self.db.flush()?;
                 }
                 Ok(())
             }
             Some((tip_height, _)) => {
-                let merkle_height = self.get_tip_tree_state()?.map(|(h, _)| h);
-                if merkle_height != Some(tip_height) {
+                let tip_state = self.get_tip_tree_state()?;
+                let merkle_height = tip_state.as_ref().map(|(h, _)| *h);
+                let tip_missing_sentinel = match tip_state {
+                    Some((_, bytes)) => {
+                        match darkfi_serial::deserialize::<darkfi_sdk::crypto::MerkleTree>(&bytes) {
+                            Ok(tree) => tree.root(0).is_none(),
+                            Err(_) => true,
+                        }
+                    }
+                    None => false,
+                };
+                let schema = self.tip_merkle_schema()?;
+                let needs_full_reset = schema != TIP_MERKLE_SCHEMA_VERSION
+                    || self.snapshot_missing_sentinel(0)?
+                    || tip_missing_sentinel;
+
+                if needs_full_reset {
+                    if self.pruned_below_height()? == 0 {
+                        warn!(
+                            target: "lightwalletd::cache",
+                            "Tip Merkle schema {schema} != {TIP_MERKLE_SCHEMA_VERSION} or legacy sentinel-less snapshot detected; resetting and rebuilding from cached coins 0..={tip_height}"
+                        );
+                        self.reset_tip_merkle_state()?;
+                        self.rebuild_tip_merkle_tree(tip_height)?;
+                        self.meta.insert(
+                            META_TIP_MERKLE_SCHEMA,
+                            &TIP_MERKLE_SCHEMA_VERSION.to_be_bytes(),
+                        )?;
+                        self.db.flush()?;
+                    } else {
+                        error!(
+                            target: "lightwalletd::cache",
+                            "Pruned cache has legacy sentinel-less Merkle snapshots (schema {schema}); clear the derived cache directory and resync from darkfid"
+                        );
+                    }
+                } else if merkle_height != Some(tip_height) {
                     warn!(
                         target: "lightwalletd::cache",
                         "Tip height {tip_height} != tip Merkle height {merkle_height:?}; rebuilding tip Merkle tree"
