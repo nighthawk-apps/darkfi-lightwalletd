@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 edition = "2021"
 # MSRV: `slice::as_chunks` (1.88). `is_multiple_of` is 1.87. CI stays on stable.
 rust-version = "1.88"
+autobins = false
 
 # =============================================================================
 # Nighthawk Apps — standalone lightwalletd
@@ -33,7 +34,7 @@ required-features = ["fhe-omr"]
 #   cargo build --features fhe-omr
 default = []
 # Enable UnifOMR (GetUnifOmrDigest + FetchPirBatch). Not part of the default binary.
-fhe-omr = ["dep:fhe", "dep:fhe-traits"]
+fhe-omr = ["dep:blackhawk-unifomr", "dep:fhe", "dep:fhe-traits"]
 # Enable live testnet 0.3 integration tests (requires running darkfid + lightwalletd).
 #   cargo test --features testnet-e2e
 testnet-e2e = []
@@ -80,6 +81,7 @@ hex = "0.4.3"
 tokio = { version = "1", features = ["full"] }
 fhe = { version = "0.1.1", optional = true }
 fhe-traits = { version = "0.1.1", optional = true }
+blackhawk-unifomr = { path = "../blackhawk/crates/blackhawk-unifomr", optional = true }
 rand = "0.9.4"
 tokio-stream = "0.1.18"
 bincode = "1.3"
@@ -93,7 +95,8 @@ tempfile = "3"
 [build-dependencies]
 tonic-build = "0.12"
 
-# Removed workspace lints
+[lints.rust]
+warnings = "deny"
 
 [patch.crates-io]
 halo2_proofs = {git="https://github.com/parazyd/halo2", branch="v050"}

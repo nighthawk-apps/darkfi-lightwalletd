@@ -19,7 +19,7 @@ LWD_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 IOS_DIR="$LWD_DIR/../nighthawk-ios-wallet"
 IOS_FFI="$IOS_DIR/rust/darkfi-mobile-ffi"
 IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
-AND_FFI="$(cd "$LWD_DIR/../nighthawk-android-wallet/rust/darkfi-mobile-ffi" && pwd)"
+AND_FFI="$(cd "$LWD_DIR/../blackhawk/crates/blackhawk" && pwd)"
 LWD_URL="${LWD_URL:-http://127.0.0.1:9067}"
 NETWORK="${NETWORK:-testnet}"
 
@@ -108,7 +108,7 @@ if [ -f "$IOS_FFI/Cargo.toml" ]; then
   fi
 elif [ -f "$IOS_BUILD_SCRIPT" ]; then
   if [ "$AND_FFI_OK" -eq 1 ] && bash -n "$IOS_BUILD_SCRIPT" && \
-     grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT"; then
+     grep -q "blackhawk/crates/blackhawk" "$IOS_BUILD_SCRIPT"; then
     report PASS "ios per-message multi-clue unit (unified shared crate)"
   else
     report FAIL "ios unified shared crate check"

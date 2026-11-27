@@ -437,6 +437,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         poller.run().await;
     });
 
+    let max_tx_bytes = config.max_tx_bytes;
+
     // Parse gRPC listen address
     let grpc_addr = config.grpc_listen.parse().unwrap_or_else(|e| {
         error!(target: "lightwalletd", "Invalid gRPC listen address: {e}");
@@ -505,7 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(b) => b,
                 Err(e) => {
                     error!(target: "lightwalletd", "Invalid TLS config: {e}");
-                    return;
+                    return Err::<(), String>(format!("invalid TLS config: {e}"));
                 }
             };
         }
@@ -518,10 +520,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder = builder.timeout(std::time::Duration::from_secs(request_timeout_s));
         }
 
+        let max_decode = if cfg!(feature = "fhe-omr") {
+            8 * 1024 * 1024
+        } else {
+            max_tx_bytes.saturating_add(512 * 1024).max(4 * 1024 * 1024)
+        };
+        let max_encode = if cfg!(feature = "fhe-omr") {
+            32 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        };
         let svc = DarkFiLightWalletServer::new(service)
-            // Param2 UnifOMR detection keys are ~120 MiB; keep headroom for digests.
-            .max_decoding_message_size(160 * 1024 * 1024)
-            .max_encoding_message_size(160 * 1024 * 1024);
+            .max_decoding_message_size(max_decode)
+            .max_encoding_message_size(max_encode);
 
         let shutdown = async {
             #[cfg(unix)]
@@ -558,7 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!(target: "lightwalletd", "Failed to bind {grpc_addr}: {e}");
-                    return;
+                    return Err(format!("bind {grpc_addr}: {e}"));
                 }
             }
         } else {
@@ -571,16 +582,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Err(e) = serve_result {
             error!(target: "lightwalletd", "gRPC server error: {e}");
+            return Err(format!("gRPC server error: {e}"));
         }
+        Ok(())
     });
 
     // Wait for either task to complete
+    let mut exit_err: Option<String> = None;
     tokio::select! {
-        _ = poller_handle => {
-            error!(target: "lightwalletd", "Chain poller exited unexpectedly");
+        res = poller_handle => {
+            error!(target: "lightwalletd", "Chain poller exited unexpectedly: {res:?}");
+            exit_err = Some("chain poller exited unexpectedly".to_string());
         }
-        _ = server_handle => {
-            info!(target: "lightwalletd", "gRPC server stopped");
+        res = server_handle => {
+            match res {
+                Ok(Ok(())) => info!(target: "lightwalletd", "gRPC server stopped"),
+                Ok(Err(e)) => exit_err = Some(e),
+                Err(e) => exit_err = Some(format!("server task panicked: {e}")),
+            }
         }
     }
     metrics_handle.abort();
@@ -589,6 +608,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(target: "lightwalletd", "Flushing cache...");
     if let Err(e) = cache.flush() {
         error!(target: "lightwalletd", "Failed to flush cache: {e}");
+    }
+
+    if let Some(err) = exit_err {
+        error!(target: "lightwalletd", "Exiting non-zero due to fatal error: {err}");
+        std::process::exit(1);
     }
 
     info!(target: "lightwalletd", "Shutdown complete");

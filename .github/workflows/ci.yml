@@ -19,6 +19,13 @@ jobs:
         with:
           path: darkfi-lightwalletd
 
+      - name: Checkout blackhawk (blackhawk-unifomr)
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
+
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 

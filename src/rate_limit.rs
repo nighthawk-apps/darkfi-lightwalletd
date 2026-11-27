@@ -29,7 +29,12 @@ pub struct PeerRateLimiter {
     limit: u32,
     window: Duration,
     gc_threshold: AtomicUsize,
-    inner: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    inner: Mutex<RateLimiterState>,
+}
+
+struct RateLimiterState {
+    entries: HashMap<IpAddr, (u32, Instant)>,
+    last_gc: Instant,
 }
 
 impl PeerRateLimiter {
@@ -42,7 +47,10 @@ impl PeerRateLimiter {
             limit: limit_per_window,
             window,
             gc_threshold: AtomicUsize::new(gc_threshold.max(1)),
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(RateLimiterState {
+                entries: HashMap::new(),
+                last_gc: Instant::now(),
+            }),
         }
     }
 
@@ -71,12 +79,22 @@ impl PeerRateLimiter {
             Err(_) => return false,
         };
         let now = Instant::now();
-        // Opportunistic GC: drop stale IP entries when the map grows.
-        if guard.len() >= self.gc_threshold.load(Ordering::Relaxed) {
+        let threshold = self.gc_threshold.load(Ordering::Relaxed);
+        let hard_cap = threshold.saturating_mul(4);
+        // Opportunistic GC with cooldown so full maps do not scan O(N) per RPC.
+        if guard.entries.len() >= threshold
+            && now.duration_since(guard.last_gc) >= Duration::from_secs(10)
+        {
             let window = self.window;
-            guard.retain(|_, (_, t)| now.duration_since(*t) < window);
+            guard
+                .entries
+                .retain(|_, (_, t)| now.duration_since(*t) < window);
+            guard.last_gc = now;
         }
-        let entry = guard.entry(peer).or_insert((0, now));
+        if !guard.entries.contains_key(&peer) && guard.entries.len() >= hard_cap {
+            return false;
+        }
+        let entry = guard.entries.entry(peer).or_insert((0, now));
         if now.duration_since(entry.1) >= self.window {
             *entry = (n, now);
             return n <= self.limit;
@@ -111,7 +129,10 @@ mod tests {
             limit: 10,
             window: Duration::from_secs(60),
             gc_threshold: AtomicUsize::new(4096),
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(RateLimiterState {
+                entries: HashMap::new(),
+                last_gc: Instant::now(),
+            }),
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = limiter.inner.lock().unwrap();

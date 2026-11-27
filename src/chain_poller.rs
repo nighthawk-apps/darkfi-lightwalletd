@@ -53,7 +53,7 @@ impl Default for ChainPollerConfig {
             poll_interval_secs: 10,
             max_backoff_secs: 300,
             batch_size: 100,
-            retention_window: 100_000,
+            retention_window: 0,
             prune_interval_blocks: 10_000,
         }
     }
@@ -329,13 +329,15 @@ impl ChainPoller {
             }
         };
 
-        // A cache imported from a birthday / snapshot can have tip > 0 while
-        // height 0 is absent. GetNoteCommitments(0..=tip) then abort with
-        // chain discontinuity and wallets cannot rebuild spend Merkle trees.
-        if self.cache.get_compact_block(0)?.is_none() {
+        // A cache imported from an unpruned birthday / snapshot can have tip > 0 while
+        // height 0 is absent. Skip backfill once pruning has occurred.
+        if self.cache.pruned_below_height()? == 0
+            && self.cache.get_compact_block(0)?.is_none()
+            && self.cache.get_compact_block(1)?.is_some()
+        {
             info!(
                 target: "lightwalletd::chain_poller",
-                "Height 0 missing from cache; backfilling genesis compact block"
+                "Height 0 missing from unpruned cache; backfilling genesis compact block"
             );
             return self.fetch_range(0, 0).await;
         }
@@ -464,9 +466,13 @@ impl ChainPoller {
             if h == 0 || walked >= MAX_WALK {
                 warn!(
                     target: "lightwalletd::chain_poller",
-                    "No common ancestor at or above height {h}; rewinding to {h}"
+                    "No common ancestor at or above height {h}; clearing derived block cache"
                 );
-                self.cache.rewind_to_height(h)?;
+                if h == 0 {
+                    self.cache.clear_derived_block_cache()?;
+                } else {
+                    self.cache.rewind_to_height(h)?;
+                }
                 self.refresh_tip_chain_facts().await;
                 self.notify_tip();
                 return Ok(0);

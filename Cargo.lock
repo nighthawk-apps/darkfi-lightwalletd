@@ -645,6 +645,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blackhawk-unifomr"
+version = "0.3.1"
+dependencies = [
+ "blake3",
+ "fhe",
+ "fhe-traits",
+ "rand 0.9.5",
+ "rayon",
+ "zeroize",
+]
+
+[[package]]
 name = "blake2b_simd"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1334,6 +1346,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bincode 1.3.3",
+ "blackhawk-unifomr",
  "blake3",
  "bs58",
  "darkfi",

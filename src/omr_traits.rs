@@ -18,7 +18,11 @@
 
 //! Shared error type for UnifOMR evaluation.
 
+#[cfg(feature = "fhe-omr")]
+pub use blackhawk_unifomr::OmrError;
+
 /// An error that can occur during UnifOMR / OMR operations.
+#[cfg(not(feature = "fhe-omr"))]
 #[derive(Debug, thiserror::Error)]
 pub enum OmrError {
     #[error("Deserialization failed: {0}")]

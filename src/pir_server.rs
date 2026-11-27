@@ -124,8 +124,8 @@ impl BatchPirServer {
         Self { params }
     }
 
-    pub fn with_unifomr_params() -> Self {
-        Self::new(bfv_params())
+    pub fn with_unifomr_params() -> Result<Self, String> {
+        Ok(Self::new(bfv_params().map_err(|e| e.to_string())?))
     }
 
     /// Evaluate `Σ query_slots[i] * db[i]` under encryption for one stripe.
@@ -191,20 +191,20 @@ pub struct BatchPirClient {
 }
 
 impl BatchPirClient {
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    pub fn from_seed(seed: [u8; 32]) -> Result<Self, String> {
         let mut r = StdRng::from_seed(seed);
-        let params = bfv_params();
+        let params = bfv_params().map_err(|e| e.to_string())?;
         let secret_key = SecretKey::random(&params, &mut r);
         let public_key = PublicKey::new(&secret_key, &mut r);
-        Self {
+        Ok(Self {
             secret_key,
             public_key,
             params,
-        }
+        })
     }
 
     pub fn from_wallet(wallet_secret: &[u8], network: u8) -> Result<Self, String> {
-        Ok(Self::from_seed(derive_pir_seed(wallet_secret, network)?))
+        Self::from_seed(derive_pir_seed(wallet_secret, network)?)
     }
 
     fn encrypt_selection(&self, selection: &[u64]) -> Result<Vec<u8>, String> {
@@ -384,8 +384,8 @@ mod tests {
 
     #[test]
     fn test_batch_pir_single_select() {
-        let client = BatchPirClient::from_seed([9u8; 32]);
-        let server = BatchPirServer::with_unifomr_params();
+        let client = BatchPirClient::from_seed([9u8; 32]).unwrap();
+        let server = BatchPirServer::with_unifomr_params().unwrap();
         let mut db = vec![0u64; 100];
         for (i, slot) in db.iter_mut().enumerate() {
             *slot = 1000 + i as u64;
@@ -400,8 +400,8 @@ mod tests {
 
     #[test]
     fn test_sealpir_cross_stripe() {
-        let client = BatchPirClient::from_seed([3u8; 32]);
-        let server = BatchPirServer::with_unifomr_params();
+        let client = BatchPirClient::from_seed([3u8; 32]).unwrap();
+        let server = BatchPirServer::with_unifomr_params().unwrap();
         let degree = client.params.degree();
         let window = degree + 50;
         let mut db = vec![0u64; window];
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn test_limbs_below_plaintext_modulus() {
         use rand::RngCore;
-        let t = bfv_params().plaintext();
+        let t = bfv_params().unwrap().plaintext();
         let mut data = vec![0u8; 8 * 1024];
         StdRng::seed_from_u64(0x8C1B).fill_bytes(&mut data);
         data[..64].fill(0xFF);
@@ -524,8 +524,8 @@ mod tests {
             "payload must exercise 0xFFFF limbs"
         );
 
-        let client = BatchPirClient::from_seed([0x5Cu8; 32]);
-        let server = BatchPirServer::with_unifomr_params();
+        let client = BatchPirClient::from_seed([0x5Cu8; 32]).unwrap();
+        let server = BatchPirServer::with_unifomr_params().unwrap();
         let queries = client.generate_sealpir_queries(&[target], window).unwrap();
         let needed = pir_payload_limb_count(limbs[0]).unwrap();
         let mut cols = Vec::with_capacity(padded_limb_count(needed));
@@ -544,8 +544,8 @@ mod tests {
 
     #[test]
     fn test_pir_rejects_non_fresh_query() {
-        let client = BatchPirClient::from_seed([0x71u8; 32]);
-        let server = BatchPirServer::with_unifomr_params();
+        let client = BatchPirClient::from_seed([0x71u8; 32]).unwrap();
+        let server = BatchPirServer::with_unifomr_params().unwrap();
         let db = vec![1u64; 4];
         let q = client.generate_query(0, 4).unwrap();
         assert!(server.evaluate_limb_bytes(&q, &db).is_ok());

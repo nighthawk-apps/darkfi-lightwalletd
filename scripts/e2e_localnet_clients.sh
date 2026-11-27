@@ -19,7 +19,7 @@ GH="$(cd "$ROOT/.." && pwd)"
 PIN="$GH/darkfi-nighthawk-testnet"
 LWD_DIR="$ROOT"
 MOON_DIR="$GH/moonshine"
-AND_FFI="$GH/nighthawk-android-wallet/rust/darkfi-mobile-ffi"
+AND_FFI="$GH/blackhawk/crates/blackhawk"
 IOS_DIR="$GH/nighthawk-ios-wallet"
 IOS_FFI="$IOS_DIR/rust/darkfi-mobile-ffi"
 IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
@@ -151,8 +151,8 @@ if [[ "${SKIP_IOS:-0}" != 1 && ! -x "$WORK/ios-tx" ]]; then
   if [[ -f "$IOS_FFI/Cargo.toml" ]]; then
     echo "building ios localnet_tx"
     build_named "$IOS_FFI" "$WORK/ios-tx" --features localnet
-  elif [[ -f "$IOS_BUILD_SCRIPT" ]] && grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT"; then
-    echo "ios uses unified darkfi-mobile-ffi ($AND_FFI); reusing android-desktop-tx for ios-tx"
+  elif [[ -f "$IOS_BUILD_SCRIPT" ]] && grep -q "blackhawk/crates/blackhawk" "$IOS_BUILD_SCRIPT"; then
+    echo "ios uses unified blackhawk ($AND_FFI); reusing android-desktop-tx for ios-tx"
     cp -f "$WORK/android-desktop-tx" "$WORK/ios-tx"
   else
     echo "ios darkfi-mobile-ffi Cargo.toml not found and unified build script missing; set SKIP_IOS=1 or restore FFI crate" >&2

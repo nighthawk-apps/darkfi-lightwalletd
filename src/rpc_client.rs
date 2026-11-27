@@ -218,7 +218,7 @@ impl DarkfidRpcClient {
 
     /// Fetch a transaction by its hash.
     pub async fn get_tx(&self, tx_hash: &str) -> Result<Vec<u8>> {
-        debug!(target: "lightwalletd::rpc_client", "Fetching transaction {tx_hash}");
+        debug!(target: "lightwalletd::rpc_client", "Fetching transaction");
 
         let params = JsonValue::Array(vec![JsonValue::String(tx_hash.to_string())]);
         let response = self.request("blockchain.get_tx", params).await?;
@@ -258,7 +258,7 @@ impl DarkfidRpcClient {
 
     /// Lookup zkas bincodes for a given contract ID.
     pub async fn lookup_zkas(&self, contract_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        debug!(target: "lightwalletd::rpc_client", "Looking up zkas for contract {contract_id}");
+        debug!(target: "lightwalletd::rpc_client", "Looking up zkas");
 
         let params = JsonValue::Array(vec![JsonValue::String(contract_id.to_string())]);
         let response = self.request("blockchain.lookup_zkas", params).await?;

@@ -44,7 +44,7 @@ fn validate_unifomr_clue_roundtrip_with_client() {
 #[test]
 fn unifomr_detector_scheme_and_digest_roundtrip() {
     assert_eq!(SCHEME_UNIFOMR, 0x05);
-    let det = UnifOmrDetector::new(0x01);
+    let det = UnifOmrDetector::new(0x01).expect("detector");
     assert_eq!(det.scheme(), "unifomr");
 
     let wallet = [0x42u8; 32];
@@ -57,6 +57,6 @@ fn unifomr_detector_scheme_and_digest_roundtrip() {
     let digest = det.evaluate(&det_key, &notes).expect("evaluate");
     let (_, slot_heights) = flatten_messages(&notes);
     let slots = client.decrypt_digest_slots(&digest).expect("decrypt");
-    let matches = UnifOmrClient::range_check_matches(&slots, &slot_heights);
+    let matches = UnifOmrClient::range_check_matches(&slots, &slot_heights).expect("matches");
     assert!(matches.contains(&100), "pertinent height must match");
 }

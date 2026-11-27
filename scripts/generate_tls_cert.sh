@@ -216,9 +216,23 @@ generate_letsencrypt() {
     fi
 
     mkdir -p "${CERT_DIR}"
-    sudo cp "${le_dir}/fullchain.pem" "${CERT_DIR}/server.crt"
-    sudo cp "${le_dir}/privkey.pem" "${CERT_DIR}/server.key"
-    sudo chown "$(id -u):$(id -g)" "${CERT_DIR}/server.crt" "${CERT_DIR}/server.key"
+    local target_owner=""
+    if [[ -e "${CERT_DIR}/server.key" ]]; then
+        target_owner="$(stat -c '%u:%g' "${CERT_DIR}/server.key" 2>/dev/null || stat -f '%u:%g' "${CERT_DIR}/server.key" 2>/dev/null || true)"
+    elif [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+        target_owner="${SUDO_UID}:${SUDO_GID}"
+    else
+        target_owner="$(id -u):$(id -g)"
+    fi
+    (
+        umask 077
+        cp "${le_dir}/privkey.pem" "${CERT_DIR}/server.key.tmp"
+        mv "${CERT_DIR}/server.key.tmp" "${CERT_DIR}/server.key"
+    )
+    cp "${le_dir}/fullchain.pem" "${CERT_DIR}/server.crt"
+    if [[ -n "${target_owner}" ]]; then
+        chown "${target_owner}" "${CERT_DIR}/server.crt" "${CERT_DIR}/server.key"
+    fi
     chmod 600 "${CERT_DIR}/server.key"
     chmod 644 "${CERT_DIR}/server.crt"
 
@@ -241,9 +255,23 @@ copy_renewed() {
         exit 1
     fi
     mkdir -p "${CERT_DIR}"
-    sudo cp "${le_dir}/fullchain.pem" "${CERT_DIR}/server.crt"
-    sudo cp "${le_dir}/privkey.pem" "${CERT_DIR}/server.key"
-    sudo chown "$(id -u):$(id -g)" "${CERT_DIR}/server.crt" "${CERT_DIR}/server.key"
+    local target_owner=""
+    if [[ -e "${CERT_DIR}/server.key" ]]; then
+        target_owner="$(stat -c '%u:%g' "${CERT_DIR}/server.key" 2>/dev/null || stat -f '%u:%g' "${CERT_DIR}/server.key" 2>/dev/null || true)"
+    elif [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+        target_owner="${SUDO_UID}:${SUDO_GID}"
+    else
+        target_owner="$(id -u):$(id -g)"
+    fi
+    (
+        umask 077
+        cp "${le_dir}/privkey.pem" "${CERT_DIR}/server.key.tmp"
+        mv "${CERT_DIR}/server.key.tmp" "${CERT_DIR}/server.key"
+    )
+    cp "${le_dir}/fullchain.pem" "${CERT_DIR}/server.crt"
+    if [[ -n "${target_owner}" ]]; then
+        chown "${target_owner}" "${CERT_DIR}/server.crt" "${CERT_DIR}/server.key"
+    fi
     chmod 600 "${CERT_DIR}/server.key"
     chmod 644 "${CERT_DIR}/server.crt"
     openssl x509 -in "${CERT_DIR}/server.crt" -out "${CERT_DIR}/leaf.crt"

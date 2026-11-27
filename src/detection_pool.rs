@@ -42,6 +42,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// pool does not keep a second partial-decrypt implementation. Parsed BFV
 /// ciphertexts are dropped after that check; retaining them would fork the
 /// evaluator from the upload path.
+#[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+pub const MAX_DETECTION_HANDLES_PER_PEER: usize = 4;
+
 #[derive(Clone)]
 pub struct PooledDetectionKey {
     pub keys: Vec<Arc<Vec<u8>>>,
@@ -63,6 +66,10 @@ pub enum PoolReject {
 
 pub struct DetectionKeyPool {
     entries: HashMap<[u8; 32], PooledDetectionKey>,
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    peers: HashMap<[u8; 32], std::net::IpAddr>,
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    lru_order: std::collections::VecDeque<[u8; 32]>,
     #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
     max_handles: usize,
     #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
@@ -88,6 +95,8 @@ impl DetectionKeyPool {
     pub fn with_limits(max_handles: usize, max_total_bytes: u64) -> Self {
         Self {
             entries: HashMap::new(),
+            peers: HashMap::new(),
+            lru_order: std::collections::VecDeque::new(),
             max_handles: max_handles.max(1),
             max_total_bytes,
             total_bytes: 0,
@@ -100,34 +109,10 @@ impl DetectionKeyPool {
         self.entries.len()
     }
 
-    /// Fast pre-check before taking an FHE permit and parsing a ~120 MiB key.
-    /// Sweeps expired entries first; callers still check `insert` atomically.
-    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
-    pub fn can_accept(
-        &mut self,
-        byte_length: usize,
-        max_key_bytes: usize,
-        now_unix: u64,
-    ) -> Result<(), PoolReject> {
-        self.sweep_expired(now_unix);
-        if byte_length == 0 {
-            return Err(PoolReject::Empty);
-        }
-        if byte_length > max_key_bytes {
-            return Err(PoolReject::TooLarge);
-        }
-        if self.entries.len() >= self.max_handles
-            || self.total_bytes.saturating_add(byte_length as u64) > self.max_total_bytes
-        {
-            return Err(PoolReject::Full);
-        }
-        Ok(())
-    }
-
     /// Insert a validated key. Sweeps expired rows first.
     ///
     /// The handle is 32 bytes from the OS RNG. It is not derived from the key.
-    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    #[cfg(test)]
     pub fn insert(
         &mut self,
         key: PooledDetectionKey,
@@ -159,8 +144,94 @@ impl DetectionKeyPool {
         if let Some(old) = self.entries.insert(handle, key) {
             self.total_bytes = self.total_bytes.saturating_sub(retained_bytes(&old));
         }
+        self.lru_order.push_back(handle);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         Ok(handle)
+    }
+
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    pub fn can_accept_for_peer(
+        &mut self,
+        byte_length: usize,
+        max_key_bytes: usize,
+        now_unix: u64,
+    ) -> Result<(), PoolReject> {
+        self.sweep_expired(now_unix);
+        if byte_length == 0 {
+            return Err(PoolReject::Empty);
+        }
+        if byte_length > max_key_bytes {
+            return Err(PoolReject::TooLarge);
+        }
+        if byte_length as u64 > self.max_total_bytes {
+            return Err(PoolReject::Full);
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(any(test, feature = "fhe-omr")), allow(dead_code))]
+    pub fn insert_for_peer(
+        &mut self,
+        peer: std::net::IpAddr,
+        key: PooledDetectionKey,
+        max_key_bytes: usize,
+        now_unix: u64,
+    ) -> Result<[u8; 32], PoolReject> {
+        self.sweep_expired(now_unix);
+        if key.keys.is_empty() || key.keys.iter().any(|k| k.is_empty()) {
+            return Err(PoolReject::Empty);
+        }
+        if key.byte_length > max_key_bytes || key.keys.iter().any(|k| k.len() > max_key_bytes) {
+            return Err(PoolReject::TooLarge);
+        }
+        let bytes = retained_bytes(&key);
+        if bytes > self.max_total_bytes {
+            return Err(PoolReject::Full);
+        }
+        // Evict this peer's oldest handle if they already hold the per-peer maximum.
+        while self.peers.values().filter(|&&p| p == peer).count() >= MAX_DETECTION_HANDLES_PER_PEER
+        {
+            let pos = self
+                .lru_order
+                .iter()
+                .position(|h| self.peers.get(h) == Some(&peer));
+            match pos.and_then(|i| self.lru_order.remove(i)) {
+                Some(h) => self.remove_handle(&h),
+                None => break,
+            }
+        }
+        // Evict global LRU handles to stay within handle/byte capacity instead of locking out.
+        while self.entries.len() >= self.max_handles
+            || self.total_bytes.saturating_add(bytes) > self.max_total_bytes
+        {
+            match self.lru_order.pop_front() {
+                Some(h) => self.remove_handle(&h),
+                None => return Err(PoolReject::Full),
+            }
+        }
+        let mut handle = [0u8; 32];
+        for _ in 0..8 {
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut handle)
+                .expect("os rng");
+            if !self.entries.contains_key(&handle) {
+                break;
+            }
+        }
+        if let Some(old) = self.entries.insert(handle, key) {
+            self.total_bytes = self.total_bytes.saturating_sub(retained_bytes(&old));
+        }
+        self.peers.insert(handle, peer);
+        self.lru_order.push_back(handle);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        Ok(handle)
+    }
+
+    fn remove_handle(&mut self, handle: &[u8; 32]) {
+        if let Some(old) = self.entries.remove(handle) {
+            self.total_bytes = self.total_bytes.saturating_sub(retained_bytes(&old));
+        }
+        self.peers.remove(handle);
     }
 
     /// Clone the entry if it is still live. Expired and unknown handles yield `None`.
@@ -183,13 +254,17 @@ impl DetectionKeyPool {
 
     fn sweep_expired(&mut self, now_unix: u64) {
         let mut freed = 0u64;
-        self.entries.retain(|_, entry| {
+        let peers = &mut self.peers;
+        self.entries.retain(|h, entry| {
             let live = entry.expires_unix > now_unix;
             if !live {
                 freed = freed.saturating_add(retained_bytes(entry));
+                peers.remove(h);
             }
             live
         });
+        let entries = &self.entries;
+        self.lru_order.retain(|h| entries.contains_key(h));
         self.total_bytes = self.total_bytes.saturating_sub(freed);
         self.last_sweep = Instant::now();
     }
