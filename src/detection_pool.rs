@@ -48,6 +48,8 @@ pub const MAX_DETECTION_HANDLES_PER_PEER: usize = 4;
 #[derive(Clone)]
 pub struct PooledDetectionKey {
     pub keys: Vec<Arc<Vec<u8>>>,
+    #[cfg(feature = "fhe-omr")]
+    pub parsed_keys: Vec<Arc<crate::unifomr::ParsedDetectionKey>>,
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
     pub network_byte: u8,
     #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
@@ -79,7 +81,16 @@ pub struct DetectionKeyPool {
 }
 
 fn retained_bytes(key: &PooledDetectionKey) -> u64 {
-    key.keys.iter().map(|k| k.len() as u64).sum()
+    #[cfg(feature = "fhe-omr")]
+    if !key.parsed_keys.is_empty() {
+        return key
+            .parsed_keys
+            .iter()
+            .map(|k| k.approx_bytes() as u64)
+            .sum();
+    }
+    let raw: u64 = key.keys.iter().map(|k| k.len() as u64).sum();
+    raw.max(key.byte_length as u64)
 }
 
 impl DetectionKeyPool {
@@ -178,10 +189,17 @@ impl DetectionKeyPool {
         now_unix: u64,
     ) -> Result<[u8; 32], PoolReject> {
         self.sweep_expired(now_unix);
-        if key.keys.is_empty() || key.keys.iter().any(|k| k.is_empty()) {
+        #[cfg(feature = "fhe-omr")]
+        let has_key_data = !key.keys.is_empty() || !key.parsed_keys.is_empty();
+        #[cfg(not(feature = "fhe-omr"))]
+        let has_key_data = !key.keys.is_empty();
+        if !has_key_data || key.keys.iter().any(|k| k.is_empty()) {
             return Err(PoolReject::Empty);
         }
-        if key.byte_length > max_key_bytes || key.keys.iter().any(|k| k.len() > max_key_bytes) {
+        if key.byte_length == 0
+            || key.byte_length > max_key_bytes
+            || key.keys.iter().any(|k| k.len() > max_key_bytes)
+        {
             return Err(PoolReject::TooLarge);
         }
         let bytes = retained_bytes(&key);
@@ -285,9 +303,14 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+#[allow(dead_code)]
 pub fn expiry_from(now_unix: u64) -> u64 {
     now_unix.saturating_add(DETECTION_KEY_TTL_SECS)
+}
+
+#[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+pub fn expiry_from_ttl(now_unix: u64, ttl_secs: u64) -> u64 {
+    now_unix.saturating_add(ttl_secs.max(1))
 }
 
 #[cfg(test)]
@@ -297,6 +320,8 @@ mod tests {
     fn key_expiring(at: u64) -> PooledDetectionKey {
         PooledDetectionKey {
             keys: vec![Arc::new(vec![0xAB, 0xCD])],
+            #[cfg(feature = "fhe-omr")]
+            parsed_keys: Vec::new(),
             network_byte: 1,
             expires_unix: at,
             byte_length: 2,

@@ -2,7 +2,7 @@
 
 Privacy-preserving light wallet server for the DarkFi network. The default binary serves compact blocks for trial decryption. Experimental UnifOMR is a separate build (`--features fhe-omr`).
 
-**0.3.15.** Keeps a payment clue when confirmation loses the connection after a successful broadcast, and caps encrypted metadata at 100,000 rows. Aligns with Nighthawk Android/iOS 3.01.23, desktop 3.1.23, and Moonshine 3.1.23. DarkFi pin for wallets is `b87318e80`.
+**0.3.16.** Proto `2.2.0`: default compact-block quick scanning supports `omit_omr_clues` (`BlockRange`) to strip unused clue overhead on `GetCompactOutputBodies`; opt-in `--features fhe-omr` upgrades to **UnifOMR v2** (`unifomr-v2`: `~30.03 MiB` seeded raw-NTT det-keys, `40 KiB` digests, `2,573 B` clues, amortized `PreparedClueWindow` cache, parsed key pool) + 2-RPC streaming Batch PIR (`FetchPirBatchStream`). Aligns with Nighthawk Android/iOS 3.2.02, Desktop 3.2.2, Moonshine 3.2.2, and `blackhawk` 0.4.0. DarkFi pin is `b87318e80`.
 
 ## Contents
 
@@ -180,10 +180,10 @@ Defined in `proto/lightwallet.proto`.
 | `GetChainTip` | Tip height + hash |
 | `SendTransaction` | Broadcast + optional `omr_clue` → `clue_accepted` |
 | `RegisterOmrClue` | Transitional clue register (peer-bound) |
-| `GetUnifOmrDigest` | UnifOMR Round 1 (scheme `0x05`) |
-| `FetchPirBatch` | UnifOMR Round 2 |
-| `RegisterCluePublicKey` / `GetCluePublicKey` | UnifOMR send-path registry |
-| `GetOmrCapabilities` | Disabled in the default build. `unifomr` only with `--features fhe-omr` |
+| `GetUnifOmrDigest` | UnifOMR v2 Round 1 (`unifomr-v2`, scheme `0x05`) |
+| `FetchPirBatch` / `FetchPirBatchStream` | UnifOMR Round 2 unary & streaming Batch PIR (2-RPC retrieval) |
+| `RegisterCluePublicKey` / `GetCluePublicKey` | UnifOMR send-path registry (`2,596 B` seed-compressed keys) |
+| `GetOmrCapabilities` | Disabled in the default build. `"unifomr-v2"` only with `--features fhe-omr` |
 | `GetNullifiers` / `GetNoteCommitments` | Spend / commitment sync |
 
 `GetUnifOmrDigest` and `RegisterDetectionKey` stream `DetectionKeyChunk` messages:
@@ -214,7 +214,7 @@ Defined in `proto/lightwallet.proto`.
 | **Optional PEM TLS** | ✅ | `tls_cert_path` + `tls_key_path` |
 | **OMR rate limit** | ✅ | `omr_rate_limit_per_min` |
 | **Clue rate limit** | ✅ | Tighter on `RegisterOmrClue` |
-| **Detection key size cap** | ✅ | Reject oversized UnifOMR keys (160 MiB cap for ~120 MiB Param2 keys) |
+| **Detection key size cap** | ✅ | Reject oversized UnifOMR v2 keys (`40 MiB` default cap for `~30.03 MiB` keys) |
 | **Max block range** | ✅ | Caps range RPCs (DoS) |
 
 ### Compact blocks & cache
@@ -285,10 +285,8 @@ Defined in `proto/lightwallet.proto`.
 
 ## Infrastructure sizing
 
-Two different loads. **Trial decryption** (default binary) is cheap per client.
-**UnifOMR** (`--features fhe-omr`) is dominated by Param2 detection keys
-(~120 MiB each on the wire; see [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md))
-and by the process-wide FHE worker pool (`fhe_workers`, default **2**).
+Two different loads. **Trial decryption** (default binary) is cheap per client and supports `omit_omr_clues` so clients never download unused OMR clues.
+**UnifOMR v2** (`--features fhe-omr`) cuts detection keys to **~30.03 MiB** on the wire (64 MiB parsed NTT RAM in the pool), **40 KiB** per 4,096-clue digest chunk, and **41.8 ms** per prepared chunk evaluation.
 
 Configurable caps (see `lightwalletd.toml.example`):
 
@@ -300,11 +298,12 @@ Configurable caps (see `lightwalletd.toml.example`):
 | OMR RPCs / min / IP | 30 | `omr_rate_limit_per_min` |
 | Concurrent FHE digests | 2 | `fhe_workers` |
 | Concurrent PIR workers | `max(fhe_workers, 4)` | derived from `fhe_workers` |
-| Detection-key upload budget | 512 MiB | `upload_budget_mib` |
-| Det-key upload deadline | 300 s | `upload_deadline_s` |
-| Pooled detection keys | ≤4096 handles, **8 GiB** | `detection_pool_handles`, `detection_pool_mib` |
-| Det-key / request | ≤160 MiB | `max_detection_key_bytes` |
-| Compact-block range | ≤10 000 heights | `max_range_per_request` |
+| FHE Rayon threads | `auto (<=16)` | `omr_rayon_threads` |
+| Detection-key upload budget | 512 MiB | `upload_budget_mib` |
+| Det-key upload deadline | 300 s | `upload_deadline_s` |
+| Pooled detection keys | ≤4096 handles, **8 GiB**, 24h TTL | `detection_pool_handles`, `detection_pool_mib`, `detection_key_ttl_secs` |
+| Det-key / request | ≤40 MiB | `max_detection_key_bytes` |
+| Compact-block range | ≤10 000 heights | `max_range_per_request` |
 
 ### Trial decryption (default binary) — minimum host specs
 
@@ -339,20 +338,20 @@ Hard limits until the crypto path shrinks keys:
 
 Lab / self-host starting point (≤100 wallets, few digests at once): 8-core ARM or x86, 32 GB RAM, 200 GB NVMe, 1 Gbps, `request_timeout_s ≥ 1800`, `fhe_workers=4`, reverse-proxy body ≥ 160 MB (`docs/deploy-hardening.md`).
 
-Measured on this Mac (Apple Silicon, `cargo test --release --features fhe-omr --lib measure_hosting_timings -- --ignored`, 2026-11-23):
+Measured UnifOMR v2 timings on Void Linux x86_64 (`cargo test --release --features fhe-omr --lib measure_hosting_timings -- --ignored --nocapture`, 2026-11-28):
 
-| Op | Result |
-|----|--------|
-| Detection key size | **125 863 941 B (~120.0 MiB)**, 1024 CTs |
-| `from_wallet` | 21 ms |
-| `build_detection_key` | 759 ms |
-| `parse_detection_key` | 219 ms |
-| Encode one full SIMD chunk (`D=4096`) | 495 ms total (275 ms eval after parse) |
-| Digest size (1 chunk) | 81 997 B |
-| Decrypt digest slots | 0.42 ms |
-| PIR evaluate 1 / 2 stripes (one limb) | 0.63 ms / 1.25 ms |
-| PIR query CT | 122 910 B |
-| Money-tree append 1000 coins (Sinsemilla) | 70 ms |
+| Op | UnifOMR v1 (baseline) | UnifOMR v2 |
+|----|----------------------|------------|
+| Detection key size | 125,863,941 B (120.0 MiB) | **31,490,055 B (30.03 MiB)** (64 MiB parsed RAM) |
+| `from_wallet` / `build_detection_key` | 21 ms / 759 ms | **7.90 ms / 121.94 ms** |
+| `parse_detection_key` | 685.76 ms | **57.64 ms** (skipped on pooled repeat calls) |
+| Prepare 4,096 clues (amortized) | — | **117.65 ms** |
+| Evaluate 4,096 clues per key | 717.15 ms | **41.78 ms** |
+| Digest size (1 chunk = 4,096 clues) | 81,997 B | **40,965 B (40.0 KiB)** |
+| Decrypt digest slots | — | **0.85 ms** |
+| PIR query CT size | 122,910 B | **30,769 B (30.0 KiB)** |
+| PIR evaluate 1 stripe (1 limb / 16-limb batch) | — | **0.31 ms / 5.01 ms** |
+| Money-tree append 1,000 coins (Sinsemilla) | — | **122.01 ms** (`694 B` tree) |
 
 So UnifOMR hosting cost is **key upload + FHE encode**, not Merkle hashing. With `fhe_workers=2`, a single box sustains on the order of a few digests per second for one-chunk windows, not hundreds.
 

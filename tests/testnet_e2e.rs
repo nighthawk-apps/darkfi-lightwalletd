@@ -95,6 +95,7 @@ async fn testnet_compact_block_stream() {
         .get_block_range(proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         })
         .await
         .expect("GetBlockRange failed")
@@ -318,6 +319,7 @@ async fn testnet_nullifiers_and_commitments() {
         .get_nullifiers(proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         })
         .await
         .expect("GetNullifiers failed")
@@ -336,6 +338,7 @@ async fn testnet_nullifiers_and_commitments() {
         .get_note_commitments(proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         })
         .await
         .expect("GetNoteCommitments failed")

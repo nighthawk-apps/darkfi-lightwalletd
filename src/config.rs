@@ -128,9 +128,17 @@ pub struct Config {
     #[serde(default = "default_detection_pool_mib")]
     pub detection_pool_mib: u64,
 
-    /// Whole detection-key upload deadline in seconds (default 300; ~120 MiB over Tor).
+    /// Whole detection-key upload deadline in seconds (default 300).
     #[serde(default = "default_upload_deadline_s")]
     pub upload_deadline_s: u64,
+
+    /// Pooled detection-key TTL in seconds (default 86400 = 24h).
+    #[serde(default = "default_detection_key_ttl_secs")]
+    pub detection_key_ttl_secs: u64,
+
+    /// Max Rayon worker threads dedicated to FHE OMR/PIR compute (0 = auto <= 16).
+    #[serde(default = "default_omr_rayon_threads")]
+    pub omr_rayon_threads: usize,
 }
 
 fn default_darkfid_endpoint() -> String {
@@ -189,9 +197,8 @@ fn default_max_tx_bytes() -> usize {
 }
 
 fn default_request_timeout_s() -> u64 {
-    // Param2 UnifOMR per-message packing: one SIMD chunk (D=4096, ℓ=2) of
-    // partial-decrypt can exceed 5 minutes on a laptop. 0 = no timeout.
-    1800
+    // 5 minutes leaves plenty of headroom for UnifOMR v2 / streaming PIR over Tor.
+    300
 }
 
 fn default_darkfid_rpc_timeout_s() -> u64 {
@@ -211,7 +218,7 @@ fn default_max_send_peer_entries() -> usize {
 }
 
 fn default_max_detection_key_bytes() -> usize {
-    160 * 1024 * 1024
+    40 * 1024 * 1024
 }
 
 fn default_upload_budget_mib() -> usize {
@@ -236,6 +243,14 @@ fn default_detection_pool_mib() -> u64 {
 
 fn default_upload_deadline_s() -> u64 {
     300
+}
+
+fn default_detection_key_ttl_secs() -> u64 {
+    crate::detection_pool::DETECTION_KEY_TTL_SECS
+}
+
+fn default_omr_rayon_threads() -> usize {
+    0
 }
 
 /// Expand a leading `~/` to the user home directory.
@@ -304,6 +319,8 @@ impl Default for Config {
             detection_pool_handles: default_detection_pool_handles(),
             detection_pool_mib: default_detection_pool_mib(),
             upload_deadline_s: default_upload_deadline_s(),
+            detection_key_ttl_secs: default_detection_key_ttl_secs(),
+            omr_rayon_threads: default_omr_rayon_threads(),
         }
     }
 }

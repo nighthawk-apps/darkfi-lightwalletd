@@ -1,6 +1,6 @@
 [package]
 name = "darkfi-lightwalletd"
-version = "0.3.15"
+version = "0.3.16"
 homepage = "https://nighthawkapps.com"
 description = "DarkFi lightwallet server — compact blocks for trial-decrypt sync. UnifOMR is optional."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
@@ -34,7 +34,7 @@ required-features = ["fhe-omr"]
 #   cargo build --features fhe-omr
 default = []
 # Enable UnifOMR (GetUnifOmrDigest + FetchPirBatch). Not part of the default binary.
-fhe-omr = ["dep:blackhawk-unifomr", "dep:fhe", "dep:fhe-traits"]
+fhe-omr = ["dep:blackhawk-unifomr", "dep:fhe", "dep:fhe-traits", "dep:rayon"]
 # Enable live testnet 0.3 integration tests (requires running darkfid + lightwalletd).
 #   cargo test --features testnet-e2e
 testnet-e2e = []
@@ -82,6 +82,7 @@ tokio = { version = "1", features = ["full"] }
 fhe = { version = "0.1.1", optional = true }
 fhe-traits = { version = "0.1.1", optional = true }
 blackhawk-unifomr = { path = "../blackhawk/crates/blackhawk-unifomr", optional = true }
+rayon = { version = "1.12", optional = true }
 rand = "0.9.4"
 tokio-stream = "0.1.18"
 bincode = "1.3"

@@ -646,10 +646,11 @@ dependencies = [
 
 [[package]]
 name = "blackhawk-unifomr"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "fhe",
+ "fhe-math",
  "fhe-traits",
  "rand 0.9.5",
  "rayon",
@@ -1341,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "darkfi-lightwalletd"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1360,6 +1361,7 @@ dependencies = [
  "hex",
  "prost 0.13.5",
  "rand 0.9.5",
+ "rayon",
  "serde",
  "sled",
  "tempfile",

@@ -392,6 +392,8 @@ async fn pool_digest_missing_and_expired_handles_are_not_found() {
         pool.insert(
             PooledDetectionKey {
                 keys: vec![Arc::new(vec![1, 2, 3])],
+                #[cfg(feature = "fhe-omr")]
+                parsed_keys: Vec::new(),
                 network_byte: 1,
                 expires_unix: 10,
                 byte_length: 3,
@@ -534,6 +536,7 @@ async fn compact_output_bodies_are_one_per_output_in_a_padded_range() {
         Request::new(proto::BlockRange {
             start_height: 0,
             end_height: 10,
+            omit_omr_clues: false,
         }),
     )
     .await
@@ -546,6 +549,7 @@ async fn compact_output_bodies_are_one_per_output_in_a_padded_range() {
         Request::new(proto::BlockRange {
             start_height: 0,
             end_height: 1023,
+            omit_omr_clues: false,
         }),
     )
     .await
@@ -571,17 +575,44 @@ async fn compact_output_bodies_are_one_per_output_in_a_padded_range() {
     assert_eq!(bodies[1].coin, coin_b.to_vec());
     assert_eq!(bodies[1].hash, tip_hash.to_vec());
     assert!(bodies[1].omr_clue.is_empty());
+
+    // Trial-decrypt clients set omit_omr_clues = true to strip clue overhead while
+    // keeping coin, encrypted_note, omr_metadata_enc, tx_hash, and func_code intact.
+    let mut stream_omit = DarkFiLightWallet::get_compact_output_bodies(
+        &svc,
+        Request::new(proto::BlockRange {
+            start_height: 0,
+            end_height: 1023,
+            omit_omr_clues: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let mut omitted = Vec::new();
+    while let Some(item) = stream_omit.next().await {
+        omitted.push(item.expect("omitted padded range"));
+    }
+    assert_eq!(omitted.len(), 2);
+    assert!(omitted[0].omr_clue.is_empty());
+    assert_eq!(omitted[0].coin, coin_a.to_vec());
+    assert_eq!(omitted[0].encrypted_note, vec![1, 2]);
+    assert_eq!(omitted[0].omr_metadata_enc, vec![6]);
+    assert_eq!(omitted[1].coin, coin_b.to_vec());
 }
 
 #[cfg(feature = "fhe-omr")]
 #[test]
 fn clue_window_cache_keeps_notes_not_digest_bytes() {
     let mut cache = ClueWindowCache::new();
+    let detector = crate::unifomr::UnifOmrDetector::new(0x01).unwrap();
+    let ct = crate::unifomr::RlweCiphertext {
+        a: vec![1u64; crate::unifomr::CLUE_N],
+        b: vec![3u64; crate::unifomr::CLUE_ELL],
+    };
+    let prepared = Arc::new(detector.prepare_window(&[ct]).unwrap());
     let window = Arc::new(FlattenedClueWindow {
-        messages: vec![crate::unifomr::RlweCiphertext {
-            a: vec![1, 2],
-            b: vec![3, 4],
-        }],
+        prepared,
         slot_heights_wire: crate::unifomr::pack_slot_heights(&[4]),
         truncated: false,
     });
@@ -589,7 +620,7 @@ fn clue_window_cache_keeps_notes_not_digest_bytes() {
     cache.insert(0, 1023, hash, Arc::clone(&window));
     let hit = cache.get(0, 1023, hash).unwrap();
     assert!(Arc::ptr_eq(&hit, &window));
-    assert_eq!(hit.messages.len(), 1);
+    assert_eq!(hit.prepared.message_count(), 1);
     assert_eq!(hit.slot_heights_wire, window.slot_heights_wire);
     assert!(cache.get(0, 1023, [8u8; 32]).is_none());
 }
@@ -654,10 +685,8 @@ fn pir_encode_strips_omr_clue_under_payload_cap() {
     assert_eq!(out.encrypted_note, vec![0x11; 40]);
     assert_eq!(out.omr_metadata_enc, vec![0x44; 16]);
     assert_eq!(decoded.txs[0].nullifiers, vec![vec![0x55; 32]]);
-    assert_eq!(
-        PIR_RATE_LIMIT_PER_MIN,
-        crate::pir_server::MAX_PIR_LIMBS as u32
-    );
+    assert_eq!(PIR_RATE_LIMIT_PER_MIN, 4096);
+    assert_eq!(crate::pir_server::MAX_PIR_LIMBS, 32_768);
 }
 
 async fn spawn_mock_darkfid(pending_contains_hash: bool, hash_hex: String) -> String {
@@ -1433,6 +1462,11 @@ async fn service_metrics_counts_requests_rate_limits_and_active_streams() {
             rpc_requests: 0,
             rate_limited: 0,
             active_streams: 0,
+            omr_digest_requests: 0,
+            omr_digest_ms_total: 0,
+            pir_requests: 0,
+            pir_limbs_total: 0,
+            pir_ms_total: 0,
         }
     );
 
@@ -1459,4 +1493,199 @@ async fn service_metrics_counts_requests_rate_limits_and_active_streams() {
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(metrics.snapshot().active_streams, 0);
+}
+
+#[cfg(feature = "fhe-omr")]
+#[tokio::test]
+async fn unifomr_v2_pooled_digest_and_streaming_pir_e2e() {
+    use prost::Message;
+    use tokio_stream::StreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(Cache::new(dir.path().to_str().unwrap()).unwrap());
+
+    let alice = [0x42u8; 32];
+    let bob = [0x99u8; 32];
+    let alice_client = crate::unifomr::UnifOmrClient::from_wallet(&alice, 0x01).unwrap();
+    let (_, alice_pk) = crate::unifomr::clue_keypair_from_wallet(&alice, 0x01).unwrap();
+    let (_, bob_pk) = crate::unifomr::clue_keypair_from_wallet(&bob, 0x01).unwrap();
+
+    let mut rng = rand::rng();
+    let mut prev_hash = [0u8; 32];
+    let target_height = 512u32;
+    let tip_height = 1023u32;
+    for height in 0u32..=tip_height {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&height.to_be_bytes());
+        let clue = if height == target_height {
+            crate::unifomr::serialize_clue(&alice_pk.encrypt_zeros(&mut rng))
+        } else {
+            crate::unifomr::serialize_clue(&bob_pk.encrypt_zeros(&mut rng))
+        };
+        let txs = if height == target_height || height % 256 == 0 {
+            let coin = if height == target_height {
+                let mut c = [0u8; 32];
+                c[0] = 0x77;
+                c
+            } else {
+                let mut c = [0u8; 32];
+                c[0] = 0x22;
+                c
+            };
+            vec![crate::compact_block::CompactTx {
+                tx_hash: [height as u8; 32],
+                outputs: vec![crate::compact_block::CompactOutput {
+                    coin,
+                    encrypted_note: vec![if height == target_height { 0xAB } else { 0x01 }; 320],
+                    value_commit: vec![0x33; 33],
+                    token_commit: [0x44; 32],
+                    omr_clue: clue,
+                    omr_metadata_enc: vec![0x55; 64],
+                    func_code: 0,
+                }],
+                nullifiers: Vec::new(),
+                fee: 100,
+            }]
+        } else {
+            Vec::new()
+        };
+        cache
+            .insert_compact_block(&crate::compact_block::CompactBlock {
+                height,
+                hash,
+                prev_hash,
+                timestamp: 1_780_000_000 + height as u64,
+                txs,
+                dao_calls: Vec::new(),
+                func_events: Vec::new(),
+            })
+            .unwrap();
+        prev_hash = hash;
+    }
+
+    let (svc, _) = test_service(Arc::clone(&cache));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(proto::dark_fi_light_wallet_server::DarkFiLightWalletServer::new(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let mut client = proto::dark_fi_light_wallet_client::DarkFiLightWalletClient::connect(
+        format!("http://{addr}"),
+    )
+    .await
+    .unwrap();
+
+    // Verify capabilities report unifomr-v2 and LightInfo reports 2.2.0.
+    let info = client.get_light_info(proto::Empty {}).await.unwrap().into_inner();
+    assert_eq!(info.proto_version, "2.2.0");
+    let caps = client
+        .get_omr_capabilities(proto::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(caps.enabled);
+    assert_eq!(caps.scheme, "unifomr-v2");
+
+    // 1. Upload v3 detection key once via RegisterDetectionKey.
+    let det_key = alice_client.build_detection_key(0x01).unwrap();
+    let chunks: Vec<proto::DetectionKeyChunk> = det_key
+        .chunks(1024 * 1024)
+        .enumerate()
+        .map(|(i, sl)| {
+            let is_last = (i + 1) * (1024 * 1024) >= det_key.len();
+            proto::DetectionKeyChunk {
+                start_height: 0,
+                end_height: tip_height,
+                num_keys: if i == 0 { 1 } else { 0 },
+                data: sl.to_vec(),
+                key_done: is_last,
+            }
+        })
+        .collect();
+    let reg = client
+        .register_detection_key(tokio_stream::iter(chunks))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reg.handle.len(), 32);
+
+    // 2. Fetch compact OMR digest from pooled handle.
+    let digest_resp = client
+        .get_unif_omr_digest_from_pool(proto::PoolDigestRequest {
+            handle: reg.handle,
+            start_height: 0,
+            end_height: tip_height,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(digest_resp.complete);
+    let slot_heights = crate::unifomr::unpack_slot_heights(&digest_resp.slot_heights).unwrap();
+    let matched = alice_client
+        .decrypt_matching_heights(&digest_resp.encrypted_digest, &slot_heights)
+        .unwrap();
+    assert_eq!(matched, vec![target_height]);
+
+    // 3. Round-2 PIR: length limb via FetchPirBatch + body limbs via FetchPirBatchStream.
+    let pir_client = crate::pir_server::BatchPirClient::from_wallet(&alice, 0x01).unwrap();
+    let window = (tip_height + 1) as usize;
+    let queries = pir_client
+        .generate_sealpir_queries(&[target_height as usize], window)
+        .unwrap();
+
+    let len_resp = client
+        .fetch_pir_batch(proto::BatchPirRequest {
+            query_ciphertexts: queries.clone(),
+            start_height: 0,
+            end_height: tip_height,
+            limb_index: 0,
+            limb_count: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let len_col = pir_client
+        .decrypt_sealpir_stripes(&len_resp.payload_ciphertexts, window)
+        .unwrap();
+    let needed_limbs =
+        crate::pir_server::pir_payload_limb_count(len_col[target_height as usize]).unwrap();
+    let padded_limbs = crate::pir_server::padded_limb_count(needed_limbs);
+
+    let mut pir_stream = client
+        .fetch_pir_batch_stream(proto::BatchPirRequest {
+            query_ciphertexts: queries,
+            start_height: 0,
+            end_height: tip_height,
+            limb_index: 1,
+            limb_count: (padded_limbs - 1) as u32,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut limb_cols = vec![len_col];
+    while let Some(chunk) = pir_stream.next().await {
+        let chunk = chunk.unwrap();
+        limb_cols.push(
+            pir_client
+                .decrypt_sealpir_stripes(&chunk.payload_ciphertexts, window)
+                .unwrap(),
+        );
+    }
+    assert_eq!(limb_cols.len(), padded_limbs);
+    let payloads = crate::pir_server::assemble_payloads(&[target_height as usize], &limb_cols);
+    let recovered = proto::CompactBlock::decode(payloads[0].as_slice()).unwrap();
+    assert_eq!(recovered.height, target_height);
+    let mut expected_coin = vec![0u8; 32];
+    expected_coin[0] = 0x77;
+    assert_eq!(recovered.txs[0].outputs[0].coin, expected_coin);
+    assert!(recovered.txs[0].outputs[0].omr_clue.is_empty());
+
+    server_handle.abort();
 }

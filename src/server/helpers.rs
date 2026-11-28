@@ -56,10 +56,10 @@ pub(super) const MAX_BLOCKS_PER_REQUEST: u32 = 10_000;
 /// Max heights in a sparse GetCompactBlocksAtHeights request.
 pub(super) const MAX_SPARSE_HEIGHTS: usize = 512;
 /// Max serialized detection key size before parse (S24 / DoS).
-/// Param2 (D=4096, moduli 40×3, n=1024) det-keys measure ~120 MiB on the wire.
-pub(super) const MAX_DETECTION_KEY_BYTES: usize = 160 * 1024 * 1024;
+/// Param2 UnifOMR v2 (D=4096, single 60-bit Q_0, seeded raw-NTT) det-keys measure ~30.03 MiB.
+pub(super) const MAX_DETECTION_KEY_BYTES: usize = 40 * 1024 * 1024;
 /// Cap on sum of all detection_keys lengths in one request.
-pub(super) const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 160 * 1024 * 1024;
+pub(super) const MAX_DETECTION_KEYS_TOTAL_BYTES: usize = 80 * 1024 * 1024;
 /// Concurrent FHE worker slots (GetUnifOmrDigest / FetchPirBatch).
 pub(super) const DEFAULT_FHE_PERMITS: usize = 2;
 /// Max wait for the next DetectionKeyChunk. The FHE permit is not held
@@ -90,14 +90,13 @@ pub(super) const MAX_SUBSCRIBE_STREAMS: usize = 512;
 /// Max SealPIR stripe query ciphertexts (window ≤ stripes × BFV degree).
 #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 pub(super) const MAX_PIR_STRIPES: usize = 8;
-/// Max bytes per SealPIR query ciphertext (rejects multi-MB garbage).
+/// Max bytes per SealPIR query ciphertext (rejects multi-MB garbage; v2 symmetric query is ~61 KiB).
 #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
-pub(super) const MAX_PIR_QUERY_CT_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_PIR_QUERY_CT_BYTES: usize = 256 * 1024;
 /// Max protobuf-encoded compact-block bytes materialized for one PIR window.
 #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
 pub(super) const MAX_PIR_WINDOW_ENCODED_BYTES: usize = 64 * 1024 * 1024;
-/// One `FetchPirBatch` per limb. Matches `MAX_PIR_LIMBS` (4096) so a peer can
-/// pull every column of one compact block within the minute window.
+/// FetchPirBatch rate cap (streaming handles normal fetches in 2 RPCs; fallback unary stays allowed).
 pub(super) const PIR_RATE_LIMIT_PER_MIN: u32 = 4096;
 /// Max opaque recipient OMR metadata on SendTransaction / RegisterOmrClue.
 pub(super) const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
@@ -105,18 +104,19 @@ pub(super) const MAX_OMR_METADATA_ENC_BYTES: usize = 4096;
 /// transaction; 64 leaves room for a few outputs per call and still stops
 /// the quadratic hint rewrite.
 pub(super) const MAX_EXTRA_OMR_CLUES: usize = 64;
-/// Serialized UnifOMR clue public key (`n = 1024`: 4-byte header + 16 bytes × n).
-pub(super) const CLUE_PUBLIC_KEY_WIRE_LEN: usize = 4 + 16 * 1024;
+/// Serialized UnifOMR v2 clue public key (`n = 1024`: 4 B header + 32 B seed_a + 2560 B packed b).
+pub(super) const CLUE_PUBLIC_KEY_WIRE_LEN: usize = 4 + 32 + (1024usize * 20).div_ceil(8);
 /// Upper bound on `CluePublicKeyRegistration.clue_public_key` before signature verify.
-pub(super) const MAX_CLUE_PUBLIC_KEY_BYTES: usize = 65_536;
+pub(super) const MAX_CLUE_PUBLIC_KEY_BYTES: usize = 8192;
 /// Upper bound on `CluePublicKeyRegistration.ownership_proof` before signature verify.
 pub(super) const MAX_OWNERSHIP_PROOF_BYTES: usize = 4096;
 /// Compact-block wire version reported by GetLightInfo.
 /// Bump when the compact format or RPC contract changes.
+/// 2.2.0: UnifOMR v2 (`unifomr-v2`), `omit_omr_clues` on BlockRange, streaming `FetchPirBatchStream`.
 /// 2.1.0: compact DAO calls and Money `func_code` (token mint, auth-token history).
 /// 2.0.0: historical snapshots, padded ranges, detection-key pool,
 /// ChainTip subscribe, compact output bodies. No 1.0.0 compatibility path.
-pub(super) const LIGHTWALLET_PROTO_VERSION: &str = "2.1.0";
+pub(super) const LIGHTWALLET_PROTO_VERSION: &str = "2.2.0";
 
 /// Default max raw tx bytes (overridden by Config.max_tx_bytes).
 pub(super) const DEFAULT_MAX_TX_BYTES: usize = 2_000_000;
@@ -145,6 +145,11 @@ pub struct ServiceMetrics {
     pub(super) rpc_requests: AtomicU64,
     pub(super) rate_limited: AtomicU64,
     pub(super) active_streams: AtomicUsize,
+    pub(super) omr_digest_requests: AtomicU64,
+    pub(super) omr_digest_ms_total: AtomicU64,
+    pub(super) pir_requests: AtomicU64,
+    pub(super) pir_limbs_total: AtomicU64,
+    pub(super) pir_ms_total: AtomicU64,
 }
 
 /// Point-in-time snapshot of [`ServiceMetrics`].
@@ -153,6 +158,11 @@ pub struct MetricsSnapshot {
     pub rpc_requests: u64,
     pub rate_limited: u64,
     pub active_streams: usize,
+    pub omr_digest_requests: u64,
+    pub omr_digest_ms_total: u64,
+    pub pir_requests: u64,
+    pub pir_limbs_total: u64,
+    pub pir_ms_total: u64,
 }
 
 impl ServiceMetrics {
@@ -168,11 +178,31 @@ impl ServiceMetrics {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    pub fn record_omr_digest(&self, elapsed_ms: u64) {
+        self.omr_digest_requests.fetch_add(1, Ordering::Relaxed);
+        self.omr_digest_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    pub fn record_pir(&self, limbs: usize, elapsed_ms: u64) {
+        self.pir_requests.fetch_add(1, Ordering::Relaxed);
+        self.pir_limbs_total
+            .fetch_add(limbs as u64, Ordering::Relaxed);
+        self.pir_ms_total.fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             rpc_requests: self.rpc_requests.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             active_streams: self.active_streams.load(Ordering::Relaxed),
+            omr_digest_requests: self.omr_digest_requests.load(Ordering::Relaxed),
+            omr_digest_ms_total: self.omr_digest_ms_total.load(Ordering::Relaxed),
+            pir_requests: self.pir_requests.load(Ordering::Relaxed),
+            pir_limbs_total: self.pir_limbs_total.load(Ordering::Relaxed),
+            pir_ms_total: self.pir_ms_total.load(Ordering::Relaxed),
         }
     }
 
@@ -498,6 +528,7 @@ pub(super) fn spawn_output_bodies(
     cache: Arc<Cache>,
     start: u32,
     end: u32,
+    omit_omr_clues: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_guard: ActiveStreamGuard,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
@@ -538,7 +569,11 @@ pub(super) fn spawn_output_bodies(
                         prev_hash: block.prev_hash.to_vec(),
                         coin: output.coin.to_vec(),
                         encrypted_note: output.encrypted_note.clone(),
-                        omr_clue: output.omr_clue.clone(),
+                        omr_clue: if omit_omr_clues {
+                            Vec::new()
+                        } else {
+                            output.omr_clue.clone()
+                        },
                         omr_metadata_enc: output.omr_metadata_enc.clone(),
                         tx_hash: tx_body.tx_hash.to_vec(),
                         func_code: u32::from(output.func_code),
@@ -561,6 +596,7 @@ pub(super) fn spawn_outputs_by_func(
     start: u32,
     end: u32,
     func_code: u32,
+    omit_omr_clues: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_guard: ActiveStreamGuard,
 ) -> tokio_stream::wrappers::ReceiverStream<Result<proto::CompactOutputBody, Status>> {
@@ -604,7 +640,11 @@ pub(super) fn spawn_outputs_by_func(
                         prev_hash: block.prev_hash.to_vec(),
                         coin: output.coin.to_vec(),
                         encrypted_note: output.encrypted_note.clone(),
-                        omr_clue: output.omr_clue.clone(),
+                        omr_clue: if omit_omr_clues {
+                            Vec::new()
+                        } else {
+                            output.omr_clue.clone()
+                        },
                         omr_metadata_enc: output.omr_metadata_enc.clone(),
                         tx_hash: tx_body.tx_hash.to_vec(),
                         func_code,
@@ -821,15 +861,13 @@ pub(super) fn resolve_peer_ip(
     client_ip_from_forwarded_headers(xff_headers.into_iter(), trusted_proxies).unwrap_or(remote)
 }
 
-/// Pre-flattened, validated RLWE clues for one `(start, end)` window.
+/// Pre-transformed BFV-NTT clue matrix for one `(start, end)` window.
 ///
-/// Shared across concurrent digest requests via `Arc` so repeat digests for
-/// the same padded window skip sled reads, clue deserialization, BLAKE3
-/// checksums, and slot-height packing. Digest ciphertexts are never stored —
-/// they differ per detection key.
+/// Shared across concurrent detection-key evaluations via `Arc` so repeat digests
+/// skip sled reads, clue deserialization, BLAKE3 checksums, and BFV plaintext NTTs.
 #[cfg(feature = "fhe-omr")]
 pub(super) struct FlattenedClueWindow {
-    pub(super) messages: Vec<crate::unifomr::RlweCiphertext>,
+    pub(super) prepared: Arc<crate::unifomr::PreparedClueWindow>,
     pub(super) slot_heights_wire: Vec<u8>,
     pub(super) truncated: bool,
 }

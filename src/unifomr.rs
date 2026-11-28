@@ -126,7 +126,7 @@ mod tests {
 
         let detector = UnifOmrDetector::new(0x01).unwrap();
         let t2 = Instant::now();
-        let (_net, parsed_cts) = parse_detection_key(&det_key, &detector.params).unwrap();
+        let (_net, parsed) = parse_detection_key(&det_key, &detector.params).unwrap();
         let parse_det_ms = t2.elapsed().as_secs_f64() * 1e3;
 
         let (_, pk) = clue_keypair_from_wallet(&wallet, 0x01).unwrap();
@@ -135,9 +135,13 @@ mod tests {
         let degree = detector.params.degree();
         let messages: Vec<RlweCiphertext> = vec![sample_ct; degree];
 
-        let t3 = Instant::now();
-        let digest = detector.encode_messages(&det_key, &messages).unwrap();
-        let encode_full_ms = t3.elapsed().as_secs_f64() * 1e3;
+        let t3a = Instant::now();
+        let prepared = detector.prepare_window(&messages).unwrap();
+        let prepare_ms = t3a.elapsed().as_secs_f64() * 1e3;
+
+        let t3b = Instant::now();
+        let digest = detector.evaluate_prepared(&parsed, &prepared).unwrap();
+        let eval_prepared_ms = t3b.elapsed().as_secs_f64() * 1e3;
 
         let t4 = Instant::now();
         let slots = client.decrypt_digest_slots(&digest).unwrap();
@@ -147,13 +151,14 @@ mod tests {
         let pir_server = crate::pir_server::BatchPirServer::with_unifomr_params().unwrap();
         let q1 = pir_client.generate_sealpir_queries(&[42], degree).unwrap();
         let db1 = vec![0x1234u64; degree];
+        let parsed_q1 = pir_server.parse_queries(&q1).unwrap();
+        let limb_dbs1 = vec![db1.clone(); 16];
         let t5 = Instant::now();
-        for _ in 0..10 {
-            let _ = pir_server
-                .evaluate_sealpir_stripes(&q1, &db1, degree)
-                .unwrap();
-        }
-        let pir_1stripe_ms = t5.elapsed().as_secs_f64() * 1e3 / 10.0;
+        let _ = pir_server
+            .evaluate_parsed_limb_range(&parsed_q1, &limb_dbs1, degree)
+            .unwrap();
+        let pir_16limbs_1stripe_ms = t5.elapsed().as_secs_f64() * 1e3;
+        let pir_1stripe_ms = pir_16limbs_1stripe_ms / 16.0;
 
         let q2 = pir_client
             .generate_sealpir_queries(&[42], degree * 2)
@@ -178,19 +183,17 @@ mod tests {
         let tree_bytes = darkfi_serial::serialize(&tree).len();
 
         println!("MEASURE_DET_KEY_BYTES={}", det_key.len());
-        println!("MEASURE_DET_KEY_CTS={}", parsed_cts.len());
+        println!("MEASURE_DET_KEY_PARSED_BYTES={}", parsed.approx_bytes());
         println!("MEASURE_DIGEST_1CHUNK_BYTES={}", digest.len());
         println!("MEASURE_SLOTS={}", slots.len());
         println!("MEASURE_FROM_WALLET_MS={from_wallet_ms:.2}");
         println!("MEASURE_BUILD_DET_KEY_MS={build_det_ms:.2}");
         println!("MEASURE_PARSE_DET_KEY_MS={parse_det_ms:.2}");
-        println!("MEASURE_ENCODE_1CHUNK_TOTAL_MS={encode_full_ms:.2}");
-        println!(
-            "MEASURE_ENCODE_1CHUNK_EVAL_ONLY_MS={:.2}",
-            encode_full_ms - parse_det_ms
-        );
+        println!("MEASURE_PREPARE_1CHUNK_MS={prepare_ms:.2}");
+        println!("MEASURE_EVAL_PREPARED_1CHUNK_MS={eval_prepared_ms:.2}");
         println!("MEASURE_DECRYPT_1CHUNK_MS={decrypt_ms:.2}");
         println!("MEASURE_PIR_1STRIPE_LIMB_MS={pir_1stripe_ms:.2}");
+        println!("MEASURE_PIR_16LIMBS_1STRIPE_MS={pir_16limbs_1stripe_ms:.2}");
         println!("MEASURE_PIR_2STRIPE_LIMB_MS={pir_2stripe_ms:.2}");
         println!("MEASURE_PIR_QUERY_CT_BYTES={}", q1[0].len());
         println!("MEASURE_MERKLE_1000_APPEND_MS={merkle_1000_ms:.2}");

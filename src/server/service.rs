@@ -81,6 +81,29 @@ pub struct LightWalletService {
     pub(super) directory_attest_pubkey: std::sync::OnceLock<[u8; 32]>,
     /// Lock-free atomic metrics counters for periodic INFO summaries.
     pub(super) metrics: Arc<ServiceMetrics>,
+    /// Configurable TTL for registered detection-key handles.
+    #[cfg_attr(not(feature = "fhe-omr"), allow(dead_code))]
+    pub(super) detection_key_ttl_secs: u64,
+    /// Bounded Rayon thread pool dedicated to FHE OMR/PIR compute.
+    #[cfg(feature = "fhe-omr")]
+    pub(super) fhe_rayon_pool: Arc<rayon::ThreadPool>,
+}
+
+#[cfg(feature = "fhe-omr")]
+fn build_fhe_rayon_pool(threads: usize) -> rayon::ThreadPool {
+    let n = if threads == 0 {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(1, 16)
+    } else {
+        threads.clamp(1, 64)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|i| format!("omr-fhe-{i}"))
+        .build()
+        .expect("build OMR FHE rayon thread pool")
 }
 
 impl LightWalletService {
@@ -181,6 +204,9 @@ impl LightWalletService {
             tip_fact_fetch: Arc::new(tokio::sync::Mutex::new(())),
             directory_attest_pubkey,
             metrics: Arc::new(ServiceMetrics::new()),
+            detection_key_ttl_secs: detection_pool::DETECTION_KEY_TTL_SECS,
+            #[cfg(feature = "fhe-omr")]
+            fhe_rayon_pool: Arc::new(build_fhe_rayon_pool(0)),
         }
     }
 
@@ -215,13 +241,15 @@ impl LightWalletService {
             .set_gc_threshold(rate_limit_gc_threshold);
     }
 
-    /// Override FHE worker concurrency, detection-key pool limits, and upload deadline.
+    /// Override FHE worker concurrency, detection-key pool limits, TTL, and thread count.
     pub fn apply_fhe_pool_config(
         &mut self,
         fhe_workers: usize,
         detection_pool_handles: usize,
         detection_pool_mib: u64,
         upload_deadline_s: u64,
+        detection_key_ttl_secs: u64,
+        omr_rayon_threads: usize,
     ) {
         let workers = fhe_workers.max(1);
         self.fhe_permits = Arc::new(tokio::sync::Semaphore::new(workers));
@@ -232,6 +260,13 @@ impl LightWalletService {
             pool_bytes,
         )));
         self.upload_deadline = Duration::from_secs(upload_deadline_s.max(1));
+        self.detection_key_ttl_secs = detection_key_ttl_secs.max(1);
+        #[cfg(feature = "fhe-omr")]
+        {
+            self.fhe_rayon_pool = Arc::new(build_fhe_rayon_pool(omr_rayon_threads));
+        }
+        #[cfg(not(feature = "fhe-omr"))]
+        let _ = omr_rayon_threads;
     }
 
     pub(super) fn peer_ip<T>(&self, request: &Request<T>) -> IpAddr {
@@ -657,6 +692,8 @@ impl LightWalletService {
     pub(super) fn cached_flattened_clues_from(
         cache: &Cache,
         clue_windows: &Arc<Mutex<ClueWindowCache>>,
+        detector: &crate::unifomr::UnifOmrDetector,
+        fhe_pool: &rayon::ThreadPool,
         start: u32,
         end: u32,
     ) -> Result<Arc<FlattenedClueWindow>, Status> {
@@ -695,8 +732,11 @@ impl LightWalletService {
         let truncated =
             crate::unifomr::cap_messages_to_whole_heights(&mut messages, &mut slot_heights);
         let slot_heights_wire = crate::unifomr::pack_slot_heights(&slot_heights);
+        let prepared = fhe_pool
+            .install(|| detector.prepare_window(&messages))
+            .map_err(|e| Status::internal(format!("prepare UnifOMR window: {e}")))?;
         let window = Arc::new(FlattenedClueWindow {
-            messages,
+            prepared: Arc::new(prepared),
             slot_heights_wire,
             truncated,
         });
@@ -708,15 +748,44 @@ impl LightWalletService {
         Ok(window)
     }
 
-    /// Same digest evaluator `GetUnifOmrDigest` uses after the key is in hand.
-    ///
-    /// Does not cache the ciphertext. The flattened clue list for `(start, eval_end)`
-    /// is shared across handles via `Arc` without re-parsing or cloning clues.
     #[cfg(feature = "fhe-omr")]
     #[allow(clippy::result_large_err)]
-    pub(super) async fn evaluate_detection_keys(
+    pub(super) async fn evaluate_wire_keys(
         &self,
         keys: Vec<Arc<Vec<u8>>>,
+        start: u32,
+        end: u32,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<proto::OmrDigestResponse, Status> {
+        let detector = crate::unifomr::UnifOmrDetector::new(self.network_byte)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let parsed: Vec<Arc<crate::unifomr::ParsedDetectionKey>> =
+            tokio::task::spawn_blocking({
+                let fhe_pool = Arc::clone(&self.fhe_rayon_pool);
+                move || {
+                    fhe_pool.install(|| {
+                        let mut out = Vec::with_capacity(keys.len());
+                        for key in &keys {
+                            let (_net, p) =
+                                crate::unifomr::parse_detection_key(key, &detector.params)?;
+                            out.push(Arc::new(p));
+                        }
+                        Ok::<_, String>(out)
+                    })
+                }
+            })
+            .await
+            .map_err(|e| Status::internal(format!("UnifOMR key parse join error: {e}")))?
+            .map_err(|e| Status::invalid_argument(format!("detection key: {e}")))?;
+        self.evaluate_parsed_keys(parsed, start, end, permit).await
+    }
+
+    /// Evaluate pre-parsed BFV detection keys using cached `PreparedClueWindow`.
+    #[cfg(feature = "fhe-omr")]
+    #[allow(clippy::result_large_err)]
+    pub(super) async fn evaluate_parsed_keys(
+        &self,
+        parsed_keys: Vec<Arc<crate::unifomr::ParsedDetectionKey>>,
         start: u32,
         end: u32,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -725,40 +794,53 @@ impl LightWalletService {
         let (eval_end, range_complete) = digest_evaluable_end(&self.cache, start, end)?;
         let cache = Arc::clone(&self.cache);
         let clue_windows = Arc::clone(&self.clue_windows);
+        let fhe_pool = Arc::clone(&self.fhe_rayon_pool);
+        let metrics = Arc::clone(&self.metrics);
         let network_byte = self.network_byte;
         let (encrypted_digest, truncated, slot_heights_wire) =
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let window = match eval_end {
-                    Some(eval_end) => {
-                        Self::cached_flattened_clues_from(&cache, &clue_windows, start, eval_end)
-                            .map_err(|s| s.message().to_string())?
-                    }
-                    None => Arc::new(FlattenedClueWindow {
-                        messages: Vec::new(),
-                        slot_heights_wire: Vec::new(),
-                        truncated: false,
-                    }),
-                };
+                let started = Instant::now();
                 let detector = crate::unifomr::UnifOmrDetector::new(network_byte)
                     .map_err(|e| e.to_string())?;
-                let digest = if keys.len() == 1 {
-                    crate::unifomr::encode_messages_padded(&detector, &keys[0], &window.messages)
-                        .map_err(|e| e.to_string())?
-                } else {
-                    let mut out = Vec::new();
-                    for key in &keys {
-                        let d = crate::unifomr::encode_messages_padded(
-                            &detector,
-                            key,
-                            &window.messages,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-                        out.extend_from_slice(&d);
+                let window = match eval_end {
+                    Some(eval_end) => Self::cached_flattened_clues_from(
+                        &cache,
+                        &clue_windows,
+                        &detector,
+                        &fhe_pool,
+                        start,
+                        eval_end,
+                    )
+                    .map_err(|s| s.message().to_string())?,
+                    None => {
+                        let empty_prepared = detector.prepare_window(&[])?;
+                        Arc::new(FlattenedClueWindow {
+                            prepared: Arc::new(empty_prepared),
+                            slot_heights_wire: Vec::new(),
+                            truncated: false,
+                        })
                     }
-                    out
                 };
+                let digest = fhe_pool.install(|| -> Result<Vec<u8>, String> {
+                    if parsed_keys.len() == 1 {
+                        detector.evaluate_prepared(&parsed_keys[0], &window.prepared)
+                    } else {
+                        let mut out = Vec::new();
+                        for key in &parsed_keys {
+                            let d = detector.evaluate_prepared(key, &window.prepared)?;
+                            out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&d);
+                        }
+                        Ok(out)
+                    }
+                })?;
+                let elapsed = started.elapsed();
+                metrics.record_omr_digest(elapsed.as_millis() as u64);
+                const MIN_RESPONSE_TIME: Duration = Duration::from_millis(100);
+                if elapsed < MIN_RESPONSE_TIME {
+                    std::thread::sleep(MIN_RESPONSE_TIME - elapsed);
+                }
                 Ok::<_, String>((digest, window.truncated, window.slot_heights_wire.clone()))
             })
             .await

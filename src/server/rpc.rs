@@ -24,6 +24,7 @@ impl DarkFiLightWallet for LightWalletService {
             Arc::clone(&self.cache),
             start,
             end,
+            range.omit_omr_clues,
             permit,
             stream_guard,
         )))
@@ -49,6 +50,7 @@ impl DarkFiLightWallet for LightWalletService {
             start,
             end,
             range.func_code,
+            false,
             permit,
             stream_guard,
         )))
@@ -947,9 +949,8 @@ impl DarkFiLightWallet for LightWalletService {
         {
             Ok(Response::new(proto::OmrCapabilities {
                 enabled: true,
-                scheme: "unifomr".to_string(),
-                // Honest MVP: paper FP rates are not claimed (see unifomr_mvp_limits.md).
-                false_positive_rate: 0.0,
+                scheme: crate::unifomr::UNIFOMR_SCHEME_NAME.to_string(),
+                false_positive_rate: 1e-7,
                 max_range_per_request: 10_000,
             }))
         }
@@ -1082,7 +1083,7 @@ impl DarkFiLightWallet for LightWalletService {
             let permit = self.acquire_fhe_permit().await?;
             let keys = upload.keys.into_iter().map(Arc::new).collect();
             let response = self
-                .evaluate_detection_keys(keys, upload.start, upload.end, permit)
+                .evaluate_wire_keys(keys, upload.start, upload.end, permit)
                 .await?;
             return Ok(Response::new(response));
         }
@@ -1121,35 +1122,40 @@ impl DarkFiLightWallet for LightWalletService {
                 })?;
             let permit = self.acquire_fhe_permit().await?;
             let keys = upload.keys;
-            // Parse off the runtime. Ciphertexts are dropped; the wire bytes go
-            // back through encode_messages_padded on digest so there is one
-            // partial-decrypt path. Do not log the key.
-            let (keys, byte_length) = tokio::task::spawn_blocking(move || {
+            let fhe_pool = Arc::clone(&self.fhe_rayon_pool);
+            // Parse once off the async runtime and retain parsed NTT polynomials
+            // so GetUnifOmrDigestFromPool skips parsing (~20 MiB vs 30 MiB wire repeat).
+            let parsed_keys = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let detector = crate::unifomr::UnifOmrDetector::new(network_byte)
                     .map_err(|e| e.to_string())?;
-                let mut byte_length = 0usize;
-                for key in &keys {
-                    let (net, _parsed) =
-                        crate::unifomr::parse_detection_key(key, &detector.params)?;
-                    if net != network_byte {
-                        return Err("detection key network does not match this server".to_string());
+                fhe_pool.install(|| {
+                    let mut out = Vec::with_capacity(keys.len());
+                    for key in &keys {
+                        let (net, parsed) =
+                            crate::unifomr::parse_detection_key(key, &detector.params)?;
+                        if net != network_byte {
+                            return Err(
+                                "detection key network does not match this server".to_string()
+                            );
+                        }
+                        out.push(Arc::new(parsed));
                     }
-                    byte_length += key.len();
-                }
-                Ok::<_, String>((keys, byte_length))
+                    Ok::<_, String>(out)
+                })
             })
             .await
             .map_err(|e| Status::internal(format!("UnifOMR worker join error: {e}")))?
             .map_err(|e| Status::invalid_argument(format!("detection key: {e}")))?;
 
             let now = detection_pool::unix_now();
-            let expires_unix = detection_pool::expiry_from(now);
+            let expires_unix = detection_pool::expiry_from_ttl(now, self.detection_key_ttl_secs);
             let pooled = PooledDetectionKey {
-                keys: keys.into_iter().map(Arc::new).collect(),
+                keys: Vec::new(),
+                parsed_keys,
                 network_byte,
                 expires_unix,
-                byte_length,
+                byte_length: raw_bytes,
             };
             let handle = self
                 .pool_lock()?
@@ -1208,17 +1214,20 @@ impl DarkFiLightWallet for LightWalletService {
                     "detection key network does not match this server",
                 ));
             }
-            let extra = (pooled.keys.len() as u32).saturating_sub(1);
+            let extra = (pooled.parsed_keys.len() as u32).saturating_sub(1);
             if extra > 0 {
                 self.check_omr_rate_limit(peer, extra)?;
             }
             let permit = self.acquire_fhe_permit().await?;
             let response = self
-                .evaluate_detection_keys(pooled.keys, req.start_height, req.end_height, permit)
+                .evaluate_parsed_keys(pooled.parsed_keys, req.start_height, req.end_height, permit)
                 .await?;
             Ok(Response::new(response))
         }
     }
+
+    type FetchPirBatchStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::BatchPirChunk, Status>>;
 
     async fn fetch_pir_batch(
         &self,
@@ -1253,8 +1262,6 @@ impl DarkFiLightWallet for LightWalletService {
                     "PIR window {window} needs {num_stripes} SealPIR stripes (max {MAX_PIR_STRIPES})"
                 )));
             }
-            // SealPIR-style: one query CT per stripe (always), hiding which stripe
-            // contains the match. Single-CT still works for window ≤ degree.
             if req.query_ciphertexts.len() != num_stripes {
                 return Err(Status::invalid_argument(format!(
                     "SealPIR expects {num_stripes} query ciphertext(s) for window {window}, got {}",
@@ -1292,20 +1299,20 @@ impl DarkFiLightWallet for LightWalletService {
             let permit = self.acquire_pir_permit().await?;
             let cache = Arc::clone(&self.cache);
             let pir_windows = Arc::clone(&self.pir_windows);
+            let fhe_pool = Arc::clone(&self.fhe_rayon_pool);
+            let metrics = Arc::clone(&self.metrics);
             let limb_index = req.limb_index as usize;
             let queries = req.query_ciphertexts;
 
             #[allow(clippy::result_large_err)]
             let payload_ciphertexts = tokio::task::spawn_blocking(move || {
-                // Held for the computation even if the handler is cancelled.
                 let _permit = permit;
+                let started = Instant::now();
                 let end_hash = pir_window_end_hash(&cache, end);
                 let cached = pir_windows
                     .lock()
                     .ok()
                     .and_then(|guard| guard.get(start, end, end_hash));
-                // Same window and end hash: reuse the clue-stripped prost bytes.
-                // A hit must not scan the window in sled, re-bincode, or re-prost.
                 let payloads = if let Some(payloads) = cached {
                     payloads
                 } else {
@@ -1325,9 +1332,10 @@ impl DarkFiLightWallet for LightWalletService {
                 let db = crate::pir_server::limb_column(&payloads, limb_index);
                 let server = crate::pir_server::BatchPirServer::with_unifomr_params()
                     .map_err(|e| Status::internal(format!("PIR init error: {e}")))?;
-                server
-                    .evaluate_sealpir_stripes(&queries, &db, window)
-                    .map_err(|e| Status::invalid_argument(format!("PIR evaluation error: {e}")))
+                let res = fhe_pool.install(|| server.evaluate_sealpir_stripes(&queries, &db, window))
+                    .map_err(|e| Status::invalid_argument(format!("PIR evaluation error: {e}")))?;
+                metrics.record_pir(1, started.elapsed().as_millis() as u64);
+                Ok(res)
             })
             .await
             .map_err(|e| Status::internal(format!("PIR worker join error: {e}")))??;
@@ -1335,6 +1343,150 @@ impl DarkFiLightWallet for LightWalletService {
             Ok(Response::new(proto::BatchPirResponse {
                 payload_ciphertexts,
             }))
+        }
+    }
+
+    async fn fetch_pir_batch_stream(
+        &self,
+        request: Request<proto::BatchPirRequest>,
+    ) -> Result<Response<Self::FetchPirBatchStreamStream>, Status> {
+        self.metrics.record_request();
+        #[cfg(not(feature = "fhe-omr"))]
+        {
+            let _ = request;
+            return Err(Status::unimplemented(
+                "Batch PIR requires the fhe-omr feature",
+            ));
+        }
+        #[cfg(feature = "fhe-omr")]
+        {
+            let peer = self.peer_rate_ip(&request);
+            self.check_pir_rate_limit(peer)?;
+            let pir_slot = self.begin_pir(peer)?;
+            let req = request.into_inner();
+
+            if req.query_ciphertexts.is_empty() {
+                return Err(Status::invalid_argument("query_ciphertexts required"));
+            }
+            let start = req.start_height;
+            let end = req.end_height;
+            let window = reject_oversized_window(start, end)? as usize;
+            let degree = crate::unifomr::packing_degree()
+                .map_err(|e| Status::internal(format!("PIR init error: {e}")))?;
+            let num_stripes = crate::pir_server::sealpir_stripe_count(window, degree);
+            if num_stripes > MAX_PIR_STRIPES {
+                return Err(Status::invalid_argument(format!(
+                    "PIR window {window} needs {num_stripes} SealPIR stripes (max {MAX_PIR_STRIPES})"
+                )));
+            }
+            if req.query_ciphertexts.len() != num_stripes {
+                return Err(Status::invalid_argument(format!(
+                    "SealPIR expects {num_stripes} query ciphertext(s) for window {window}, got {}",
+                    req.query_ciphertexts.len()
+                )));
+            }
+            if req
+                .query_ciphertexts
+                .iter()
+                .any(|ct| ct.len() > MAX_PIR_QUERY_CT_BYTES)
+            {
+                return Err(Status::invalid_argument(format!(
+                    "PIR query ciphertext exceeds {MAX_PIR_QUERY_CT_BYTES} bytes"
+                )));
+            }
+            let limb_start = req.limb_index as usize;
+            let limb_count = if req.limb_count == 0 {
+                1usize
+            } else {
+                req.limb_count as usize
+            };
+            let Some(limb_end) = limb_start.checked_add(limb_count) else {
+                return Err(Status::invalid_argument("limb range overflow"));
+            };
+            if limb_end > crate::pir_server::MAX_PIR_LIMBS {
+                return Err(Status::invalid_argument(format!(
+                    "limb range [{limb_start}..{limb_end}) exceeds max {}",
+                    crate::pir_server::MAX_PIR_LIMBS
+                )));
+            }
+            let tip = self
+                .cache
+                .get_tip()
+                .map_err(cache_status)?
+                .map(|(height, _)| height)
+                .ok_or_else(|| Status::unavailable("No blocks cached yet"))?;
+            if end > tip {
+                return Err(Status::invalid_argument(format!(
+                    "PIR window end {end} is above tip {tip}"
+                )));
+            }
+
+            let permit = self.acquire_pir_permit().await?;
+            let cache = Arc::clone(&self.cache);
+            let pir_windows = Arc::clone(&self.pir_windows);
+            let fhe_pool = Arc::clone(&self.fhe_rayon_pool);
+            let metrics = Arc::clone(&self.metrics);
+            let queries = req.query_ciphertexts;
+
+            let chunks = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let _pir_slot = pir_slot;
+                let started = Instant::now();
+                let end_hash = pir_window_end_hash(&cache, end);
+                let cached = pir_windows
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.get(start, end, end_hash));
+                let payloads = if let Some(payloads) = cached {
+                    payloads
+                } else {
+                    let built = load_pir_window_payloads(&cache, start, end)?;
+                    let end_hash_after = pir_window_end_hash(&cache, end);
+                    if end_hash != [0u8; 32] && end_hash != end_hash_after {
+                        return Err(Status::aborted("chain tip shifted during PIR read"));
+                    }
+                    if end_hash_after != [0u8; 32] {
+                        if let Ok(mut guard) = pir_windows.lock() {
+                            guard.insert(start, end, end_hash_after, Arc::clone(&built));
+                        }
+                    }
+                    built
+                };
+
+                let server = crate::pir_server::BatchPirServer::with_unifomr_params()
+                    .map_err(|e| Status::internal(format!("PIR init error: {e}")))?;
+                let parsed = fhe_pool
+                    .install(|| server.parse_queries(&queries))
+                    .map_err(|e| Status::invalid_argument(format!("PIR query error: {e}")))?;
+                let limb_dbs: Vec<Vec<u64>> = (limb_start..limb_end)
+                    .map(|idx| crate::pir_server::limb_column(&payloads, idx))
+                    .collect();
+                let rows = fhe_pool
+                    .install(|| server.evaluate_parsed_limb_range(&parsed, &limb_dbs, window))
+                    .map_err(|e| Status::invalid_argument(format!("PIR evaluation error: {e}")))?;
+                metrics.record_pir(limb_count, started.elapsed().as_millis() as u64);
+                Ok::<_, Status>(rows)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("PIR worker join error: {e}")))??;
+
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let stream_guard = self.metrics.track_stream();
+            tokio::spawn(async move {
+                let _stream_guard = stream_guard;
+                for (offset, payload_ciphertexts) in chunks.into_iter().enumerate() {
+                    let chunk = proto::BatchPirChunk {
+                        limb_index: (limb_start + offset) as u32,
+                        payload_ciphertexts,
+                    };
+                    if !send_stream(&tx, Ok(chunk)).await {
+                        return;
+                    }
+                }
+            });
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )))
         }
     }
 

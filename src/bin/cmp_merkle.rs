@@ -188,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get_note_commitments(BlockRange {
                 start_height: start,
                 end_height: end,
+                omit_omr_clues: false,
             })
             .await?
             .into_inner();

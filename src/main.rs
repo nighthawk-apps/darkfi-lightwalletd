@@ -341,7 +341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "fhe-omr")]
     info!(
         target: "lightwalletd",
-        "UnifOMR enabled (GetUnifOmrDigest + FetchPirBatch)"
+        "UnifOMR v2 enabled (GetUnifOmrDigest + FetchPirBatch + FetchPirBatchStream)"
     );
     #[cfg(not(feature = "fhe-omr"))]
     info!(
@@ -377,6 +377,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.detection_pool_handles,
         config.detection_pool_mib,
         config.upload_deadline_s,
+        config.detection_key_ttl_secs,
+        config.omr_rayon_threads,
     );
 
     // Periodic 60s INFO metrics summary using lock-free atomic counters.
@@ -409,12 +411,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format_tip_age(metrics_cache.tip_fetched_unix().ok().unwrap_or(0), now_unix);
             info!(
                 target: "lightwalletd::metrics",
-                "summary: rpc_requests={} (+{}) rate_limited={} (+{}) active_streams={} tip_height={} tip_age={}",
+                "summary: rpc_requests={} (+{}) rate_limited={} (+{}) active_streams={} omr_digests={} omr_ms={} pir_reqs={} pir_limbs={} pir_ms={} tip_height={} tip_age={}",
                 snap.rpc_requests,
                 req_delta,
                 snap.rate_limited,
                 rl_delta,
                 snap.active_streams,
+                snap.omr_digest_requests,
+                snap.omr_digest_ms_total,
+                snap.pir_requests,
+                snap.pir_limbs_total,
+                snap.pir_ms_total,
                 tip_height,
                 tip_age,
             );

@@ -45,7 +45,7 @@ fn validate_unifomr_clue_roundtrip_with_client() {
 fn unifomr_detector_scheme_and_digest_roundtrip() {
     assert_eq!(SCHEME_UNIFOMR, 0x05);
     let det = UnifOmrDetector::new(0x01).expect("detector");
-    assert_eq!(det.scheme(), "unifomr");
+    assert_eq!(det.scheme(), "unifomr-v2");
 
     let wallet = [0x42u8; 32];
     let client = UnifOmrClient::from_wallet(&wallet, 0x01).expect("client");

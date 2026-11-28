@@ -78,6 +78,10 @@ service DarkFiLightWallet {
   // Phase 2: Batch PIR Fetch (Non-Linear Payload Retrieval)
   rpc FetchPirBatch(BatchPirRequest) returns (BatchPirResponse);
 
+  // Streaming Batch PIR Fetch: evaluates `[limb_index, limb_index + limb_count)` in one
+  // request so Round-2 retrieval finishes in 2 RPCs (length limb + bucketed body limbs).
+  rpc FetchPirBatchStream(BatchPirRequest) returns (stream BatchPirChunk);
+
   // Submit a signed transaction to the network via the backing darkfid node.
   rpc SendTransaction(RawTransaction) returns (SendResponse);
 
@@ -149,6 +153,9 @@ message BlockRange {
   uint32 start_height = 1;
   // End height, inclusive
   uint32 end_height = 2;
+  // When true on GetCompactOutputBodies / GetCompactOutputsByFunc, omit `omr_clue` bytes
+  // so trial-decrypt clients avoid downloading OMR clue data they do not inspect.
+  bool omit_omr_clues = 3;
 }
 
 message BlockHeight {
@@ -511,9 +518,19 @@ message BatchPirRequest {
   // byte length; limb i >= 1 is bytes [2(i-1), 2i) as a little-endian u16
   // (last chunk zero-padded), so every limb stays below the BFV plaintext modulus.
   uint32 limb_index = 4;
+  // Number of consecutive limbs `[limb_index .. limb_index + limb_count)` for
+  // FetchPirBatchStream. `0` is treated as `1`.
+  uint32 limb_count = 5;
 }
 
 message BatchPirResponse {
   // BFV ciphertext(s) encrypting the selected limb(s) / packed payload fragments.
   repeated bytes payload_ciphertexts = 1;
+}
+
+message BatchPirChunk {
+  // 0-based limb column index corresponding to `BatchPirRequest.limb_index + k`.
+  uint32 limb_index = 1;
+  // BFV ciphertexts (one per stripe) encrypting this limb across the requested heights.
+  repeated bytes payload_ciphertexts = 2;
 }
